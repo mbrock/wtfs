@@ -24,6 +24,7 @@ const WorkItem = struct {
     parent: ?usize,
     direct_size: u64 = 0,
     total_size: u64 = 0,
+    inaccessible: bool = false,
 };
 
 fn printIndent(depth: usize) !void {
@@ -92,7 +93,15 @@ pub fn main() !void {
 
         try stdout.print("{s}:\n", .{item.path});
 
-        var dir = try std.fs.cwd().openDir(item.path, .{ .iterate = true });
+        var dir = std.fs.cwd().openDir(item.path, .{ .iterate = true }) catch |err| switch (err) {
+            error.PermissionDenied, error.AccessDenied => {
+                queue.items[item_index].inaccessible = true;
+                try printIndent(item.depth + 1);
+                try stdout.print("[inaccessible]\n\n", .{});
+                continue;
+            },
+            else => return err,
+        };
         defer dir.close();
 
         var scanner = Scanner.init(dir.fd, &buf);
@@ -167,7 +176,8 @@ pub fn main() !void {
     try stdout.print("Totals:\n", .{});
     for (queue.items) |item| {
         try printIndent(item.depth);
-        try stdout.print("{Bi:>10}  {s}\n", .{ item.total_size, item.path });
+        const marker = if (item.inaccessible) " (inaccessible)" else "";
+        try stdout.print("{Bi:>10}  {s}{s}\n", .{ item.total_size, item.path, marker });
     }
 
     try stdout.flush();
