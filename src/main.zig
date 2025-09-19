@@ -23,7 +23,7 @@ const AtomicUsize = std.atomic.Value(usize);
 const DirectoryNode = struct {
     parent: ?usize,
     depth: usize,
-    basename: []u8,
+    basename: []const u8,
     dir: ?std.fs.Dir,
     total_size: u64 = 0,
     total_files: usize = 0,
@@ -82,13 +82,28 @@ const Context = struct {
     skip_hidden: bool,
     inaccessible_dirs: AtomicUsize = AtomicUsize.init(0),
     directories_mutex: std.Thread.Mutex = .{},
+    path_set_mutex: std.Thread.Mutex = .{},
     task_queue: TaskQueue = .{},
     outstanding: AtomicUsize = AtomicUsize.init(0),
+    path_set: *std.BufSet,
 
     fn getNode(self: *Context, index: usize) *DirectoryNode {
         self.directories_mutex.lock();
         defer self.directories_mutex.unlock();
         return self.directories.at(index);
+    }
+
+    fn internPath(self: *Context, path: []const u8) ![]const u8 {
+        self.path_set_mutex.lock();
+        defer self.path_set_mutex.unlock();
+
+        const gop = try self.path_set.hash_map.getOrPut(path);
+        if (!gop.found_existing) {
+            const copy = try self.path_set.hash_map.allocator.alloc(u8, path.len);
+            @memcpy(copy, path);
+            gop.key_ptr.* = copy;
+        }
+        return gop.key_ptr.*;
     }
 
     fn setTotals(self: *Context, index: usize, size: u64, files: usize) void {
@@ -114,8 +129,7 @@ const Context = struct {
         var dir_copy = dir;
         errdefer if (dir_copy) |*d| d.close();
 
-        const name_copy = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(name_copy);
+        const name_copy = try self.internPath(path);
 
         self.directories_mutex.lock();
         defer self.directories_mutex.unlock();
@@ -140,8 +154,7 @@ const Context = struct {
         var dir_copy = dir;
         errdefer if (dir_copy) |*d| d.close();
 
-        const name_copy = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(name_copy);
+        const name_copy = try self.internPath(name);
 
         self.directories_mutex.lock();
         defer self.directories_mutex.unlock();
@@ -334,6 +347,9 @@ pub fn main() !void {
     var directories = DirectoryStore{};
     defer directories.deinit(allocator);
 
+    var path_set = std.BufSet.init(allocator);
+    defer path_set.deinit();
+
     var progress_root = std.Progress.start(.{ .root_name = "Scanning" });
     defer progress_root.end();
 
@@ -353,6 +369,7 @@ pub fn main() !void {
         .wait_group = &wait_group,
         .progress_node = progress_node,
         .skip_hidden = skip_hidden,
+        .path_set = &path_set,
     };
     defer ctx.task_queue.deinit(allocator);
 
@@ -453,8 +470,6 @@ pub fn main() !void {
             opened.close();
             node.dir = null;
         }
-        allocator.free(node.basename);
-        node.basename = @constCast(&[_]u8{})[0..];
     }
 
     try stdout.print("Summary for {s}:\n", .{root});
