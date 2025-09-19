@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 
 // ======== Darwin constants we need (from <sys/attr.h> / <sys/vnode.h>) ========
@@ -155,132 +156,214 @@ pub fn EntryFor(mask: AttrGroupMask) type {
 /// Creates a directory scanner type that uses getattrlistbulk to efficiently
 /// iterate over directory entries with the specified attributes
 pub fn DirScanner(mask: AttrGroupMask) type {
-    return struct {
-        pub const Payload = PayloadFor(mask);
-        pub const Entry = EntryFor(mask);
+    if (builtin.target.os.tag == .macos) {
+        return struct {
+            pub const Payload = PayloadFor(mask);
+            pub const Entry = EntryFor(mask);
 
-        fd: std.posix.fd_t,
-        reader: std.io.Reader,
-        buf: []u8,
-        n: usize = 0,
+            fd: std.posix.fd_t,
+            reader: std.io.Reader,
+            buf: []u8,
+            n: usize = 0,
 
-        /// Initialize a new scanner with a directory file descriptor and buffer
-        /// The buffer will be used for storing the bulk attribute results
-        pub fn init(fd: std.posix.fd_t, buf: []u8) @This() {
-            return .{
-                .fd = fd,
-                .reader = std.io.Reader.fixed(buf),
-                .buf = buf,
-            };
-        }
+            /// Initialize a new scanner with a directory file descriptor and buffer
+            /// The buffer will be used for storing the bulk attribute results
+            pub fn init(fd: std.posix.fd_t, buf: []u8) @This() {
+                return .{
+                    .fd = fd,
+                    .reader = std.io.Reader.fixed(buf),
+                    .buf = buf,
+                };
+            }
 
-        fn pump(self: *@This()) !void {
-            const opts_mask = FsOptMask{
-                .nofollow = true,
-                .report_fullsize = true,
-                .pack_invalid_attrs = true,
-            };
+            fn pump(self: *@This()) !void {
+                const opts_mask = FsOptMask{
+                    .nofollow = true,
+                    .report_fullsize = true,
+                    .pack_invalid_attrs = true,
+                };
 
-            var al = AttrList{
-                .bitmapcount = ATTR_BIT_MAP_COUNT,
-                .reserved = 0,
-                .attrs = mask,
-            };
+                var al = AttrList{
+                    .bitmapcount = ATTR_BIT_MAP_COUNT,
+                    .reserved = 0,
+                    .attrs = mask,
+                };
 
-            const n = getattrlistbulk(self.fd, &al, self.buf.ptr, self.buf.len, opts_mask);
-            if (n < 0) {
-                switch (posix.errno(n)) {
-                    .INTR, .AGAIN => {},
-                    .NOENT => return error.FileNotFound,
-                    .NOTDIR => return error.NotDir,
-                    .BADF => return error.BadFileDescriptor,
-                    .ACCES => return error.PermissionDenied,
-                    .FAULT => return error.BadAddress,
-                    .RANGE => return error.BufferTooSmall,
-                    .INVAL => return error.InvalidArgument,
-                    .IO => return error.ReadFailed,
-                    else => unreachable,
+                const n = getattrlistbulk(self.fd, &al, self.buf.ptr, self.buf.len, opts_mask);
+                if (n < 0) {
+                    switch (posix.errno(n)) {
+                        .INTR, .AGAIN => {},
+                        .NOENT => return error.FileNotFound,
+                        .NOTDIR => return error.NotDir,
+                        .BADF => return error.BadFileDescriptor,
+                        .ACCES => return error.PermissionDenied,
+                        .FAULT => return error.BadAddress,
+                        .RANGE => return error.BufferTooSmall,
+                        .INVAL => return error.InvalidArgument,
+                        .IO => return error.ReadFailed,
+                        else => unreachable,
+                    }
+                }
+
+                if (n == 0) return;
+
+                self.n = @abs(n);
+
+                self.reader = std.io.Reader.fixed(self.buf);
+            }
+
+            /// Get the next directory entry, or null if no more entries
+            /// Automatically fetches more entries from the kernel when needed
+            pub fn next(self: *@This()) !?Entry {
+                if (self.n == 0) {
+                    try self.pump();
+                    if (self.n == 0) return null;
+                }
+
+                const reclen = try self.reader.peekInt(u32, .little);
+                const recbuf = try self.reader.peek(reclen);
+                var rec = std.io.Reader.fixed(recbuf);
+                try self.reader.discardAll(@as(usize, reclen));
+                self.n -= 1;
+
+                // Take a pointer, so we can find the name slice by pointer arithmetic.
+                // If we use takeStruct, we wouldn't have the buffer address of name_ref.
+                // We can't use takeStructPointer because @SizeOf(Payload) is aligned
+                // even though it's packed, so we would advance too far.
+                // So we peekStructPointer and then advance with takeStruct, which works.
+
+                const payload = try rec.peekStructPointer(Payload);
+                _ = try rec.takeStruct(Payload, .little);
+
+                const namerefptr = @as([*]u8, @ptrCast(&payload.name_ref));
+                const namestart = if (payload.name_ref.off < 0)
+                    namerefptr - @abs(payload.name_ref.off)
+                else
+                    namerefptr + @abs(payload.name_ref.off);
+                const name = namestart[0 .. payload.name_ref.len - 1 :0];
+
+                var entry = Entry{
+                    .name = name,
+                    .kind = switch (payload.objtype) {
+                        VDIR => .dir,
+                        VREG => .file,
+                        VLNK => .symlink,
+                        else => .other,
+                    },
+                    .fsid = payload.fsid,
+                    .fileid = payload.fileid,
+                    .details = undefined,
+                };
+
+                switch (payload.objtype) {
+                    VDIR => {
+                        const dir = try rec.takeStruct(DirPayloadFor(mask.dir), .little);
+                        entry.details = .{
+                            .dir = .{
+                                .linkcount = dir.linkcount,
+                                .entrycount = dir.entrycount,
+                                .mountstatus = dir.mountstatus,
+                                .allocsize = dir.allocsize,
+                                .ioblocksize = dir.ioblocksize,
+                                .datalength = dir.datalength,
+                            },
+                        };
+                    },
+                    VREG => {
+                        const file = try rec.takeStruct(FilePayloadFor(mask.file), .little);
+                        entry.details = .{
+                            .file = .{
+                                .linkcount = file.linkcount,
+                                .totalsize = file.totalsize,
+                                .allocsize = file.allocsize,
+                            },
+                        };
+                    },
+                    else => {},
+                }
+
+                return entry;
+            }
+        };
+    } else {
+        return struct {
+            comptime {
+                if (!(mask.common.name and mask.common.obj_type and mask.dir.datalength and mask.file.totalsize)) {
+                    @compileError("fallback DirScanner only supports the mask used by main.zig");
+                }
+                if (mask.common.fsid or mask.common.file_id or mask.dir.linkcount or mask.dir.entrycount or mask.dir.mountstatus or mask.dir.allocsize or mask.dir.ioblocksize or mask.file.linkcount or mask.file.allocsize) {
+                    @compileError("fallback DirScanner only supports the mask used by main.zig");
                 }
             }
 
-            if (n == 0) return;
-
-            self.n = @abs(n);
-
-            self.reader = std.io.Reader.fixed(self.buf);
-        }
-
-        /// Get the next directory entry, or null if no more entries
-        /// Automatically fetches more entries from the kernel when needed
-        pub fn next(self: *@This()) !?Entry {
-            if (self.n == 0) {
-                try self.pump();
-                if (self.n == 0) return null;
-            }
-
-            const reclen = try self.reader.peekInt(u32, .little);
-            const recbuf = try self.reader.peek(reclen);
-            var rec = std.io.Reader.fixed(recbuf);
-            try self.reader.discardAll(@as(usize, reclen));
-            self.n -= 1;
-
-            // Take a pointer, so we can find the name slice by pointer arithmetic.
-            // If we use takeStruct, we wouldn't have the buffer address of name_ref.
-            // We can't use takeStructPointer because @SizeOf(Payload) is aligned
-            // even though it's packed, so we would advance too far.
-            // So we peekStructPointer and then advance with takeStruct, which works.
-
-            const payload = try rec.peekStructPointer(Payload);
-            _ = try rec.takeStruct(Payload, .little);
-
-            const namerefptr = @as([*]u8, @ptrCast(&payload.name_ref));
-            const namestart = if (payload.name_ref.off < 0)
-                namerefptr - @abs(payload.name_ref.off)
-            else
-                namerefptr + @abs(payload.name_ref.off);
-            const name = namestart[0 .. payload.name_ref.len - 1 :0];
-
-            var entry = Entry{
-                .name = name,
-                .kind = switch (payload.objtype) {
-                    VDIR => .dir,
-                    VREG => .file,
-                    VLNK => .symlink,
-                    else => .other,
+            pub const Payload = PayloadFor(mask);
+            pub const Entry = struct {
+                name: [:0]const u8,
+                kind: Kind,
+                details: union(enum) {
+                    dir: struct { datalength: u64 },
+                    file: struct { totalsize: u64 },
+                    other: void,
                 },
-                .fsid = payload.fsid,
-                .fileid = payload.fileid,
-                .details = undefined,
             };
 
-            switch (payload.objtype) {
-                VDIR => {
-                    const dir = try rec.takeStruct(DirPayloadFor(mask.dir), .little);
-                    entry.details = .{
-                        .dir = .{
-                            .linkcount = dir.linkcount,
-                            .entrycount = dir.entrycount,
-                            .mountstatus = dir.mountstatus,
-                            .allocsize = dir.allocsize,
-                            .ioblocksize = dir.ioblocksize,
-                            .datalength = dir.datalength,
-                        },
-                    };
-                },
-                VREG => {
-                    const file = try rec.takeStruct(FilePayloadFor(mask.file), .little);
-                    entry.details = .{
-                        .file = .{
-                            .linkcount = file.linkcount,
-                            .totalsize = file.totalsize,
-                            .allocsize = file.allocsize,
-                        },
-                    };
-                },
-                else => {},
+            dir: std.fs.Dir,
+            iterator: std.fs.Dir.Iterator,
+            buf: []u8,
+
+            /// Initialize a new scanner with a directory file descriptor and buffer.
+            pub fn init(fd: std.posix.fd_t, buf: []u8) @This() {
+                var scanner = @This(){
+                    .dir = .{ .fd = fd },
+                    .iterator = undefined,
+                    .buf = buf,
+                };
+                scanner.iterator = scanner.dir.iterateAssumeFirstIteration();
+                return scanner;
             }
 
-            return entry;
-        }
-    };
+            /// Get the next directory entry, or null if no more entries.
+            pub fn next(self: *@This()) !?Entry {
+                while (try self.iterator.next()) |dir_entry| {
+                    const name = dir_entry.name;
+                    if (name.len + 1 > self.buf.len) {
+                        return error.BufferTooSmall;
+                    }
+
+                    const dest = self.buf[0 .. name.len + 1];
+                    std.mem.copyForwards(u8, dest[0..name.len], name);
+                    dest[name.len] = 0;
+
+                    const entry_kind: Kind = switch (dir_entry.kind) {
+                        .directory => .dir,
+                        .file => .file,
+                        .sym_link => .symlink,
+                        else => .other,
+                    };
+
+                    var entry = Entry{
+                        .name = dest[0..name.len :0],
+                        .kind = entry_kind,
+                        .details = .{ .other = {} },
+                    };
+
+                    switch (entry_kind) {
+                        .dir => {
+                            const stat = try self.dir.statFile(name);
+                            entry.details = .{ .dir = .{ .datalength = stat.size } };
+                        },
+                        .file => {
+                            const stat = try self.dir.statFile(name);
+                            entry.details = .{ .file = .{ .totalsize = stat.size } };
+                        },
+                        else => {},
+                    }
+
+                    return entry;
+                }
+
+                return null;
+            }
+        };
+    }
 }
