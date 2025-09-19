@@ -1,28 +1,30 @@
-// mac_bulk.zig — getattrlistbulk() with extern structs, no @cInclude.
 const std = @import("std");
 const posix = std.posix;
 
 // ======== Darwin constants we need (from <sys/attr.h> / <sys/vnode.h>) ========
 
-// FSOPT_* (getattrlistbulk options)
 const FSOPT_NOFOLLOW: u32 = 0x0000_0001;
 const FSOPT_REPORT_FULLSIZE: u32 = 0x0000_0004;
 const FSOPT_PACK_INVAL_ATTRS: u32 = 0x0000_0008;
 
-// attrlist bitmaps
 const ATTR_BIT_MAP_COUNT: u16 = 5;
 
-// Common attrs
 const ATTR_CMN_NAME: u32 = 0x0000_0001;
 const ATTR_CMN_FSID: u32 = 0x0000_0004;
 const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
 const ATTR_CMN_FILEID: u32 = 0x0200_0000;
 const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
 
-// File attrs
 const ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001;
 const ATTR_FILE_TOTALSIZE: u32 = 0x0000_0002;
 const ATTR_FILE_ALLOCSIZE: u32 = 0x0000_0004;
+
+const ATTR_DIR_LINKCOUNT: u32 = 0x0000_0001;
+const ATTR_DIR_ENTRYCOUNT: u32 = 0x0000_0002;
+const ATTR_DIR_MOUNTSTATUS: u32 = 0x0000_0004;
+const ATTR_DIR_ALLOCSIZE: u32 = 0x0000_0008;
+const ATTR_DIR_IOBLOCKSIZE: u32 = 0x0000_0010;
+const ATTR_DIR_DATALENGTH: u32 = 0x0000_0020;
 
 const CommonAttrMask = packed struct(u32) {
     name: bool = false,
@@ -32,7 +34,7 @@ const CommonAttrMask = packed struct(u32) {
     pad1: u21 = 0,
     file_id: bool = false,
     pad2: u5 = 0,
-    returned_attrs: bool = false,
+    returned_attrs: bool = true,
 };
 
 const DirAttrMask = packed struct(u32) {
@@ -47,12 +49,12 @@ const DirAttrMask = packed struct(u32) {
 
 const FileAttrMask = packed struct(u32) {
     linkcount: bool = false,
-    total_size: bool = false,
-    alloc_size: bool = false,
+    totalsize: bool = false,
+    allocsize: bool = false,
     pad0: u29 = 0,
 };
 
-const AttrGroupMask = packed struct(u160) align(4) {
+const AttrGroupMask = packed struct(u160) {
     common: CommonAttrMask = .{},
     vol: u32 = 0,
     dir: DirAttrMask = .{},
@@ -85,145 +87,195 @@ const VBAD: u32 = 8;
 // (others exist; we only need the basics)
 
 const AttrList = packed struct {
-    bitmapcount: u16 = ATTR_BIT_MAP_COUNT,
-    reserved: u16 = 0,
-    commonattr: u32,
-    volattr: u32,
-    dirattr: u32,
-    fileattr: u32,
-    forkattr: u32,
+    bitmapcount: u16,
+    reserved: u16,
+    attrs: AttrGroupMask,
 };
 
 const AttributeSet = packed struct {
-    commonattr: u32,
-    volattr: u32,
-    dirattr: u32,
-    fileattr: u32,
-    forkattr: u32,
+    attrs: AttrGroupMask,
 };
 
 const AttrRef = packed struct {
-    attr_dataoffset: i32,
-    attr_length: u32,
+    off: i32,
+    len: u32,
 };
 
 const Fsid = packed struct { id0: i32, id1: i32 };
 
-const Payload = packed struct {
-    reclen: u32, // total length of this record in bytes
-    returned: AttributeSet, // ATTR_CMN_RETURNED_ATTRS payload
-    name_ref: AttrRef, // ATTR_CMN_NAME (actual string lives elsewhere in record)
-    fsid: Fsid,
-    objtype: u32,
-    fileid: u64,
-    linkcount: u32,
-    total: u64,
-    alloc: u64,
-};
+fn DirPayloadFor(mask: DirAttrMask) type {
+    return packed struct {
+        linkcount: if (mask.linkcount) u32 else void,
+        entrycount: if (mask.entrycount) u32 else void,
+        mountstatus: if (mask.mountstatus) u32 else void,
+        allocsize: if (mask.allocsize) u64 else void,
+        ioblocksize: if (mask.ioblocksize) u32 else void,
+        datalength: if (mask.datalength) u64 else void,
+    };
+}
+
+fn FilePayloadFor(mask: FileAttrMask) type {
+    return packed struct {
+        linkcount: if (mask.linkcount) u32 else void,
+        totalsize: if (mask.totalsize) u64 else void,
+        allocsize: if (mask.allocsize) u64 else void,
+    };
+}
+
+pub fn PayloadFor(mask: AttrGroupMask) type {
+    return packed struct {
+        len: u32,
+        returned: AttributeSet,
+        name_ref: if (mask.common.name) AttrRef else void,
+        fsid: if (mask.common.fsid) Fsid else void,
+        objtype: if (mask.common.obj_type) u32 else void,
+        fileid: if (mask.common.file_id) u64 else void,
+    };
+}
 
 extern "c" fn getattrlistbulk(
     dirfd: std.posix.fd_t,
     alist: *const AttrList,
     attrbuf: *anyopaque,
     buflen: usize,
-    options: u32,
+    options: FsOptMask,
 ) c_int;
-
-// ======== Public API ========
 
 pub const Kind = enum { file, dir, symlink, other };
 
-pub const Entry = struct {
-    name: [:0]const u8, // UTF-8
-    kind: Kind,
-    fsid: Fsid,
-    fileid: u64,
-    linkcount: u32,
-    total: u64, // apparent bytes
-    alloc: u64, // allocated/physical bytes
-};
-
-pub fn scanDirBulk(
-    dir_fd: std.posix.fd_t,
-    gpa: std.mem.Allocator,
-    cb: anytype, // fn (e: Entry) void
-) !usize {
-    const requested_common = CommonAttrMask{
-        .returned_attrs = true,
-        .name = true,
-        .obj_type = true,
-        .fsid = true,
-        .file_id = true,
+pub fn EntryFor(mask: AttrGroupMask) type {
+    return struct {
+        name: if (mask.common.name) [:0]const u8 else void,
+        kind: if (mask.common.obj_type) Kind else void,
+        fsid: if (mask.common.fsid) Fsid else void,
+        fileid: if (mask.common.file_id) u64 else void,
+        details: union(enum) {
+            dir: struct {
+                linkcount: if (mask.dir.linkcount) u32 else void,
+                entrycount: if (mask.dir.entrycount) u32 else void,
+                mountstatus: if (mask.dir.mountstatus) u32 else void,
+                allocsize: if (mask.dir.allocsize) u64 else void,
+                ioblocksize: if (mask.dir.ioblocksize) u32 else void,
+                datalength: if (mask.dir.datalength) u64 else void,
+            },
+            file: struct {
+                linkcount: if (mask.file.linkcount) u32 else void,
+                totalsize: if (mask.file.totalsize) u64 else void,
+                allocsize: if (mask.file.allocsize) u64 else void,
+            },
+            other: void,
+        },
     };
-    const requested_file = FileAttrMask{
-        .linkcount = true,
-        .total_size = true,
-        .alloc_size = true,
-    };
-    const opts_mask = FsOptMask{
-        .nofollow = true,
-        .report_fullsize = true,
-        .pack_invalid_attrs = true,
-    };
+}
 
-    var al = AttrList{
-        .commonattr = maskValue(requested_common),
-        .volattr = 0,
-        .dirattr = 0,
-        .fileattr = maskValue(requested_file),
-        .forkattr = 0,
-    };
+pub fn DirScanner(mask: AttrGroupMask, Ctx: type) type {
+    return struct {
+        pub const Payload = PayloadFor(mask);
+        pub const Entry = EntryFor(mask);
 
-    const buf = try gpa.alloc(u8, 128 * 1024);
-    defer gpa.free(buf);
+        pub fn scan(
+            gpa: std.mem.Allocator,
+            dir_fd: std.posix.fd_t,
+            ctx: Ctx,
+            callback: *const fn (ctx: Ctx, entry: Entry) anyerror!void,
+        ) anyerror!usize {
+            const opts_mask = FsOptMask{
+                .nofollow = true,
+                .report_fullsize = true,
+                .pack_invalid_attrs = true,
+            };
 
-    const opts: u32 = maskValue(opts_mask);
+            var al = AttrList{
+                .bitmapcount = ATTR_BIT_MAP_COUNT,
+                .reserved = 0,
+                .attrs = mask,
+            };
 
-    var total: usize = 0;
-    while (true) {
-        const n = getattrlistbulk(dir_fd, &al, buf.ptr, buf.len, opts);
-        if (n <= 0) {
-            if (n < 0) {
-                const err = posix.errno(n);
-                std.debug.print("getattrlistbulk errno={s}\n", .{@tagName(err)});
+            const buf = try gpa.alloc(u8, 128 * 1024);
+            defer gpa.free(buf);
+
+            var total: usize = 0;
+            while (true) {
+                const n = getattrlistbulk(dir_fd, &al, buf.ptr, buf.len, opts_mask);
+                std.debug.print("getattrlistbulk returned {d}\n", .{n});
+                if (n <= 0) {
+                    if (n < 0) {
+                        const err = posix.errno(n);
+                        std.debug.print("getattrlistbulk errno={s}\n", .{@tagName(err)});
+                    }
+                    break;
+                }
+
+                var chunk_reader = std.io.Reader.fixed(buf);
+                var record_index: usize = 0;
+                while (record_index < @as(usize, @intCast(n))) : (record_index += 1) {
+                    const reclen = try chunk_reader.peekInt(u32, .little);
+                    const recbuf = try chunk_reader.peek(reclen);
+                    var rec = std.io.Reader.fixed(recbuf);
+                    try chunk_reader.discardAll(@as(usize, reclen));
+
+                    // Take a pointer, so we can find the name slice by pointer arithmetic.
+                    // If we use takeStruct, we wouldn't have the buffer address of name_ref.
+                    // We can't use takeStructPointer because @SizeOf(Payload) is aligned
+                    // even though it's packed, so we would advance too far.
+                    // So we peekStructPointer and then advance with takeStruct, which works.
+
+                    const payload = try rec.peekStructPointer(Payload);
+                    _ = try rec.takeStruct(Payload, .little);
+
+                    const namerefptr = @as([*]u8, @ptrCast(&payload.name_ref));
+                    const namestart = if (payload.name_ref.off < 0)
+                        namerefptr - @abs(payload.name_ref.off)
+                    else
+                        namerefptr + @abs(payload.name_ref.off);
+                    const name = namestart[0 .. payload.name_ref.len - 1 :0];
+
+                    var entry = Entry{
+                        .name = name,
+                        .kind = switch (payload.objtype) {
+                            VDIR => .dir,
+                            VREG => .file,
+                            VLNK => .symlink,
+                            else => .other,
+                        },
+                        .fsid = payload.fsid,
+                        .fileid = payload.fileid,
+                        .details = undefined,
+                    };
+
+                    switch (payload.objtype) {
+                        VDIR => {
+                            const dir = try rec.takeStruct(DirPayloadFor(mask.dir), .little);
+                            entry.details = .{
+                                .dir = .{
+                                    .linkcount = dir.linkcount,
+                                    .entrycount = dir.entrycount,
+                                    .mountstatus = dir.mountstatus,
+                                    .allocsize = dir.allocsize,
+                                    .ioblocksize = dir.ioblocksize,
+                                    .datalength = dir.datalength,
+                                },
+                            };
+                        },
+                        VREG => {
+                            const file = try rec.takeStruct(FilePayloadFor(mask.file), .little);
+                            entry.details = .{
+                                .file = .{
+                                    .linkcount = file.linkcount,
+                                    .totalsize = file.totalsize,
+                                    .allocsize = file.allocsize,
+                                },
+                            };
+                        },
+                        else => {},
+                    }
+
+                    try callback(ctx, entry);
+
+                    total += 1;
+                }
             }
-            break;
+            return total;
         }
-
-        var chunk_reader = std.io.Reader.fixed(buf);
-        var record_index: usize = 0;
-        while (record_index < @as(usize, @intCast(n))) : (record_index += 1) {
-            const payload = try chunk_reader.peekStructPointer(Payload);
-            try chunk_reader.discardAll(@as(usize, payload.reclen));
-
-            // extract name
-            const namerefptr = @as([*]u8, @ptrCast(&payload.name_ref));
-            const namestart = if (payload.name_ref.attr_dataoffset < 0)
-                namerefptr - @abs(payload.name_ref.attr_dataoffset)
-            else
-                namerefptr + @abs(payload.name_ref.attr_dataoffset);
-            const name = namestart[0 .. payload.name_ref.attr_length - 1 :0];
-
-            std.debug.print("record[{d}] {any}\n", .{ record_index, payload });
-
-            // deliver
-            cb(Entry{
-                .name = name,
-                .kind = switch (payload.objtype) {
-                    VDIR => .dir,
-                    VREG => .file,
-                    VLNK => .symlink,
-                    else => .other,
-                },
-                .fsid = payload.fsid,
-                .fileid = payload.fileid,
-                .linkcount = payload.linkcount,
-                .total = payload.total,
-                .alloc = payload.alloc,
-            });
-
-            total += 1;
-        }
-    }
-    return total;
+    };
 }

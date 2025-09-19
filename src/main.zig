@@ -7,25 +7,56 @@ const stdout = &stdout_writer.interface;
 pub fn main() !void {
     const gpa = std.heap.page_allocator;
 
-    var dir = try std.fs.cwd().openDir(".", .{ .iterate = true });
-    defer dir.close();
+    var rootdir = try std.fs.cwd().openDir(".", .{ .iterate = true });
+    defer rootdir.close();
 
-    try stdout.print("Scanning dir (fd={d})...\n", .{dir.fd});
+    try stdout.print("Scanning dir (fd={d})...\n", .{rootdir.fd});
 
-    const result = try wtfs.scanDirBulk(dir.fd, gpa, struct {
-        fn on(e: wtfs.Entry) void {
-            stdout.print("{s}\t{s}\t{d} alloc={d} total={d}\n", .{
-                switch (e.kind) {
-                    .dir => "dir ",
-                    .file => "file",
-                    .symlink => "lnk ",
-                    .other => "oth ",
+    const Scanner = wtfs.DirScanner(.{
+        .common = .{
+            .name = true,
+            .obj_type = true,
+            .file_id = true,
+            .fsid = true,
+        },
+        .dir = .{
+            .linkcount = true,
+            .entrycount = false,
+            .mountstatus = false,
+            .allocsize = true,
+            .ioblocksize = false,
+            .datalength = false,
+        },
+        .file = .{
+            .linkcount = true,
+            .totalsize = true,
+            .allocsize = true,
+        },
+    }, void);
+
+    const result = try Scanner.scan(gpa, rootdir.fd, void{}, struct {
+        fn on(_: void, e: Scanner.Entry) !void {
+            try stdout.print("{s} ", .{e.name});
+            switch (e.kind) {
+                .file => try stdout.print("(file) ", .{}),
+                .dir => try stdout.print("(dir) ", .{}),
+                .symlink => try stdout.print("(symlink) ", .{}),
+                .other => try stdout.print("(other) ", .{}),
+            }
+            try stdout.print("  {x}:{x}\n", .{ e.fsid.id0, e.fsid.id1 });
+            try stdout.print("  fileid={x}\n", .{e.fileid});
+            switch (e.details) {
+                .dir => |dir| {
+                    try stdout.print("  linkcount={d}\n", .{dir.linkcount});
+                    try stdout.print("  allocsize={Bi: <.2}\n", .{dir.allocsize});
                 },
-                e.name,
-                e.linkcount,
-                e.alloc,
-                e.total,
-            }) catch {};
+                .file => |file| {
+                    try stdout.print("  linkcount={d}\n", .{file.linkcount});
+                    try stdout.print("  totalsize={Bi: <.2}\n", .{file.totalsize});
+                    try stdout.print("  allocsize={Bi: <.2}\n", .{file.allocsize});
+                },
+                .other => {},
+            }
         }
     }.on);
 
