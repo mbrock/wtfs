@@ -3,28 +3,7 @@ const posix = std.posix;
 
 // ======== Darwin constants we need (from <sys/attr.h> / <sys/vnode.h>) ========
 
-const FSOPT_NOFOLLOW: u32 = 0x0000_0001;
-const FSOPT_REPORT_FULLSIZE: u32 = 0x0000_0004;
-const FSOPT_PACK_INVAL_ATTRS: u32 = 0x0000_0008;
-
 const ATTR_BIT_MAP_COUNT: u16 = 5;
-
-const ATTR_CMN_NAME: u32 = 0x0000_0001;
-const ATTR_CMN_FSID: u32 = 0x0000_0004;
-const ATTR_CMN_OBJTYPE: u32 = 0x0000_0008;
-const ATTR_CMN_FILEID: u32 = 0x0200_0000;
-const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
-
-const ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001;
-const ATTR_FILE_TOTALSIZE: u32 = 0x0000_0002;
-const ATTR_FILE_ALLOCSIZE: u32 = 0x0000_0004;
-
-const ATTR_DIR_LINKCOUNT: u32 = 0x0000_0001;
-const ATTR_DIR_ENTRYCOUNT: u32 = 0x0000_0002;
-const ATTR_DIR_MOUNTSTATUS: u32 = 0x0000_0004;
-const ATTR_DIR_ALLOCSIZE: u32 = 0x0000_0008;
-const ATTR_DIR_IOBLOCKSIZE: u32 = 0x0000_0010;
-const ATTR_DIR_DATALENGTH: u32 = 0x0000_0020;
 
 const CommonAttrMask = packed struct(u32) {
     name: bool = false,
@@ -168,17 +147,25 @@ pub fn EntryFor(mask: AttrGroupMask) type {
     };
 }
 
-pub fn DirScanner(mask: AttrGroupMask, Ctx: type) type {
+pub fn DirScanner(mask: AttrGroupMask) type {
     return struct {
         pub const Payload = PayloadFor(mask);
         pub const Entry = EntryFor(mask);
 
-        pub fn scan(
-            gpa: std.mem.Allocator,
-            dir_fd: std.posix.fd_t,
-            ctx: Ctx,
-            callback: *const fn (ctx: Ctx, entry: Entry) anyerror!void,
-        ) anyerror!usize {
+        fd: std.posix.fd_t,
+        reader: std.io.Reader,
+        buf: []u8,
+        n: usize = 0,
+
+        pub fn init(fd: std.posix.fd_t, buf: []u8) @This() {
+            return .{
+                .fd = fd,
+                .reader = std.io.Reader.fixed(buf),
+                .buf = buf,
+            };
+        }
+
+        fn pump(self: *@This()) !void {
             const opts_mask = FsOptMask{
                 .nofollow = true,
                 .report_fullsize = true,
@@ -191,91 +178,98 @@ pub fn DirScanner(mask: AttrGroupMask, Ctx: type) type {
                 .attrs = mask,
             };
 
-            const buf = try gpa.alloc(u8, 128 * 1024);
-            defer gpa.free(buf);
-
-            var total: usize = 0;
-            while (true) {
-                const n = getattrlistbulk(dir_fd, &al, buf.ptr, buf.len, opts_mask);
-                std.debug.print("getattrlistbulk returned {d}\n", .{n});
-                if (n <= 0) {
-                    if (n < 0) {
-                        const err = posix.errno(n);
-                        std.debug.print("getattrlistbulk errno={s}\n", .{@tagName(err)});
-                    }
-                    break;
-                }
-
-                var chunk_reader = std.io.Reader.fixed(buf);
-                var record_index: usize = 0;
-                while (record_index < @as(usize, @intCast(n))) : (record_index += 1) {
-                    const reclen = try chunk_reader.peekInt(u32, .little);
-                    const recbuf = try chunk_reader.peek(reclen);
-                    var rec = std.io.Reader.fixed(recbuf);
-                    try chunk_reader.discardAll(@as(usize, reclen));
-
-                    // Take a pointer, so we can find the name slice by pointer arithmetic.
-                    // If we use takeStruct, we wouldn't have the buffer address of name_ref.
-                    // We can't use takeStructPointer because @SizeOf(Payload) is aligned
-                    // even though it's packed, so we would advance too far.
-                    // So we peekStructPointer and then advance with takeStruct, which works.
-
-                    const payload = try rec.peekStructPointer(Payload);
-                    _ = try rec.takeStruct(Payload, .little);
-
-                    const namerefptr = @as([*]u8, @ptrCast(&payload.name_ref));
-                    const namestart = if (payload.name_ref.off < 0)
-                        namerefptr - @abs(payload.name_ref.off)
-                    else
-                        namerefptr + @abs(payload.name_ref.off);
-                    const name = namestart[0 .. payload.name_ref.len - 1 :0];
-
-                    var entry = Entry{
-                        .name = name,
-                        .kind = switch (payload.objtype) {
-                            VDIR => .dir,
-                            VREG => .file,
-                            VLNK => .symlink,
-                            else => .other,
-                        },
-                        .fsid = payload.fsid,
-                        .fileid = payload.fileid,
-                        .details = undefined,
-                    };
-
-                    switch (payload.objtype) {
-                        VDIR => {
-                            const dir = try rec.takeStruct(DirPayloadFor(mask.dir), .little);
-                            entry.details = .{
-                                .dir = .{
-                                    .linkcount = dir.linkcount,
-                                    .entrycount = dir.entrycount,
-                                    .mountstatus = dir.mountstatus,
-                                    .allocsize = dir.allocsize,
-                                    .ioblocksize = dir.ioblocksize,
-                                    .datalength = dir.datalength,
-                                },
-                            };
-                        },
-                        VREG => {
-                            const file = try rec.takeStruct(FilePayloadFor(mask.file), .little);
-                            entry.details = .{
-                                .file = .{
-                                    .linkcount = file.linkcount,
-                                    .totalsize = file.totalsize,
-                                    .allocsize = file.allocsize,
-                                },
-                            };
-                        },
-                        else => {},
-                    }
-
-                    try callback(ctx, entry);
-
-                    total += 1;
+            const n = getattrlistbulk(self.fd, &al, self.buf.ptr, self.buf.len, opts_mask);
+            if (n < 0) {
+                switch (posix.errno(n)) {
+                    .INTR, .AGAIN => {},
+                    .NOENT => return error.FileNotFound,
+                    .NOTDIR => return error.NotDir,
+                    .BADF => return error.BadFileDescriptor,
+                    .ACCES => return error.PermissionDenied,
+                    .FAULT => return error.BadAddress,
+                    .RANGE => return error.BufferTooSmall,
+                    .INVAL => return error.InvalidArgument,
+                    .IO => return error.ReadFailed,
+                    else => unreachable,
                 }
             }
-            return total;
+
+            if (n == 0) return;
+
+            self.n = @abs(n);
+
+            self.reader = std.io.Reader.fixed(self.buf);
+        }
+
+        pub fn next(self: *@This()) !?Entry {
+            if (self.n == 0) {
+                try self.pump();
+                if (self.n == 0) return null;
+            }
+
+            const reclen = try self.reader.peekInt(u32, .little);
+            const recbuf = try self.reader.peek(reclen);
+            var rec = std.io.Reader.fixed(recbuf);
+            try self.reader.discardAll(@as(usize, reclen));
+            self.n -= 1;
+
+            // Take a pointer, so we can find the name slice by pointer arithmetic.
+            // If we use takeStruct, we wouldn't have the buffer address of name_ref.
+            // We can't use takeStructPointer because @SizeOf(Payload) is aligned
+            // even though it's packed, so we would advance too far.
+            // So we peekStructPointer and then advance with takeStruct, which works.
+
+            const payload = try rec.peekStructPointer(Payload);
+            _ = try rec.takeStruct(Payload, .little);
+
+            const namerefptr = @as([*]u8, @ptrCast(&payload.name_ref));
+            const namestart = if (payload.name_ref.off < 0)
+                namerefptr - @abs(payload.name_ref.off)
+            else
+                namerefptr + @abs(payload.name_ref.off);
+            const name = namestart[0 .. payload.name_ref.len - 1 :0];
+
+            var entry = Entry{
+                .name = name,
+                .kind = switch (payload.objtype) {
+                    VDIR => .dir,
+                    VREG => .file,
+                    VLNK => .symlink,
+                    else => .other,
+                },
+                .fsid = payload.fsid,
+                .fileid = payload.fileid,
+                .details = undefined,
+            };
+
+            switch (payload.objtype) {
+                VDIR => {
+                    const dir = try rec.takeStruct(DirPayloadFor(mask.dir), .little);
+                    entry.details = .{
+                        .dir = .{
+                            .linkcount = dir.linkcount,
+                            .entrycount = dir.entrycount,
+                            .mountstatus = dir.mountstatus,
+                            .allocsize = dir.allocsize,
+                            .ioblocksize = dir.ioblocksize,
+                            .datalength = dir.datalength,
+                        },
+                    };
+                },
+                VREG => {
+                    const file = try rec.takeStruct(FilePayloadFor(mask.file), .little);
+                    entry.details = .{
+                        .file = .{
+                            .linkcount = file.linkcount,
+                            .totalsize = file.totalsize,
+                            .allocsize = file.allocsize,
+                        },
+                    };
+                },
+                else => {},
+            }
+
+            return entry;
         }
     };
 }
