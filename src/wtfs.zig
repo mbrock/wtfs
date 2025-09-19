@@ -101,6 +101,8 @@ fn FilePayloadFor(mask: FileAttrMask) type {
     };
 }
 
+/// Generates a packed struct type for the payload returned by getattrlistbulk
+/// based on the requested attributes in the mask
 pub fn PayloadFor(mask: AttrGroupMask) type {
     return packed struct {
         len: u32,
@@ -120,8 +122,11 @@ extern "c" fn getattrlistbulk(
     options: FsOptMask,
 ) c_int;
 
+/// Represents the type of a file system object
 pub const Kind = enum { file, dir, symlink, other };
 
+/// Generates a struct type representing a directory entry with fields
+/// populated based on the requested attributes in the mask
 pub fn EntryFor(mask: AttrGroupMask) type {
     return struct {
         name: if (mask.common.name) [:0]const u8 else void,
@@ -147,6 +152,8 @@ pub fn EntryFor(mask: AttrGroupMask) type {
     };
 }
 
+/// Creates a directory scanner type that uses getattrlistbulk to efficiently
+/// iterate over directory entries with the specified attributes
 pub fn DirScanner(mask: AttrGroupMask) type {
     return struct {
         pub const Payload = PayloadFor(mask);
@@ -157,6 +164,8 @@ pub fn DirScanner(mask: AttrGroupMask) type {
         buf: []u8,
         n: usize = 0,
 
+        /// Initialize a new scanner with a directory file descriptor and buffer
+        /// The buffer will be used for storing the bulk attribute results
         pub fn init(fd: std.posix.fd_t, buf: []u8) @This() {
             return .{
                 .fd = fd,
@@ -201,6 +210,8 @@ pub fn DirScanner(mask: AttrGroupMask) type {
             self.reader = std.io.Reader.fixed(self.buf);
         }
 
+        /// Get the next directory entry, or null if no more entries
+        /// Automatically fetches more entries from the kernel when needed
         pub fn next(self: *@This()) !?Entry {
             if (self.n == 0) {
                 try self.pump();
