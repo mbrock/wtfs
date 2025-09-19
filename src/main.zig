@@ -17,8 +17,9 @@ const Scanner = wtfs.DirScanner(.{
         .totalsize = true,
     },
 });
+const AtomicUsize = std.atomic.Value(usize);
 
-const WorkItem = struct {
+const QueueFields = struct {
     path: []u8,
     depth: usize,
     parent: ?usize,
@@ -27,6 +28,146 @@ const WorkItem = struct {
     total_dirs: usize = 1,
     inaccessible: bool = false,
 };
+
+const WorkQueue = std.MultiArrayList(QueueFields);
+
+const ItemSnapshot = struct {
+    path: []const u8,
+    depth: usize,
+};
+
+const Context = struct {
+    allocator: std.mem.Allocator,
+    queue: *WorkQueue,
+    pool: *std.Thread.Pool,
+    wait_group: *std.Thread.WaitGroup,
+    progress_node: std.Progress.Node,
+    skip_hidden: bool,
+    inaccessible_dirs: AtomicUsize = AtomicUsize.init(0),
+    queue_mutex: std.Thread.Mutex = .{},
+
+    fn snapshot(self: *Context, index: usize) ItemSnapshot {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        const slice = self.queue.slice();
+        return .{
+            .path = slice.items(.path)[index],
+            .depth = slice.items(.depth)[index],
+        };
+    }
+
+    fn setTotals(self: *Context, index: usize, size: u64, files: usize) void {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        const slice = self.queue.slice();
+        slice.items(.total_size)[index] = size;
+        slice.items(.total_files)[index] = files;
+        slice.items(.total_dirs)[index] = 1;
+    }
+
+    fn markInaccessible(self: *Context, index: usize) void {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        const slice = self.queue.slice();
+        slice.items(.inaccessible)[index] = true;
+        slice.items(.total_size)[index] = 0;
+        slice.items(.total_files)[index] = 0;
+        slice.items(.total_dirs)[index] = 1;
+    }
+
+    fn addDirectory(self: *Context, parent_index: usize, path: []u8) !usize {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        const slice = self.queue.slice();
+        const parent_depth = slice.items(.depth)[parent_index];
+
+        const new_index = try self.queue.addOne(self.allocator);
+        self.queue.set(new_index, .{
+            .path = path,
+            .depth = parent_depth + 1,
+            .parent = parent_index,
+            .total_size = 0,
+            .total_files = 0,
+            .total_dirs = 1,
+            .inaccessible = false,
+        });
+
+        return new_index;
+    }
+};
+
+fn directoryWorker(ctx: *Context, index: usize) void {
+    defer ctx.progress_node.completeOne();
+    processDirectory(ctx, index) catch |err| {
+        const snap = ctx.snapshot(index);
+        std.log.err("failed to process {s}: {s}", .{ snap.path, @errorName(err) });
+        _ = ctx.inaccessible_dirs.fetchAdd(1, .monotonic);
+        ctx.markInaccessible(index);
+    };
+}
+
+fn processDirectory(ctx: *Context, index: usize) !void {
+    var buf: [16 * 1024]u8 = undefined;
+    const snap = ctx.snapshot(index);
+
+    var dir = std.fs.cwd().openDir(snap.path, .{ .iterate = true }) catch |err| switch (err) {
+        error.PermissionDenied, error.AccessDenied => {
+            _ = ctx.inaccessible_dirs.fetchAdd(1, .monotonic);
+            ctx.markInaccessible(index);
+            return;
+        },
+        else => return err,
+    };
+    defer dir.close();
+
+    var scanner = Scanner.init(dir.fd, &buf);
+    var total_size: u64 = 0;
+    var total_files: usize = 0;
+
+    while (try scanner.next()) |entry| {
+        const name = std.mem.sliceTo(entry.name, 0);
+        if (name.len == 0) continue;
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+
+        const child_path = std.fs.path.join(ctx.allocator, &[_][]const u8{ snap.path, name }) catch |join_err| {
+            std.log.warn("unable to join path {s}/{s}: {s}", .{ snap.path, name, @errorName(join_err) });
+            continue;
+        };
+
+        switch (entry.kind) {
+            .dir => {
+                if (ctx.skip_hidden and name[0] == '.') {
+                    ctx.allocator.free(child_path);
+                    continue;
+                }
+
+                const child_index = ctx.addDirectory(index, child_path) catch |add_err| {
+                    std.log.err("unable to enqueue directory {s}: {s}", .{ child_path, @errorName(add_err) });
+                    ctx.allocator.free(child_path);
+                    continue;
+                };
+
+                ctx.progress_node.increaseEstimatedTotalItems(1);
+                ctx.pool.spawnWg(ctx.wait_group, directoryWorker, .{ ctx, child_index });
+            },
+            .file => {
+                const file = entry.details.file;
+                total_size += file.totalsize;
+                total_files += 1;
+                ctx.allocator.free(child_path);
+            },
+            .symlink, .other => {
+                ctx.allocator.free(child_path);
+            },
+        }
+    }
+
+    ctx.setTotals(index, total_size, total_files);
+}
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
@@ -62,138 +203,103 @@ pub fn main() !void {
 
     const root = root_arg orelse ".";
 
-    var queue = std.ArrayList(WorkItem){};
+    var queue = WorkQueue{};
     defer {
-        for (queue.items) |item| {
-            allocator.free(item.path);
+        const slice = queue.slice();
+        const paths = slice.items(.path);
+        for (paths) |p| {
+            allocator.free(p);
         }
         queue.deinit(allocator);
     }
 
-    try queue.append(allocator, .{
-        .path = try allocator.dupe(u8, root),
+    const root_path = try allocator.dupe(u8, root);
+    const root_index = try queue.addOne(allocator);
+    queue.set(root_index, .{
+        .path = root_path,
         .depth = 0,
         .parent = null,
+        .total_size = 0,
+        .total_files = 0,
+        .total_dirs = 1,
+        .inaccessible = false,
     });
-
-    var cursor: usize = 0;
-    var buf: [16 * 1024]u8 = undefined;
-    var inaccessible_dirs: usize = 0;
 
     var progress_root = std.Progress.start(.{ .root_name = "Scanning" });
     defer progress_root.end();
 
     var progress_node = progress_root.start("directories", 0);
     defer progress_node.end();
-    progress_node.setEstimatedTotalItems(queue.items.len);
+    progress_node.setEstimatedTotalItems(1);
 
-    var processed_dirs: usize = 0;
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{ .allocator = allocator });
+    defer pool.deinit();
 
-    while (cursor < queue.items.len) : (cursor += 1) {
-        const item_index = cursor;
-        const item = queue.items[item_index];
+    var wait_group: std.Thread.WaitGroup = .{};
 
-        progress_node.setName(item.path);
-        defer {
-            processed_dirs += 1;
-            progress_node.setCompletedItems(processed_dirs);
-        }
+    var ctx = Context{
+        .allocator = allocator,
+        .queue = &queue,
+        .pool = &pool,
+        .wait_group = &wait_group,
+        .progress_node = progress_node,
+        .skip_hidden = skip_hidden,
+    };
 
-        var dir_total: u64 = 0;
-        var file_count: usize = 0;
+    pool.spawnWg(&wait_group, directoryWorker, .{ &ctx, root_index });
 
-        var dir = std.fs.cwd().openDir(item.path, .{ .iterate = true }) catch |err| switch (err) {
-            error.PermissionDenied, error.AccessDenied => {
-                queue.items[item_index].inaccessible = true;
-                queue.items[item_index].total_size = 0;
-                queue.items[item_index].total_files = 0;
-                inaccessible_dirs += 1;
-                continue;
-            },
-            else => return err,
-        };
-        defer dir.close();
+    wait_group.wait();
 
-        var scanner = Scanner.init(dir.fd, &buf);
+    var slice = queue.slice();
+    var total_size = slice.items(.total_size);
+    var total_files = slice.items(.total_files);
+    var total_dirs = slice.items(.total_dirs);
+    const parents = slice.items(.parent);
 
-        while (try scanner.next()) |entry| {
-            const name = std.mem.sliceTo(entry.name, 0);
-            if (name.len == 0) continue;
-            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-
-            const child_path = try std.fs.path.join(allocator, &[_][]const u8{ item.path, name });
-
-            switch (entry.kind) {
-                .dir => {
-                    if (skip_hidden and name[0] == '.') {
-                        allocator.free(child_path);
-                        continue;
-                    }
-
-                    errdefer allocator.free(child_path);
-                    try queue.append(allocator, .{
-                        .path = child_path,
-                        .depth = item.depth + 1,
-                        .parent = item_index,
-                    });
-                    progress_node.increaseEstimatedTotalItems(1);
-                },
-                .file => {
-                    const file = entry.details.file;
-                    defer allocator.free(child_path);
-
-                    dir_total += file.totalsize;
-                    file_count += 1;
-                },
-                .symlink, .other => {
-                    defer allocator.free(child_path);
-                },
-            }
-        }
-
-        queue.items[item_index].total_size = dir_total;
-        queue.items[item_index].total_files = file_count;
-        queue.items[item_index].total_dirs = 1;
-    }
-
-    var idx = queue.items.len;
+    var idx = queue.len;
     while (idx > 0) {
         idx -= 1;
-        const child = queue.items[idx];
-        if (child.parent) |parent_index| {
-            queue.items[parent_index].total_size += child.total_size;
-            queue.items[parent_index].total_files += child.total_files;
-            queue.items[parent_index].total_dirs += child.total_dirs;
+        if (parents[idx]) |parent_index| {
+            total_size[parent_index] += total_size[idx];
+            total_files[parent_index] += total_files[idx];
+            total_dirs[parent_index] += total_dirs[idx];
         }
     }
 
-    const root_item = queue.items[0];
-    const directories_including_root = root_item.total_dirs;
-    const files_total = root_item.total_files;
-    const bytes_total = root_item.total_size;
+    const directories_including_root = total_dirs[0];
+    const files_total = total_files[0];
+    const bytes_total = total_size[0];
+    const inaccessible_dirs = ctx.inaccessible_dirs.load(.acquire);
 
     var top_level = std.ArrayList(usize){};
     defer top_level.deinit(allocator);
-    for (queue.items, 0..) |entry, idx2| {
-        if (entry.depth == 1) {
+
+    const depths = slice.items(.depth);
+    for (depths, 0..) |depth, idx2| {
+        if (depth == 1) {
             try top_level.append(allocator, idx2);
         }
     }
 
+    const paths = slice.items(.path);
+    const inaccessible_flags = slice.items(.inaccessible);
+
     const SortContext = struct {
-        items: []const WorkItem,
-        pub fn lessThan(ctx: @This(), lhs: usize, rhs: usize) bool {
-            const a = ctx.items[lhs];
-            const b = ctx.items[rhs];
-            if (a.total_size == b.total_size) {
-                return std.mem.lessThan(u8, a.path, b.path);
+        totals: []const u64,
+        paths: [][]u8,
+        pub fn lessThan(state: @This(), lhs: usize, rhs: usize) bool {
+            const a_size = state.totals[lhs];
+            const b_size = state.totals[rhs];
+            if (a_size == b_size) {
+                return std.mem.lessThan(u8, state.paths[lhs], state.paths[rhs]);
             }
-            return a.total_size > b.total_size;
+            return a_size > b_size;
         }
     };
 
     if (top_level.items.len > 1) {
-        std.sort.heap(usize, top_level.items, SortContext{ .items = queue.items }, SortContext.lessThan);
+        std.sort.heap(usize, top_level.items, SortContext{ .totals = total_size, .paths = paths }, SortContext.lessThan);
     }
 
     try stdout.print("Summary for {s}:\n", .{root});
@@ -212,11 +318,11 @@ pub fn main() !void {
         const max_show = @min(top_level.items.len, 10);
         var i: usize = 0;
         while (i < max_show) : (i += 1) {
-            const entry = queue.items[top_level.items[i]];
-            const marker = if (entry.inaccessible) " (inaccessible)" else "";
+            const entry_index = top_level.items[i];
+            const marker = if (inaccessible_flags[entry_index]) " (inaccessible)" else "";
             try stdout.print(
                 "  {d:>2}. {Bi:>10}  {d:>7} files  {s}{s}\n",
-                .{ i + 1, entry.total_size, entry.total_files, entry.path, marker },
+                .{ i + 1, total_size[entry_index], total_files[entry_index], paths[entry_index], marker },
             );
         }
     }
