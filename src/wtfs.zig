@@ -201,7 +201,8 @@ pub fn DirScanner(mask: AttrGroupMask) type {
                         .RANGE => return error.BufferTooSmall,
                         .INVAL => return error.InvalidArgument,
                         .IO => return error.ReadFailed,
-                        else => unreachable,
+                        .TIMEDOUT => return error.TimedOut,
+                        else => |e| std.debug.panic("unexpected errno {t}", .{e}),
                     }
                 }
 

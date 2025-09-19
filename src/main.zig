@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const wtfs = @import("wtfs").mac;
+const strpool = @import("wtfs").strpool;
 
 var stdout_buffer: [4096]u8 = undefined;
 var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
@@ -23,8 +24,9 @@ const AtomicUsize = std.atomic.Value(usize);
 const DirectoryNode = struct {
     parent: ?usize,
     depth: usize,
-    basename: []const u8,
+    basename: u32,
     dir: ?std.fs.Dir,
+    fdrefcount: AtomicUsize,
     total_size: u64 = 0,
     total_files: usize = 0,
     total_dirs: usize = 1,
@@ -82,10 +84,12 @@ const Context = struct {
     skip_hidden: bool,
     inaccessible_dirs: AtomicUsize = AtomicUsize.init(0),
     directories_mutex: std.Thread.Mutex = .{},
-    path_set_mutex: std.Thread.Mutex = .{},
     task_queue: TaskQueue = .{},
     outstanding: AtomicUsize = AtomicUsize.init(0),
-    path_set: *std.BufSet,
+
+    namelock: std.Thread.Mutex = .{},
+    namedata: *std.ArrayListUnmanaged(u8),
+    idxset: *strpool.IndexSet,
 
     fn getNode(self: *Context, index: usize) *DirectoryNode {
         self.directories_mutex.lock();
@@ -93,17 +97,11 @@ const Context = struct {
         return self.directories.at(index);
     }
 
-    fn internPath(self: *Context, path: []const u8) ![]const u8 {
-        self.path_set_mutex.lock();
-        defer self.path_set_mutex.unlock();
+    fn internPath(self: *Context, path: []const u8) !u32 {
+        self.namelock.lock();
+        defer self.namelock.unlock();
 
-        const gop = try self.path_set.hash_map.getOrPut(path);
-        if (!gop.found_existing) {
-            const copy = try self.path_set.hash_map.allocator.alloc(u8, path.len);
-            @memcpy(copy, path);
-            gop.key_ptr.* = copy;
-        }
-        return gop.key_ptr.*;
+        return strpool.intern(self.idxset, self.allocator, self.namedata, path);
     }
 
     fn setTotals(self: *Context, index: usize, size: u64, files: usize) void {
@@ -145,15 +143,13 @@ const Context = struct {
             .total_files = 0,
             .total_dirs = 1,
             .inaccessible = inaccessible,
+            .fdrefcount = AtomicUsize.init(0),
         };
 
         return index;
     }
 
-    fn addChild(self: *Context, parent_index: usize, name: []const u8, dir: ?std.fs.Dir, inaccessible: bool) !usize {
-        var dir_copy = dir;
-        errdefer if (dir_copy) |*d| d.close();
-
+    fn addChild(self: *Context, parent_index: usize, name: []const u8) !usize {
         const name_copy = try self.internPath(name);
 
         self.directories_mutex.lock();
@@ -166,11 +162,12 @@ const Context = struct {
             .parent = parent_index,
             .depth = parent_depth + 1,
             .basename = name_copy,
-            .dir = dir_copy,
+            .dir = null,
             .total_size = 0,
             .total_files = 0,
             .total_dirs = 1,
-            .inaccessible = inaccessible,
+            .inaccessible = false,
+            .fdrefcount = .init(0),
         };
 
         return index;
@@ -210,11 +207,12 @@ const Context = struct {
         const basename = node.basename;
         if (parent_index) |parent| {
             try self.appendPathRecursive(buffer, parent);
-            if (buffer.items.len > 0 and basename.len > 0 and buffer.items[buffer.items.len - 1] != '/') {
-                try buffer.append(self.allocator, '/');
-            }
+            try buffer.append(self.allocator, '/');
         }
-        try buffer.appendSlice(self.allocator, basename);
+        try buffer.appendSlice(
+            self.allocator,
+            std.mem.sliceTo(self.namedata.items[basename..], 0),
+        );
     }
 };
 
@@ -243,17 +241,57 @@ fn directoryWorker(ctx: *Context) void {
     }
 }
 
-fn processDirectory(ctx: *Context, index: usize, path_buffer: *std.ArrayListUnmanaged(u8)) !void {
+fn processDirectory(
+    ctx: *Context,
+    index: usize,
+    path_buffer: *std.ArrayList(u8),
+) !void {
     var buf: [16 * 1024]u8 = undefined;
-    const node = ctx.getNode(index);
-    const dir = node.dir orelse {
-        ctx.markInaccessible(index);
-        return;
-    };
 
-    var scanner = Scanner.init(dir.fd, &buf);
+    const node = ctx.getNode(index);
+
+    if (node.parent != null) {
+        const parent = ctx.getNode(node.parent.?);
+
+        const basename = std.mem.sliceTo(ctx.namedata.items[node.basename..], 0);
+        const opened = parent.dir.?.openDir(
+            basename,
+            .{ .iterate = true },
+        );
+
+        const refcnt = parent.fdrefcount.fetchSub(1, .release);
+        if (refcnt == 1) {
+            _ = parent.fdrefcount.load(.acquire);
+            parent.dir.?.close();
+        }
+        node.dir = opened catch |err| switch (err) {
+            error.PermissionDenied, error.AccessDenied => {
+                _ = ctx.inaccessible_dirs.fetchAdd(1, .monotonic);
+                ctx.markInaccessible(index);
+                return;
+            },
+            else => return err,
+        };
+    } else {
+        const basename = std.mem.sliceTo(ctx.namedata.items[node.basename..], 0);
+        node.dir = std.fs.cwd().openDir(
+            basename,
+            .{ .iterate = true },
+        ) catch |err| switch (err) {
+            error.PermissionDenied, error.AccessDenied => {
+                _ = ctx.inaccessible_dirs.fetchAdd(1, .monotonic);
+                ctx.markInaccessible(index);
+                return;
+            },
+            else => return err,
+        };
+    }
+
+    var scanner = Scanner.init(node.dir.?.fd, &buf);
     var total_size: u64 = 0;
     var total_files: usize = 0;
+
+    node.fdrefcount.store(1, .monotonic);
 
     while (try scanner.next()) |entry| {
         const name = std.mem.sliceTo(entry.name, 0);
@@ -264,27 +302,11 @@ fn processDirectory(ctx: *Context, index: usize, path_buffer: *std.ArrayListUnma
             .dir => {
                 if (ctx.skip_hidden and name[0] == '.') continue;
 
-                const child_dir = dir.openDir(name, .{ .iterate = true }) catch |err| switch (err) {
-                    error.PermissionDenied, error.AccessDenied => {
-                        _ = ctx.inaccessible_dirs.fetchAdd(1, .monotonic);
-                        const child_index = ctx.addChild(index, name, null, true) catch |add_err| {
-                            const full_path = ctx.buildChildPathInBuffer(index, name, path_buffer) catch "<path unavailable>";
-                            std.log.err("unable to record inaccessible directory {s}: {s}", .{ full_path, @errorName(add_err) });
-                            continue;
-                        };
-                        ctx.markInaccessible(child_index);
-                        continue;
-                    },
-                    else => {
-                        const full_path = ctx.buildChildPathInBuffer(index, name, path_buffer) catch "<path unavailable>";
-                        std.log.warn("unable to open directory {s}: {s}", .{ full_path, @errorName(err) });
-                        continue;
-                    },
-                };
+                _ = node.fdrefcount.fetchAdd(1, .monotonic) + 1;
 
-                const child_index = ctx.addChild(index, name, child_dir, false) catch |add_err| {
+                const child_index = ctx.addChild(index, name) catch |add_err| {
                     const full_path = ctx.buildChildPathInBuffer(index, name, path_buffer) catch "<path unavailable>";
-                    std.log.err("unable to enqueue directory {s}: {s}", .{ full_path, @errorName(add_err) });
+                    std.log.err("unable to record inaccessible directory {s}: {s}", .{ full_path, @errorName(add_err) });
                     continue;
                 };
 
@@ -307,11 +329,18 @@ fn processDirectory(ctx: *Context, index: usize, path_buffer: *std.ArrayListUnma
         }
     }
 
+    if (node.fdrefcount.fetchSub(1, .release) == 1) {
+        node.dir.?.close();
+    }
+
     ctx.setTotals(index, total_size, total_files);
 }
 
 pub fn main() !void {
-    const allocator = std.heap.c_allocator;
+    const gpa = std.heap.c_allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -347,8 +376,11 @@ pub fn main() !void {
     var directories = DirectoryStore{};
     defer directories.deinit(allocator);
 
-    var path_set = std.BufSet.init(allocator);
-    defer path_set.deinit();
+    var namedata = std.ArrayListUnmanaged(u8).empty;
+    defer namedata.deinit(allocator);
+
+    var idxset = strpool.IndexSet.empty;
+    defer idxset.deinit(allocator);
 
     var progress_root = std.Progress.start(.{ .root_name = "Scanning" });
     defer progress_root.end();
@@ -369,8 +401,10 @@ pub fn main() !void {
         .wait_group = &wait_group,
         .progress_node = progress_node,
         .skip_hidden = skip_hidden,
-        .path_set = &path_set,
+        .namedata = &namedata,
+        .idxset = &idxset,
     };
+
     defer ctx.task_queue.deinit(allocator);
 
     progress_node.setEstimatedTotalItems(1);
@@ -461,15 +495,6 @@ pub fn main() !void {
 
     if (top_level_entries.items.len > 1) {
         std.sort.heap(SummaryEntry, top_level_entries.items, SortContext{ .ctx = &ctx }, SortContext.lessThan);
-    }
-
-    var cleanup_index: usize = 0;
-    while (cleanup_index < dir_count) : (cleanup_index += 1) {
-        const node = ctx.getNode(cleanup_index);
-        if (node.dir) |*opened| {
-            opened.close();
-            node.dir = null;
-        }
     }
 
     try stdout.print("Summary for {s}:\n", .{root});
