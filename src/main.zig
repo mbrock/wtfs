@@ -26,6 +26,24 @@ const AtomicUsize = std.atomic.Value(usize);
 const AtomicU16 = std.atomic.Value(u16);
 const invalid_fd: std.posix.fd_t = -1;
 
+const Stats = struct {
+    directories_started: AtomicUsize = AtomicUsize.init(0),
+    directories_completed: AtomicUsize = AtomicUsize.init(0),
+    directories_scheduled: AtomicUsize = AtomicUsize.init(0),
+    directories_discovered: AtomicUsize = AtomicUsize.init(0),
+    files_discovered: AtomicUsize = AtomicUsize.init(0),
+    symlinks_discovered: AtomicUsize = AtomicUsize.init(0),
+    other_discovered: AtomicUsize = AtomicUsize.init(0),
+    scanner_batches: AtomicUsize = AtomicUsize.init(0),
+    scanner_entries: AtomicUsize = AtomicUsize.init(0),
+    scanner_max_batch: AtomicUsize = AtomicUsize.init(0),
+    scanner_errors: AtomicUsize = AtomicUsize.init(0),
+
+    fn init() Stats {
+        return .{};
+    }
+};
+
 const DirectoryNode = struct {
     parent: u32,
     basename: u32,
@@ -101,6 +119,7 @@ const Context = struct {
     namelock: std.Thread.Mutex = .{},
     namedata: *std.ArrayList(u8),
     idxset: *strpool.IndexSet,
+    stats: Stats,
 
     fn getNode(self: *Context, index: usize) DirectoryNode {
         self.directories_mutex.lock();
@@ -216,21 +235,7 @@ const Context = struct {
         _ = self.outstanding.fetchAdd(1, .acq_rel);
         errdefer _ = self.outstanding.fetchSub(1, .acq_rel);
         try self.task_queue.push(self.allocator, index);
-    }
-
-    fn buildPathInBuffer(self: *Context, index: usize, buffer: *std.ArrayList(u8)) ![]const u8 {
-        buffer.clearRetainingCapacity();
-        try self.appendPathRecursive(buffer, index);
-        return buffer.items;
-    }
-
-    fn buildChildPathInBuffer(self: *Context, parent_index: usize, name: []const u8, buffer: *std.ArrayList(u8)) ![]const u8 {
-        const base = try self.buildPathInBuffer(parent_index, buffer);
-        if (base.len > 0 and name.len > 0 and base[base.len - 1] != '/') {
-            try buffer.append(self.allocator, '/');
-        }
-        try buffer.appendSlice(self.allocator, name);
-        return buffer.items;
+        _ = self.stats.directories_scheduled.fetchAdd(1, .monotonic);
     }
 
     fn buildPathOwned(self: *Context, allocator: std.mem.Allocator, index: usize) ![]u8 {
@@ -321,6 +326,9 @@ fn processDirectory(
     errprogress: *std.Progress.Node,
     index: usize,
 ) !usize {
+    _ = ctx.stats.directories_started.fetchAdd(1, .monotonic);
+    defer _ = ctx.stats.directories_completed.fetchAdd(1, .monotonic);
+
     var buf: [1024 * 1024]u8 = undefined;
     var namebuf: [std.fs.max_name_bytes]u8 = undefined;
 
@@ -395,6 +403,7 @@ fn processDirectory(
 
     while (true) {
         const has_batch = scanner.fill() catch |err| {
+            _ = ctx.stats.scanner_errors.fetchAdd(1, .monotonic);
             errprogress.completeOne();
             if (err == error.DeadLock) {
                 errprogress.setName("dataless file");
@@ -412,10 +421,17 @@ fn processDirectory(
         var lock_released = false;
         defer if (!lock_released) ctx.directories_mutex.unlock();
 
+        var batch_entries: usize = 0;
+        var batch_dirs: usize = 0;
+        var batch_files: usize = 0;
+        var batch_symlinks: usize = 0;
+        var batch_other: usize = 0;
+
         while (true) {
             const maybe_entry = scanner.next() catch |err| {
                 ctx.directories_mutex.unlock();
                 lock_released = true;
+                _ = ctx.stats.scanner_errors.fetchAdd(1, .monotonic);
                 errprogress.completeOne();
                 if (err == error.DeadLock) {
                     errprogress.setName("dataless file");
@@ -429,6 +445,7 @@ fn processDirectory(
             };
 
             const entry = maybe_entry orelse break;
+            batch_entries += 1;
             const name = std.mem.sliceTo(entry.name, 0);
             if (name.len == 0) continue;
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
@@ -439,18 +456,29 @@ fn processDirectory(
                     _ = ctx.fdRefAdd(index, 1, .acq_rel);
                     const child_index = try ctx.addChild(index, name);
                     try ctx.scheduleDirectory(child_index);
+                    batch_dirs += 1;
                 },
                 .file => {
                     const file = entry.details.file;
                     total_size += file.allocsize;
                     total_files += 1;
+                    batch_files += 1;
                 },
-                .symlink, .other => {},
+                .symlink => batch_symlinks += 1,
+                .other => batch_other += 1,
             }
         }
 
         ctx.directories_mutex.unlock();
         lock_released = true;
+
+        _ = ctx.stats.scanner_batches.fetchAdd(1, .monotonic);
+        _ = ctx.stats.scanner_entries.fetchAdd(batch_entries, .monotonic);
+        _ = ctx.stats.directories_discovered.fetchAdd(batch_dirs, .monotonic);
+        _ = ctx.stats.files_discovered.fetchAdd(batch_files, .monotonic);
+        _ = ctx.stats.symlinks_discovered.fetchAdd(batch_symlinks, .monotonic);
+        _ = ctx.stats.other_discovered.fetchAdd(batch_other, .monotonic);
+        _ = ctx.stats.scanner_max_batch.fetchMax(batch_entries, .acq_rel);
     }
 
     ctx.directories_mutex.lock();
@@ -548,6 +576,7 @@ pub fn main() !void {
         .task_queue = .{
             .progress = &queue_progress,
         },
+        .stats = Stats.init(),
     };
 
     defer ctx.task_queue.deinit(allocator);
@@ -569,6 +598,8 @@ pub fn main() !void {
 
     const root_index = try ctx.addRoot(".", root_dir, root_inaccessible);
 
+    var total_timer = std.time.Timer.start() catch unreachable;
+
     if (root_inaccessible) {
         ctx.markInaccessible(root_index);
         progress_root.completeOne();
@@ -584,6 +615,8 @@ pub fn main() !void {
     }
 
     wait_group.wait();
+
+    const elapsed_ns = total_timer.read();
 
     const dir_count = ctx.directories.len;
     progress_root.setName("Summarizing");
@@ -664,8 +697,52 @@ pub fn main() !void {
         try stdout.print("  Inaccessible directories: {d}\n", .{inaccessible_dirs});
     }
 
+    const stats_ptr = &ctx.stats;
+    const dirs_started = stats_ptr.directories_started.load(.acquire);
+    const dirs_completed = stats_ptr.directories_completed.load(.acquire);
+    const dirs_scheduled = stats_ptr.directories_scheduled.load(.acquire);
+    const dirs_discovered = stats_ptr.directories_discovered.load(.acquire);
+    const files_discovered = stats_ptr.files_discovered.load(.acquire);
+    const symlinks_discovered = stats_ptr.symlinks_discovered.load(.acquire);
+    const other_discovered = stats_ptr.other_discovered.load(.acquire);
+    const batches = stats_ptr.scanner_batches.load(.acquire);
+    const batch_entries = stats_ptr.scanner_entries.load(.acquire);
+    const max_batch = stats_ptr.scanner_max_batch.load(.acquire);
+    const scanner_errors = stats_ptr.scanner_errors.load(.acquire);
+    const queue_high = ctx.task_queue.high_watermark.load(.acquire);
+
+    const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+    const dirs_per_sec = if (elapsed_ns == 0)
+        0.0
+    else
+        @as(f64, @floatFromInt(dirs_completed)) / elapsed_s;
+
+    const avg_batch_entries = if (batches == 0)
+        0.0
+    else
+        @as(f64, @floatFromInt(batch_entries)) / @as(f64, @floatFromInt(batches));
+
+    try stdout.print("  Duration: {d:.2}s  ({d:.1} dirs/s)\n", .{ elapsed_s, dirs_per_sec });
+    try stdout.print(
+        "  Queue peak: {d} tasks  |  Scheduled dirs: {d}  discovered: {d}  started/completed: {d}/{d}\n",
+        .{ queue_high, dirs_scheduled, dirs_discovered, dirs_started, dirs_completed },
+    );
+    try stdout.print(
+        "  Batches: {d}  avg entries/batch: {d:.1}  max: {d}\n",
+        .{ batches, avg_batch_entries, max_batch },
+    );
+    try stdout.print(
+        "  Entries seen: files {d}, symlinks {d}, other {d}\n",
+        .{ files_discovered, symlinks_discovered, other_discovered },
+    );
+    if (scanner_errors > 0) {
+        try stdout.print("  Scanner errors: {d}\n", .{scanner_errors});
+    }
+
+    try stdout.print("\n", .{});
+
     if (top_level_entries.items.len > 0) {
-        try stdout.print("\nTop-level directories by total size:\n\n", .{});
+        try stdout.print("Top-level directories by total size:\n\n", .{});
         const max_show = @min(top_level_entries.items.len, 10);
         var display_index: usize = 0;
         while (display_index < max_show) : (display_index += 1) {
