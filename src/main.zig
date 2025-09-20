@@ -165,11 +165,9 @@ const Context = struct {
         return index;
     }
 
+    /// Caller must hold directories_mutex.
     fn addChild(self: *Context, parent_index: usize, name: []const u8) !usize {
         const name_copy = try self.internPath(name);
-
-        self.directories_mutex.lock();
-        defer self.directories_mutex.unlock();
 
         const index = try self.directories.addOne(self.allocator);
         var slices = self.directories.slice();
@@ -192,9 +190,8 @@ const Context = struct {
         slices.items(.fd)[index] = fd;
     }
 
+    /// Caller must hold directories_mutex.
     fn closeDirectory(self: *Context, index: usize) void {
-        self.directories_mutex.lock();
-        defer self.directories_mutex.unlock();
         var slices = self.directories.slice();
         const fd = slices.items(.fd)[index];
         if (fd != invalid_fd) {
@@ -203,16 +200,14 @@ const Context = struct {
         }
     }
 
+    /// Caller must hold directories_mutex.
     fn fdRefAdd(self: *Context, index: usize, value: u16, comptime order: std.builtin.AtomicOrder) u16 {
-        self.directories_mutex.lock();
-        defer self.directories_mutex.unlock();
         var slices = self.directories.slice();
         return slices.items(.fdrefcount)[index].fetchAdd(value, order);
     }
 
+    /// Caller must hold directories_mutex.
     fn fdRefSub(self: *Context, index: usize, value: u16, comptime order: std.builtin.AtomicOrder) u16 {
-        self.directories_mutex.lock();
-        defer self.directories_mutex.unlock();
         var slices = self.directories.slice();
         return slices.items(.fdrefcount)[index].fetchSub(value, order);
     }
@@ -341,10 +336,12 @@ fn processDirectory(
         const parent = ctx.getNode(parent_index);
         const opened = wtfs.openSubdirectory(parent.fd, basename);
 
+        ctx.directories_mutex.lock();
         const refcnt = ctx.fdRefSub(parent_index, 1, .seq_cst);
         if (refcnt == 1) {
             ctx.closeDirectory(parent_index);
         }
+        ctx.directories_mutex.unlock();
 
         if (opened) |fd| {
             dir_fd = fd;
@@ -392,48 +389,76 @@ fn processDirectory(
     var total_size: u64 = 0;
     var total_files: usize = 0;
 
+    ctx.directories_mutex.lock();
     _ = ctx.fdRefAdd(index, 1, .acq_rel);
+    ctx.directories_mutex.unlock();
 
     while (true) {
-        if (scanner.next()) |it| {
-            if (it) |entry| {
-                const name = std.mem.sliceTo(entry.name, 0);
-                if (name.len == 0) continue;
-                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-
-                switch (entry.kind) {
-                    .dir => {
-                        if (ctx.skip_hidden and name[0] == '.') continue;
-                        _ = ctx.fdRefAdd(index, 1, .acq_rel);
-                        const child_index = try ctx.addChild(index, name);
-                        try ctx.scheduleDirectory(child_index);
-                    },
-                    .file => {
-                        const file = entry.details.file;
-                        total_size += file.allocsize;
-                        total_files += 1;
-                    },
-                    .symlink, .other => {},
-                }
-            } else break;
-        } else |err| {
+        const has_batch = scanner.fill() catch |err| {
             errprogress.completeOne();
             if (err == error.DeadLock) {
-                // iCloud dataless file
                 errprogress.setName("dataless file");
                 _ = ctx.inaccessible_dirs.fetchAdd(1, .monotonic);
                 ctx.markInaccessible(index);
                 return 0;
             } else {
                 errprogress.setName(@errorName(err));
+                return err;
             }
-            return err;
+        };
+        if (!has_batch) break;
+
+        ctx.directories_mutex.lock();
+        var lock_released = false;
+        defer if (!lock_released) ctx.directories_mutex.unlock();
+
+        while (true) {
+            const maybe_entry = scanner.next() catch |err| {
+                ctx.directories_mutex.unlock();
+                lock_released = true;
+                errprogress.completeOne();
+                if (err == error.DeadLock) {
+                    errprogress.setName("dataless file");
+                    _ = ctx.inaccessible_dirs.fetchAdd(1, .monotonic);
+                    ctx.markInaccessible(index);
+                    return 0;
+                } else {
+                    errprogress.setName(@errorName(err));
+                    return err;
+                }
+            };
+
+            const entry = maybe_entry orelse break;
+            const name = std.mem.sliceTo(entry.name, 0);
+            if (name.len == 0) continue;
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+
+            switch (entry.kind) {
+                .dir => {
+                    if (ctx.skip_hidden and name[0] == '.') continue;
+                    _ = ctx.fdRefAdd(index, 1, .acq_rel);
+                    const child_index = try ctx.addChild(index, name);
+                    try ctx.scheduleDirectory(child_index);
+                },
+                .file => {
+                    const file = entry.details.file;
+                    total_size += file.allocsize;
+                    total_files += 1;
+                },
+                .symlink, .other => {},
+            }
         }
+
+        ctx.directories_mutex.unlock();
+        lock_released = true;
     }
 
-    if (ctx.fdRefSub(index, 1, .acq_rel) == 1) {
+    ctx.directories_mutex.lock();
+    const refcnt = ctx.fdRefSub(index, 1, .acq_rel);
+    if (refcnt == 1) {
         ctx.closeDirectory(index);
     }
+    ctx.directories_mutex.unlock();
 
     ctx.setTotals(index, total_size, total_files);
 

@@ -267,7 +267,7 @@ pub fn DirScanner(mask: AttrGroupMask) type {
                 };
             }
 
-            fn pump(self: *@This()) !void {
+            fn refill(self: *@This()) !void {
                 const opts_mask = FsOptMask{
                     .nofollow = true,
                     .report_fullsize = true,
@@ -305,13 +305,22 @@ pub fn DirScanner(mask: AttrGroupMask) type {
                 self.reader = std.io.Reader.fixed(self.buf);
             }
 
-            /// Get the next directory entry, or null if no more entries
-            /// Automatically fetches more entries from the kernel when needed
-            pub fn next(self: *@This()) !?Entry {
+            /// Ensure a batch of entries is available. Returns false when no
+            /// more entries can be read. This performs the kernel syscall, so
+            /// callers should avoid holding contended locks when calling it.
+            pub fn fill(self: *@This()) !bool {
                 if (self.n == 0) {
-                    try self.pump();
-                    if (self.n == 0) return null;
+                    try self.refill();
                 }
+
+                return self.n != 0;
+            }
+
+            /// Get the next entry from the current batch or null if the batch
+            /// is exhausted. Errors encountered while decoding entry data are
+            /// still surfaced here.
+            pub fn next(self: *@This()) !?Entry {
+                if (self.n == 0) return null;
 
                 const reclen = try self.reader.peekInt(u32, .little);
                 const recbuf = try self.reader.peek(reclen);
@@ -392,6 +401,7 @@ pub fn DirScanner(mask: AttrGroupMask) type {
             dir: std.fs.Dir,
             iterator: std.fs.Dir.Iterator,
             buf: []u8,
+            pending_entry: ?Entry = null,
 
             /// Initialize a new scanner with a directory file descriptor and buffer.
             pub fn init(fd: std.posix.fd_t, buf: []u8) @This() {
@@ -419,91 +429,106 @@ pub fn DirScanner(mask: AttrGroupMask) type {
                 return try posix.fstatat(self.dir.fd, name, 0);
             }
 
-            /// Get the next directory entry, or null if no more entries.
+            fn fetchNext(self: *@This()) !?Entry {
+                const dir_entry = (try self.iterator.next()) orelse return null;
+
+                const raw_name = dir_entry.name;
+                const name_z = try self.copyName(raw_name);
+
+                const entry_kind: Kind = switch (dir_entry.kind) {
+                    .directory => .dir,
+                    .file => .file,
+                    .sym_link => .symlink,
+                    else => .other,
+                };
+
+                var entry: Entry = undefined;
+                if (comptime mask.common.name) entry.name = name_z;
+                if (comptime mask.common.objtype) entry.kind = entry_kind;
+                if (comptime mask.common.fsid) entry.fsid = .{ .id0 = 0, .id1 = 0 };
+                if (comptime mask.common.objid) entry.objid = 0;
+
+                const needs_dir_stat = comptime mask.dir.linkcount or mask.dir.allocsize or mask.dir.ioblocksize or mask.dir.datalength;
+                const needs_file_stat = comptime mask.file.linkcount or mask.file.totalsize or mask.file.allocsize;
+
+                entry.details = switch (entry_kind) {
+                    .dir => blk: {
+                        var payload: DirPayload = std.mem.zeroes(DirPayload);
+                        if (needs_dir_stat) {
+                            const stat = try self.statAt(name_z);
+                            if (comptime mask.dir.linkcount) {
+                                if (stat_has_nlink) {
+                                    payload.linkcount = @intCast(stat.nlink);
+                                } else {
+                                    payload.linkcount = 0;
+                                }
+                            }
+                            if (comptime mask.dir.allocsize) {
+                                if (stat_has_blocks) {
+                                    const blocks: u64 = @intCast(stat.blocks);
+                                    payload.allocsize = blocks * 512;
+                                } else {
+                                    payload.allocsize = 0;
+                                }
+                            }
+                            if (comptime mask.dir.ioblocksize) {
+                                if (stat_has_blksize) {
+                                    payload.ioblocksize = @intCast(stat.blksize);
+                                } else {
+                                    payload.ioblocksize = 0;
+                                }
+                            }
+                            if (comptime mask.dir.datalength) payload.datalength = @intCast(stat.size);
+                        }
+                        if (comptime mask.dir.entrycount) payload.entrycount = 0;
+                        if (comptime mask.dir.mountstatus) payload.mountstatus = 0;
+                        break :blk .{ .dir = payload };
+                    },
+                    .file => blk: {
+                        var payload: FilePayload = std.mem.zeroes(FilePayload);
+                        if (needs_file_stat) {
+                            const stat = try self.statAt(name_z);
+                            if (comptime mask.file.linkcount) {
+                                if (stat_has_nlink) {
+                                    payload.linkcount = @intCast(stat.nlink);
+                                } else {
+                                    payload.linkcount = 0;
+                                }
+                            }
+                            if (comptime mask.file.totalsize) payload.totalsize = @intCast(stat.size);
+                            if (comptime mask.file.allocsize) {
+                                if (stat_has_blocks) {
+                                    const blocks: u64 = @intCast(stat.blocks);
+                                    payload.allocsize = blocks * 512;
+                                } else {
+                                    payload.allocsize = @intCast(stat.size);
+                                }
+                            }
+                        }
+                        break :blk .{ .file = payload };
+                    },
+                    else => .{ .other = {} },
+                };
+
+                return entry;
+            }
+
+            /// Ensure at least one entry is available, returning false when the
+            /// iterator is exhausted.
+            pub fn fill(self: *@This()) !bool {
+                if (self.pending_entry != null) return true;
+
+                const entry = (try self.fetchNext()) orelse return false;
+                self.pending_entry = entry;
+                return true;
+            }
+
+            /// Retrieve the next entry from the current batch (one entry per
+            /// fill on non-macOS platforms).
             pub fn next(self: *@This()) !?Entry {
-                while (try self.iterator.next()) |dir_entry| {
-                    const raw_name = dir_entry.name;
-                    const name_z = try self.copyName(raw_name);
-
-                    const entry_kind: Kind = switch (dir_entry.kind) {
-                        .directory => .dir,
-                        .file => .file,
-                        .sym_link => .symlink,
-                        else => .other,
-                    };
-
-                    var entry: Entry = undefined;
-                    if (comptime mask.common.name) entry.name = name_z;
-                    if (comptime mask.common.objtype) entry.kind = entry_kind;
-                    if (comptime mask.common.fsid) entry.fsid = .{ .id0 = 0, .id1 = 0 };
-                    if (comptime mask.common.objid) entry.objid = 0;
-
-                    const needs_dir_stat = comptime mask.dir.linkcount or mask.dir.allocsize or mask.dir.ioblocksize or mask.dir.datalength;
-                    const needs_file_stat = comptime mask.file.linkcount or mask.file.totalsize or mask.file.allocsize;
-
-                    entry.details = switch (entry_kind) {
-                        .dir => blk: {
-                            var payload: DirPayload = std.mem.zeroes(DirPayload);
-                            if (needs_dir_stat) {
-                                const stat = try self.statAt(name_z);
-                                if (comptime mask.dir.linkcount) {
-                                    if (stat_has_nlink) {
-                                        payload.linkcount = @intCast(stat.nlink);
-                                    } else {
-                                        payload.linkcount = 0;
-                                    }
-                                }
-                                if (comptime mask.dir.allocsize) {
-                                    if (stat_has_blocks) {
-                                        const blocks: u64 = @intCast(stat.blocks);
-                                        payload.allocsize = blocks * 512;
-                                    } else {
-                                        payload.allocsize = 0;
-                                    }
-                                }
-                                if (comptime mask.dir.ioblocksize) {
-                                    if (stat_has_blksize) {
-                                        payload.ioblocksize = @intCast(stat.blksize);
-                                    } else {
-                                        payload.ioblocksize = 0;
-                                    }
-                                }
-                                if (comptime mask.dir.datalength) payload.datalength = @intCast(stat.size);
-                            }
-                            if (comptime mask.dir.entrycount) payload.entrycount = 0;
-                            if (comptime mask.dir.mountstatus) payload.mountstatus = 0;
-                            break :blk .{ .dir = payload };
-                        },
-                        .file => blk: {
-                            var payload: FilePayload = std.mem.zeroes(FilePayload);
-                            if (needs_file_stat) {
-                                const stat = try self.statAt(name_z);
-                                if (comptime mask.file.linkcount) {
-                                    if (stat_has_nlink) {
-                                        payload.linkcount = @intCast(stat.nlink);
-                                    } else {
-                                        payload.linkcount = 0;
-                                    }
-                                }
-                                if (comptime mask.file.totalsize) payload.totalsize = @intCast(stat.size);
-                                if (comptime mask.file.allocsize) {
-                                    if (stat_has_blocks) {
-                                        const blocks: u64 = @intCast(stat.blocks);
-                                        payload.allocsize = blocks * 512;
-                                    } else {
-                                        payload.allocsize = @intCast(stat.size);
-                                    }
-                                }
-                            }
-                            break :blk .{ .file = payload };
-                        },
-                        else => .{ .other = {} },
-                    };
-
-                    return entry;
-                }
-
-                return null;
+                const entry = self.pending_entry orelse return null;
+                self.pending_entry = null;
+                return entry;
             }
         };
     }

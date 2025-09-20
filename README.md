@@ -59,25 +59,26 @@ const Scanner = wtfs.DirScanner(mask);
 var buffer: [16384]u8 = undefined;
 var scanner = Scanner.init(dir.handle, &buffer);
 
-// Iterate through entries
-while (try scanner.next()) |entry| {
-    // The entry type has only the fields you requested
-    std.debug.print("{s}: ", .{entry.name});
-    
-    switch (entry.kind) {
-        .dir => {
-            // dir-specific fields are available when requested
-            std.debug.print("directory with {} entries\n", .{entry.details.dir.entrycount});
-        },
-        .file => {
-            // file-specific fields are available when requested
-            std.debug.print("file, {}B ({}B allocated)\n", .{
-                entry.details.file.totalsize,
-                entry.details.file.allocsize,
-            });
-        },
-        .symlink => std.debug.print("symlink\n", .{}),
-        .other => std.debug.print("other\n", .{}),
+// Iterate through entries in batches
+while (true) {
+    if (!(try scanner.fill())) break;
+
+    while (try scanner.next()) |entry| {
+        std.debug.print("{s}: ", .{entry.name});
+
+        switch (entry.kind) {
+            .dir => {
+                std.debug.print("directory with {} entries\n", .{entry.details.dir.entrycount});
+            },
+            .file => {
+                std.debug.print("file, {}B ({}B allocated)\n", .{
+                    entry.details.file.totalsize,
+                    entry.details.file.allocsize,
+                });
+            },
+            .symlink => std.debug.print("symlink\n", .{}),
+            .other => std.debug.print("other\n", .{}),
+        }
     }
 }
 ```
