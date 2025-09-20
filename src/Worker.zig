@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Context = @import("Context.zig");
 const wtfs = @import("wtfs").mac;
+const is_macos = builtin.target.os.tag == .macos;
 
 const Worker = @This();
 
@@ -82,12 +84,12 @@ pub fn directoryWorker(ctx: *Context) void {
     };
     defer worker.path_buffer.deinit(worker.allocator);
     defer worker.marquee.end();
-    
+
     worker.progress_writer = std.Io.Writer.fixed(&worker.progress_buffer);
 
     while (worker.ctx.task_queue.pop()) |index| {
         worker.processTask(index);
-        
+
         // Mark task complete and check if we're done
         if (worker.ctx.outstanding.fetchSub(1, .acq_rel) == 1) {
             worker.ctx.task_queue.close();
@@ -97,7 +99,7 @@ pub fn directoryWorker(ctx: *Context) void {
 
 fn processTask(self: *Worker, index: usize) void {
     self.updateProgressDisplay(index);
-    
+
     _ = self.processDirectory(index) catch |err| {
         std.debug.panic("error {t}", .{err});
     };
@@ -106,10 +108,10 @@ fn processTask(self: *Worker, index: usize) void {
 fn updateProgressDisplay(self: *Worker, index: usize) void {
     if (@mod(self.items_processed, 100) == 0) {
         const basename = self.extractName(self.ctx.getNode(index).basename);
-        
+
         const dt_ns = self.timer.lap();
         const speed = self.items_processed * 1_000_000_000 / @max(dt_ns, 1);
-        
+
         self.progress_writer.print("{d: >5} Hz  {s}", .{ speed, basename }) catch unreachable;
         self.marquee.setName(self.progress_writer.buffered());
         self.progress_writer.end = 0;
@@ -141,13 +143,13 @@ fn processDirectory(self: *Worker, index: usize) !usize {
 
     const dir_fd = try self.openDirectory(index);
     if (dir_fd == Context.invalid_fd) return 0; // Directory was inaccessible
-    
+
     var metrics = ScanMetrics{};
     try self.scanDirectory(index, dir_fd, &metrics);
-    
+
     // Store the totals for this directory
     self.ctx.setTotals(index, metrics.total_size, metrics.total_files);
-    
+
     return metrics.total_size;
 }
 
@@ -156,7 +158,7 @@ fn processDirectory(self: *Worker, index: usize) !usize {
 fn openDirectory(self: *Worker, index: usize) !std.posix.fd_t {
     const node = self.ctx.getNode(index);
     const basename = self.extractName(node.basename);
-    
+
     if (index != 0) {
         return try self.openChildDirectory(index, node, basename);
     } else {
@@ -172,13 +174,13 @@ fn openChildDirectory(
 ) !std.posix.fd_t {
     const parent_index: usize = @intCast(node.parent);
     const parent = self.ctx.getNode(parent_index);
-    
+
     // Try to open the subdirectory using parent's fd
     const opened = wtfs.openSubdirectory(parent.fd, basename);
-    
+
     // We've successfully used the parent fd for openat(), release our reference
     self.ctx.releaseParentFdAfterOpen(parent_index);
-    
+
     if (opened) |fd| {
         self.ctx.setDirectoryFd(index, fd);
         return fd;
@@ -210,16 +212,15 @@ fn openRootDirectory(
             return err;
         },
     };
-    
+
     // Close old fd if present
     if (node.fd != Context.invalid_fd) {
         std.posix.close(node.fd);
     }
-    
+
     self.ctx.setDirectoryFd(index, opened);
     return opened;
 }
-
 
 // ===== Directory Scanning =====
 
@@ -230,19 +231,60 @@ fn scanDirectory(
     metrics: *ScanMetrics,
 ) !void {
     var scanner = Scanner.init(dir_fd, &self.scan_buffer);
-    
+    var wrote_context = false;
+
     // Keep this directory's fd open while we scan (in case we find subdirectories)
     self.ctx.retainParentFd(index);
     defer self.ctx.releaseParentFd(index);
-    
+
     while (true) {
         const has_batch = scanner.fill() catch |err| {
             return self.handleScanError(index, err);
         };
         if (!has_batch) break;
-        
+
+        if (self.ctx.stream_out) |out| {
+            try self.writeStreamBatch(index, &scanner, &wrote_context, out);
+        }
+
         try self.processBatch(index, &scanner, metrics);
+
+        scanner.resetAfterBatch();
     }
+}
+
+fn writeStreamBatch(
+    self: *Worker,
+    index: usize,
+    scanner: *Scanner,
+    wrote_context: *bool,
+    out: *std.Io.Writer,
+) !void {
+    if (!is_macos) return;
+
+    const payload = scanner.rawBatchSlice();
+    if (payload.len == 0) return;
+
+    self.ctx.stream_mutex.lock();
+    defer self.ctx.stream_mutex.unlock();
+
+    if (!wrote_context.*) {
+        const node = self.ctx.getNode(index);
+        const ctx_record = wtfs.stream.DirContext{
+            .dir_ix = @intCast(index),
+            .parent = @intCast(node.parent),
+            .baseix = node.basename,
+            .flags = scanner.streamFlags(),
+        };
+        try wtfs.stream.writeDirContext(out, ctx_record);
+        wrote_context.* = true;
+    }
+
+    var batch_header = wtfs.stream.RawBatch{
+        .len = @intCast(payload.len),
+    };
+    try out.writeAll(std.mem.asBytes(&batch_header));
+    try out.writeAll(payload);
 }
 
 fn processBatch(
@@ -254,26 +296,26 @@ fn processBatch(
     self.ctx.directories_mutex.lock();
     var lock_released = false;
     defer if (!lock_released) self.ctx.directories_mutex.unlock();
-    
+
     var batch_entries: usize = 0;
     var batch_metrics = ScanMetrics{};
-    
+
     while (true) {
         const maybe_entry = scanner.next() catch |err| {
             self.ctx.directories_mutex.unlock();
             lock_released = true;
             return self.handleScanError(index, err);
         };
-        
+
         const entry = maybe_entry orelse break;
         batch_entries += 1;
-        
+
         try self.processEntry(index, entry, metrics, &batch_metrics);
     }
-    
+
     self.ctx.directories_mutex.unlock();
     lock_released = true;
-    
+
     self.updateStatistics(batch_entries, &batch_metrics);
 }
 
@@ -285,11 +327,11 @@ fn processEntry(
     batch_metrics: *ScanMetrics,
 ) !void {
     const name = std.mem.sliceTo(entry.name, 0);
-    
+
     // Skip empty, current, and parent directory entries
     if (name.len == 0) return;
     if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return;
-    
+
     switch (entry.kind) {
         .dir => {
             if (self.ctx.skip_hidden and name[0] == '.') return;
@@ -353,7 +395,7 @@ fn handleScanError(
 ) !void {
     _ = self.ctx.stats.scanner_errors.fetchAdd(1, .monotonic);
     self.errprogress.completeOne();
-    
+
     if (err == error.DeadLock) {
         self.errprogress.setName("dataless file");
         _ = self.ctx.stats.inaccessible_dirs.fetchAdd(1, .monotonic);

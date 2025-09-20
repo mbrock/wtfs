@@ -104,6 +104,9 @@ large_file_threshold: u64 = default_large_file_threshold,
 /// Collection of large files discovered during the scan
 large_files: Context.LargeFileStore = .empty,
 
+/// Optional writer that receives streaming kernel batches.
+stream_out: ?*std.Io.Writer = null,
+
 pub const BinaryFormatVersion: u16 = 1;
 
 pub const RunOptions = struct {
@@ -111,6 +114,8 @@ pub const RunOptions = struct {
     emit_text_report: bool = true,
     /// Optional binary writer that receives the scan snapshot.
     binary_writer: ?*std.Io.Writer = null,
+    /// Optional writer that receives raw kernel batches.
+    stream_writer: ?*std.Io.Writer = null,
 };
 
 pub const default_large_file_threshold: u64 = 100 * 1024 * 1024;
@@ -154,6 +159,7 @@ fn createScanContext(
         .stats = &self.stats, // Pass pointer to stats
         .large_files = &self.large_files,
         .large_file_threshold = self.large_file_threshold,
+        .stream_out = self.stream_out,
     };
 }
 
@@ -984,6 +990,9 @@ fn runWithOptions(self: *Self, options: RunOptions) !void {
     errdefer progress.end();
     self.progress_root = progress;
 
+    self.stream_out = options.stream_writer;
+    defer self.stream_out = null;
+
     // Perform the scan
     const results = try self.performScan();
 
@@ -1013,6 +1022,10 @@ pub fn run(self: *Self) !void {
 
 pub fn runWithBinaryOutput(self: *Self, writer: *std.Io.Writer, emit_text_report: bool) !void {
     try self.runWithOptions(.{ .binary_writer = writer, .emit_text_report = emit_text_report });
+}
+
+pub fn runStream(self: *Self, writer: *std.Io.Writer) !void {
+    try self.runWithOptions(.{ .emit_text_report = false, .stream_writer = writer });
 }
 
 fn writeIntLittle(writer: *std.Io.Writer, comptime T: type, value: anytype) !void {
