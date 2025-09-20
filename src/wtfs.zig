@@ -591,3 +591,81 @@ fn PosixDirScanner(mask: AttrGroupMask) type {
         }
     };
 }
+
+test "POSIX DirScanner iterates entries with requested metadata" {
+    if (builtin.target.os.tag == .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("subdir");
+    try tmp.dir.writeFile(.{ .sub_path = "subdir/nested.txt", .data = "nested" });
+    try tmp.dir.writeFile(.{ .sub_path = "file.txt", .data = "abc" });
+
+    const file_stat = try tmp.dir.statFile("file.txt");
+    const dir_stat = try tmp.dir.statFile("subdir");
+
+    const mask = AttrGroupMask{
+        .common = .{ .name = true, .objtype = true },
+        .dir = .{ .datalength = true },
+        .file = .{ .totalsize = true },
+    };
+
+    const Scanner = DirScanner(mask);
+    var name_buf: [256]u8 = undefined;
+    var iterable_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    const dup_fd = try std.posix.dup(iterable_dir.fd);
+    iterable_dir.close();
+    var scanner = Scanner.init(dup_fd, name_buf[0..]);
+    defer scanner.dir.close();
+
+    var saw_file = false;
+    var saw_dir = false;
+    while (true) {
+        if (!(try scanner.fill())) break;
+        const entry = (try scanner.next()) orelse break;
+
+        if (std.mem.eql(u8, entry.name, "file.txt")) {
+            try std.testing.expect(!saw_file);
+            saw_file = true;
+            try std.testing.expectEqual(Kind.file, entry.kind);
+            try std.testing.expectEqual(@as(u64, file_stat.size), entry.details.file.totalsize);
+        } else if (std.mem.eql(u8, entry.name, "subdir")) {
+            try std.testing.expect(!saw_dir);
+            saw_dir = true;
+            try std.testing.expectEqual(Kind.dir, entry.kind);
+            try std.testing.expectEqual(@as(u64, dir_stat.size), entry.details.dir.datalength);
+        } else {
+            // No other entries were created in the temporary directory
+            try std.testing.expect(false);
+        }
+    }
+
+    try std.testing.expect(saw_file);
+    try std.testing.expect(saw_dir);
+}
+
+test "POSIX DirScanner copyName reports buffer exhaustion" {
+    if (builtin.target.os.tag == .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const mask = AttrGroupMask{
+        .common = .{ .name = true },
+    };
+    const Scanner = DirScanner(mask);
+
+    var tiny_buf: [3]u8 = undefined;
+    var iterable_dir = try tmp.dir.openDir(".", .{ .iterate = true });
+    const dup_fd = try std.posix.dup(iterable_dir.fd);
+    iterable_dir.close();
+    var scanner = Scanner.init(dup_fd, tiny_buf[0..]);
+    defer scanner.dir.close();
+
+    try std.testing.expectError(error.BufferTooSmall, scanner.copyName("long"));
+    const short_name = try scanner.copyName("ok");
+    try std.testing.expectEqualSlices(u8, "ok", std.mem.sliceTo(short_name, 0));
+}
