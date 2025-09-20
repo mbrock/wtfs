@@ -21,6 +21,7 @@ pub const LargeFile = struct {
 };
 
 pub const DirectoryStore = std.MultiArrayList(DirectoryNode);
+pub const LargeFileStore = std.MultiArrayList(LargeFile);
 
 pub const Stats = struct {
     directories_started: AtomicUsize = AtomicUsize.init(0),
@@ -59,7 +60,7 @@ directories_mutex: std.Thread.Mutex = .{},
 task_queue: *TaskQueue,
 outstanding: AtomicUsize = AtomicUsize.init(0),
 
-large_files: *std.ArrayList(LargeFile),
+large_files: *LargeFileStore,
 large_file_threshold: u64,
 
 namelock: std.Thread.Mutex = .{},

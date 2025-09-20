@@ -102,7 +102,7 @@ stats: Context.Stats = Context.Stats.init(),
 large_file_threshold: u64 = default_large_file_threshold,
 
 /// Collection of large files discovered during the scan
-large_files: std.ArrayList(Context.LargeFile) = .empty,
+large_files: Context.LargeFileStore = .empty,
 
 pub const default_large_file_threshold: u64 = 100 * 1024 * 1024;
 
@@ -417,10 +417,14 @@ const SummaryBuilder = struct {
         var top_indexes = std.ArrayList(usize){};
         defer top_indexes.deinit(self.allocator);
 
-        const files = self.large_files.items;
-        for (files, 0..) |file, idx| {
-            if (file.size < self.large_file_threshold) continue;
-            try SummaryBuilder.insertFileIndex(self, &top_indexes, idx, max_entries, files);
+        const slices = self.large_files.slice();
+        const sizes = slices.items(.size);
+        const directories = slices.items(.directory_index);
+        const basenames = slices.items(.basename);
+
+        for (sizes, 0..) |size, idx| {
+            if (size < self.large_file_threshold) continue;
+            try SummaryBuilder.insertFileIndex(self, &top_indexes, idx, max_entries, sizes);
         }
 
         var entries = std.ArrayList(FileSummaryEntry){};
@@ -428,11 +432,10 @@ const SummaryBuilder = struct {
         try entries.ensureTotalCapacityPrecise(self.allocator, top_indexes.items.len);
 
         for (top_indexes.items) |file_index| {
-            const file = files[file_index];
-            const path = try buildFilePath(self, file.directory_index, file.basename);
+            const path = try buildFilePath(self, directories[file_index], basenames[file_index]);
 
             entries.appendAssumeCapacity(.{
-                .size = file.size,
+                .size = sizes[file_index],
                 .path = path,
             });
         }
@@ -478,15 +481,15 @@ const SummaryBuilder = struct {
         list: *std.ArrayList(usize),
         index: usize,
         max_entries: usize,
-        files: []const Context.LargeFile,
+        sizes: []const u64,
     ) !void {
-        const size = files[index].size;
+        const size = sizes[index];
         if (size == 0) return;
 
         if (list.items.len < max_entries) {
             try list.append(self.allocator, index);
             var pos = list.items.len - 1;
-            while (pos > 0 and size > files[list.items[pos - 1]].size) {
+            while (pos > 0 and size > sizes[list.items[pos - 1]]) {
                 list.items[pos] = list.items[pos - 1];
                 pos -= 1;
             }
@@ -495,11 +498,11 @@ const SummaryBuilder = struct {
         }
 
         const smallest_index = list.items[max_entries - 1];
-        if (size <= files[smallest_index].size) return;
+        if (size <= sizes[smallest_index]) return;
 
         list.items[max_entries - 1] = index;
         var pos: usize = max_entries - 1;
-        while (pos > 0 and size > files[list.items[pos - 1]].size) {
+        while (pos > 0 and size > sizes[list.items[pos - 1]]) {
             list.items[pos] = list.items[pos - 1];
             pos -= 1;
         }
