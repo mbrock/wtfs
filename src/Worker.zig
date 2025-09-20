@@ -53,7 +53,9 @@ pub fn directoryWorker(ctx: *Context) void {
 
         //        progress.increaseEstimatedTotalItems(1);
 
-        _ = processDirectory(ctx, &ctx.progress_node, &errprogress, index) catch unreachable;
+        _ = processDirectory(ctx, &ctx.progress_node, &errprogress, index) catch |err| {
+            std.debug.panic("error {t}", .{err});
+        };
         //        progress.setCompletedItems(n);
 
         if (ctx.outstanding.fetchSub(1, .acq_rel) == 1) {

@@ -50,13 +50,13 @@ progress_node: std.Progress.Node,
 errprogress: std.Progress.Node,
 skip_hidden: bool,
 directories_mutex: std.Thread.Mutex = .{},
-task_queue: TaskQueue,
+task_queue: *TaskQueue,
 outstanding: AtomicUsize = AtomicUsize.init(0),
 
 namelock: std.Thread.Mutex = .{},
 namedata: *std.ArrayList(u8),
 idxset: *strpool.IndexSet,
-stats: Stats,
+stats: *Stats,
 
 pub fn getNode(self: *Context, index: usize) DirectoryNode {
     self.directories_mutex.lock();
