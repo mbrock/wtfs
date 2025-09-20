@@ -67,7 +67,7 @@ const TaskQueue = struct {
             return null;
         }
 
-        return self.items.pop().?;
+        return self.items.swapRemove(0);
     }
 
     fn close(self: *TaskQueue) void {
