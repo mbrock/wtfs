@@ -23,9 +23,11 @@ pub fn main() !void {
     var root_arg: ?[]const u8 = null;
     var large_file_threshold = DiskScan.default_large_file_threshold;
     var binary_output: ?[]const u8 = null;
+    var stream_output: ?[]const u8 = null;
 
     const threshold_prefix = "--large-file-threshold=";
     const binary_prefix = "--binary-output=";
+    const stream_prefix = "--stream-output=";
 
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
@@ -41,6 +43,15 @@ pub fn main() !void {
                 return;
             }
             binary_output = std.mem.sliceTo(args[arg_index], 0);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--stream-output")) {
+            arg_index += 1;
+            if (arg_index >= args.len) {
+                try printUsage(exe_name);
+                return;
+            }
+            stream_output = std.mem.sliceTo(args[arg_index], 0);
             continue;
         }
         if (std.mem.eql(u8, arg, "--large-file-threshold")) {
@@ -59,6 +70,10 @@ pub fn main() !void {
         }
         if (std.mem.startsWith(u8, arg, binary_prefix)) {
             binary_output = arg[binary_prefix.len..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, stream_prefix)) {
+            stream_output = arg[stream_prefix.len..];
             continue;
         }
         if (std.mem.startsWith(u8, arg, threshold_prefix)) {
@@ -90,7 +105,22 @@ pub fn main() !void {
         .large_file_threshold = large_file_threshold,
     };
 
-    if (binary_output) |path| {
+    if (binary_output != null and stream_output != null) {
+        try stderr.print("cannot combine --binary-output and --stream-output\n", .{});
+        try printUsage(exe_name);
+        return;
+    }
+
+    if (stream_output) |path| {
+        var stream_file = try std.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
+        defer stream_file.close();
+
+        var stream_buffer: [1 << 15]u8 = undefined;
+        var stream_writer = stream_file.writer(stream_buffer[0..]);
+
+        try diskScan.runStream(&stream_writer.interface);
+        try stream_writer.end();
+    } else if (binary_output) |path| {
         var binary_file = try std.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
         defer binary_file.close();
 
@@ -151,7 +181,7 @@ fn parseSize(value: []const u8) !u64 {
 
 fn printUsage(exe_name: []const u8) !void {
     try stderr.print(
-        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [dir]\n",
+        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [--stream-output PATH] [dir]\n",
         .{exe_name},
     );
     try stderr.print("       SIZE accepts optional K/M/G/T suffix (base 1024)\n", .{});
