@@ -224,6 +224,57 @@ fn directoryName(self: *Self, index: usize) []const u8 {
     return std.mem.sliceTo(self.namedata.items[base_index..], 0);
 }
 
+test "path helpers use shared directory data" {
+    const allocator = std.testing.allocator;
+
+    var disk_scan = Self{ .allocator = allocator };
+    defer disk_scan.directories.deinit(allocator);
+    defer disk_scan.namedata.deinit(allocator);
+    defer disk_scan.idxset.deinit(allocator);
+
+    const root_name_offset = disk_scan.namedata.items.len;
+    try disk_scan.namedata.appendSlice(allocator, "root");
+    try disk_scan.namedata.append(allocator, 0);
+
+    const child_name_offset = disk_scan.namedata.items.len;
+    try disk_scan.namedata.appendSlice(allocator, "child");
+    try disk_scan.namedata.append(allocator, 0);
+
+    const root_index = try disk_scan.directories.addOne(allocator);
+    var slices = disk_scan.directories.slice();
+    slices.items(.parent)[root_index] = 0;
+    slices.items(.basename)[root_index] = @intCast(root_name_offset);
+
+    const child_index = try disk_scan.directories.addOne(allocator);
+    slices = disk_scan.directories.slice();
+    slices.items(.parent)[child_index] = @intCast(root_index);
+    slices.items(.basename)[child_index] = @intCast(child_name_offset);
+
+    try std.testing.expectEqualStrings("root", disk_scan.directoryName(root_index));
+    try std.testing.expectEqualStrings("child", disk_scan.directoryName(child_index));
+
+    var root_buffer: [32]u8 = undefined;
+    var root_writer = std.Io.Writer.fixed(&root_buffer);
+    try disk_scan.writeFullPath(root_index, &root_writer);
+    try std.testing.expectEqualStrings("root", root_writer.buffered());
+
+    var child_buffer: [32]u8 = undefined;
+    var child_writer = std.Io.Writer.fixed(&child_buffer);
+    try disk_scan.writeFullPath(child_index, &child_writer);
+    try std.testing.expectEqualStrings("root/child", child_writer.buffered());
+
+    const root_path = try disk_scan.buildPath(root_index);
+    defer allocator.free(root_path);
+    try std.testing.expectEqualStrings("root", root_path);
+
+    const child_path = try disk_scan.buildPath(child_index);
+    defer allocator.free(child_path);
+    try std.testing.expectEqualStrings("root/child", child_path);
+
+    const expected_names = [_]u8{ 'r', 'o', 'o', 't', 0, 'c', 'h', 'i', 'l', 'd', 0 };
+    try std.testing.expectEqualSlices(u8, &expected_names, disk_scan.namedata.items);
+}
+
 // ===== Statistics Processing =====
 
 const StatsAggregator = struct {
