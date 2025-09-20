@@ -109,7 +109,7 @@ pub const BinaryFormatVersion: u16 = 1;
 pub const RunOptions = struct {
     /// When true, generate the human readable summary and print it to stdout.
     emit_text_report: bool = true,
-    /// Optional binary writer that receives the scan snapshot.
+    /// Optional writer that receives the raw kernel batch stream during scanning.
     binary_writer: ?*std.Io.Writer = null,
 };
 
@@ -139,6 +139,7 @@ fn createScanContext(
     wait_group: *std.Thread.WaitGroup,
     queue_progress: *std.Progress.Node,
     task_queue: *TaskQueue,
+    stream_writer: ?*std.Io.Writer,
 ) Context {
     return Context{
         .allocator = self.allocator,
@@ -154,6 +155,7 @@ fn createScanContext(
         .stats = &self.stats, // Pass pointer to stats
         .large_files = &self.large_files,
         .large_file_threshold = self.large_file_threshold,
+        .stream_out = stream_writer,
     };
 }
 
@@ -173,7 +175,7 @@ fn initializeRootDirectory(self: *Self, ctx: *Context) !void {
 }
 
 // Main gathering phase
-fn gatherPhase(self: *Self) !void {
+fn gatherPhase(self: *Self, stream_writer: ?*std.Io.Writer) !void {
     PlatformConfig.preventICloudDownload();
 
     var queue_progress = self.progress_root.start("Work queue", 0);
@@ -197,6 +199,7 @@ fn gatherPhase(self: *Self) !void {
         &wait_group,
         &queue_progress,
         &task_queue,
+        stream_writer,
     );
     defer ctx.task_queue.deinit(self.allocator);
 
@@ -935,11 +938,11 @@ const Reporter = struct {
 
 // ===== Main Entry Point =====
 
-fn performScan(self: *Self) !ScanResults {
+fn performScan(self: *Self, stream_writer: ?*std.Io.Writer) !ScanResults {
     self.large_files.clearRetainingCapacity();
 
     var timer = try std.time.Timer.start();
-    try self.gatherPhase();
+    try self.gatherPhase(stream_writer);
     const elapsed_ns = timer.read();
 
     StatsAggregator.aggregateUp(self);
@@ -985,7 +988,7 @@ fn runWithOptions(self: *Self, options: RunOptions) !void {
     self.progress_root = progress;
 
     // Perform the scan
-    const results = try self.performScan();
+    const results = try self.performScan(options.binary_writer);
 
     var summary_storage: Summary = undefined;
     var have_summary = false;
@@ -996,10 +999,6 @@ fn runWithOptions(self: *Self, options: RunOptions) !void {
 
     // End progress and report
     progress.end();
-
-    if (options.binary_writer) |writer| {
-        try self.writeBinaryResults(results, writer);
-    }
 
     if (have_summary) {
         defer summary_storage.deinit(self.allocator);
