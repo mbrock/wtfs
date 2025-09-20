@@ -16,6 +16,25 @@ const SummaryEntry = struct {
     path: []u8,
 };
 
+const Summary = struct {
+    top_level: std.ArrayList(SummaryEntry),
+    heaviest: std.ArrayList(SummaryEntry),
+
+    fn deinit(self: *Summary, allocator: std.mem.Allocator) void {
+        freeEntryList(allocator, &self.top_level);
+        freeEntryList(allocator, &self.heaviest);
+    }
+
+    fn freeEntryList(allocator: std.mem.Allocator, list: *std.ArrayList(SummaryEntry)) void {
+        if (list.items.len != 0) {
+            for (list.items) |entry| {
+                allocator.free(entry.path);
+            }
+        }
+        list.deinit(allocator);
+    }
+};
+
 const RootOpenResult = struct {
     dir: ?std.fs.Dir,
     inaccessible: bool,
@@ -99,7 +118,7 @@ fn createScanContext(
         .progress_node = queue_progress.*,
         .errprogress = self.progress_root.start("errors", 0),
         .skip_hidden = self.skip_hidden,
-        .stats = &self.stats,  // Pass pointer to stats
+        .stats = &self.stats, // Pass pointer to stats
     };
 }
 
@@ -118,7 +137,7 @@ fn initializeRootDirectory(self: *Self, ctx: *Context) !void {
     }
 }
 
-// Main gathering phase  
+// Main gathering phase
 fn gatherPhase(self: *Self) !void {
     PlatformConfig.preventICloudDownload();
 
@@ -193,6 +212,12 @@ fn writeFullPath(
     );
 }
 
+fn buildPath(self: *Self, index: usize) ![]u8 {
+    var writer = try std.Io.Writer.Allocating.initCapacity(self.allocator, 256);
+    try self.writeFullPath(index, &writer.writer);
+    return try writer.toOwnedSlice();
+}
+
 // ===== Statistics Processing =====
 
 const StatsAggregator = struct {
@@ -226,6 +251,7 @@ const StatsAggregator = struct {
 const SummaryBuilder = struct {
     fn buildTopLevelEntries(self: *Self) !std.ArrayList(SummaryEntry) {
         var entries = std.ArrayList(SummaryEntry){};
+        errdefer Summary.freeEntryList(self.allocator, &entries);
         self.progress_root.setName("Building paths");
         self.progress_root.setEstimatedTotalItems(self.directories.len);
 
@@ -237,17 +263,83 @@ const SummaryBuilder = struct {
 
             const parent = self.directories.slice().items(.parent)[idx];
             if (parent == 0) {
-                var writer = try std.Io.Writer.Allocating.initCapacity(self.allocator, 256);
-                try self.writeFullPath(idx, &writer.writer);
-
-                try entries.append(self.allocator, .{
+                const path = try buildPath(self, idx);
+                entries.append(self.allocator, .{
                     .index = idx,
-                    .path = try writer.toOwnedSlice(),
-                });
+                    .path = path,
+                }) catch |err| {
+                    self.allocator.free(path);
+                    return err;
+                };
             }
         }
 
         return entries;
+    }
+
+    fn buildHeaviestEntries(self: *Self, max_entries: usize) !std.ArrayList(SummaryEntry) {
+        if (max_entries == 0) return std.ArrayList(SummaryEntry){};
+
+        var top_indexes = std.ArrayList(usize){};
+        defer top_indexes.deinit(self.allocator);
+
+        const slices = self.directories.slice();
+        const sizes = slices.items(.total_size);
+
+        var idx: usize = 1; // Skip root
+        while (idx < self.directories.len) : (idx += 1) {
+            const size = sizes[idx];
+            if (size == 0) continue;
+            try SummaryBuilder.insertTopIndex(self, &top_indexes, idx, max_entries, sizes);
+        }
+
+        var entries = std.ArrayList(SummaryEntry){};
+        errdefer Summary.freeEntryList(self.allocator, &entries);
+        try entries.ensureTotalCapacityPrecise(self.allocator, top_indexes.items.len);
+
+        for (top_indexes.items) |directory_index| {
+            const path = try buildPath(self, directory_index);
+
+            entries.appendAssumeCapacity(.{
+                .index = directory_index,
+                .path = path,
+            });
+        }
+
+        return entries;
+    }
+
+    fn insertTopIndex(
+        self: *Self,
+        list: *std.ArrayList(usize),
+        index: usize,
+        max_entries: usize,
+        sizes: []const u64,
+    ) !void {
+        const size = sizes[index];
+        if (size == 0) return;
+
+        if (list.items.len < max_entries) {
+            try list.append(self.allocator, index);
+            var pos = list.items.len - 1;
+            while (pos > 0 and size > sizes[list.items[pos - 1]]) {
+                list.items[pos] = list.items[pos - 1];
+                pos -= 1;
+            }
+            list.items[pos] = index;
+            return;
+        }
+
+        const smallest_index = list.items[max_entries - 1];
+        if (size <= sizes[smallest_index]) return;
+
+        list.items[max_entries - 1] = index;
+        var pos: usize = max_entries - 1;
+        while (pos > 0 and size > sizes[list.items[pos - 1]]) {
+            list.items[pos] = list.items[pos - 1];
+            pos -= 1;
+        }
+        list.items[pos] = index;
     }
 
     const EntrySorter = struct {
@@ -380,33 +472,155 @@ const Reporter = struct {
         );
     }
 
-    fn printTopDirectories(self: *Self, entries: []const SummaryEntry) !void {
+    fn printTopLevelDirectories(
+        self: *Self,
+        totals: DirectoryTotals,
+        entries: []const SummaryEntry,
+    ) !void {
         if (entries.len == 0) return;
 
-        try stdout.print("Top-level directories by total size:\n\n", .{});
+        try stdout.print(
+            "Top-level directories by total size:\n\n",
+            .{},
+        );
+        try stdout.print(
+            "  Size         Share   Path                               Files      Dirs   Avg file   Status\n",
+            .{},
+        );
 
-        const max_entries = @min(entries.len, 10);
-        for (entries[0..max_entries]) |entry| {
-            try printDirectoryEntry(self, entry);
+        const limit = @min(entries.len, 10);
+        for (entries[0..limit]) |entry| {
+            try printDirectoryEntry(self, totals, entry);
         }
+        try stdout.print("\n", .{});
     }
 
-    fn printDirectoryEntry(self: *Self, entry: SummaryEntry) !void {
+    fn printHeaviestDirectories(
+        self: *Self,
+        totals: DirectoryTotals,
+        entries: []const SummaryEntry,
+    ) !void {
+        if (entries.len == 0) return;
+
+        try stdout.print(
+            "Heaviest directories in tree:\n\n",
+            .{},
+        );
+        try stdout.print(
+            "  Size         Share   Path                               Files      Dirs   Avg file   Status\n",
+            .{},
+        );
+
+        const limit = @min(entries.len, 15);
+        for (entries[0..limit]) |entry| {
+            try printDirectoryEntry(self, totals, entry);
+        }
+        try stdout.print("\n", .{});
+    }
+
+    fn printDirectoryEntry(
+        self: *Self,
+        totals: DirectoryTotals,
+        entry: SummaryEntry,
+    ) !void {
         const slices = self.directories.slice();
         const inaccessible = slices.items(.inaccessible)[entry.index];
         const size = slices.items(.total_size)[entry.index];
         const files = slices.items(.total_files)[entry.index];
-        const marker = if (inaccessible) " (inaccessible)" else "";
+        const dirs_total = slices.items(.total_dirs)[entry.index];
+        const dir_count = if (dirs_total == 0) 0 else dirs_total - 1;
+
+        var size_buf: [32]u8 = undefined;
+        const size_str = try formatBytes(size_buf[0..], size);
+
+        var share_buf: [16]u8 = undefined;
+        const share_str = try formatPercent(share_buf[0..], size, totals.bytes);
+
+        var files_buf: [32]u8 = undefined;
+        const files_str = try formatCount(files_buf[0..], files);
+
+        var dirs_buf: [32]u8 = undefined;
+        const dirs_str = try formatCount(dirs_buf[0..], dir_count);
+
+        var avg_buf: [32]u8 = undefined;
+        const avg_str = if (files == 0)
+            "-"
+        else blk: {
+            const files_u64 = std.math.cast(u64, files) orelse std.math.maxInt(u64);
+            const avg_bytes = size / @max(files_u64, 1);
+            break :blk try formatBytes(avg_buf[0..], avg_bytes);
+        };
+
+        const status = if (inaccessible) "partial" else "";
 
         try stdout.print(
-            "{d: >9.1}MiB  {s: <32}{s}  {d: >6} files\n",
-            .{
-                @as(f64, @floatFromInt(size)) / 1024 / 1024,
-                entry.path,
-                marker,
-                files,
-            },
+            "  {s:>11}  {s:>6}  {s:<36}  {s:>9}  {s:>8}  {s:>9}  {s}\n",
+            .{ size_str, share_str, entry.path, files_str, dirs_str, avg_str, status },
         );
+    }
+
+    fn formatPercent(buf: []u8, value: u64, total: u64) ![]const u8 {
+        if (total == 0) {
+            return try std.fmt.bufPrint(buf, "0.0%", .{});
+        }
+
+        const percent = @min(
+            100.0,
+            (@as(f64, @floatFromInt(value)) / @as(f64, @floatFromInt(total))) * 100.0,
+        );
+        return try std.fmt.bufPrint(buf, "{d:>5.1}%", .{percent});
+    }
+
+    fn formatBytes(buf: []u8, bytes: u64) ![]const u8 {
+        const Unit = struct {
+            threshold: u64,
+            suffix: []const u8,
+        };
+
+        const units = [_]Unit{
+            .{ .threshold = 1024 * 1024 * 1024 * 1024, .suffix = "TiB" },
+            .{ .threshold = 1024 * 1024 * 1024, .suffix = "GiB" },
+            .{ .threshold = 1024 * 1024, .suffix = "MiB" },
+            .{ .threshold = 1024, .suffix = "KiB" },
+        };
+
+        for (units) |unit| {
+            if (bytes >= unit.threshold) {
+                const value = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(unit.threshold));
+                return try std.fmt.bufPrint(buf, "{d:>7.1} {s}", .{ value, unit.suffix });
+            }
+        }
+
+        return try std.fmt.bufPrint(buf, "{d} B", .{bytes});
+    }
+
+    fn formatCount(buf: []u8, value: usize) ![]const u8 {
+        const cast_value = std.math.cast(u64, value) orelse std.math.maxInt(u64);
+        const Unit = struct {
+            threshold: u64,
+            suffix: []const u8,
+        };
+
+        const units = [_]Unit{
+            .{ .threshold = 1_000_000_000_000, .suffix = "T" },
+            .{ .threshold = 1_000_000_000, .suffix = "B" },
+            .{ .threshold = 1_000_000, .suffix = "M" },
+            .{ .threshold = 1_000, .suffix = "K" },
+        };
+
+        for (units) |unit| {
+            if (cast_value >= unit.threshold) {
+                const scaled = @as(f64, @floatFromInt(cast_value)) / @as(f64, @floatFromInt(unit.threshold));
+                const decimals: u8 = if (scaled >= 100.0) 0 else if (scaled >= 10.0) 1 else 2;
+                return switch (decimals) {
+                    0 => try std.fmt.bufPrint(buf, "{d:.0}{s}", .{ scaled, unit.suffix }),
+                    1 => try std.fmt.bufPrint(buf, "{d:.1}{s}", .{ scaled, unit.suffix }),
+                    else => try std.fmt.bufPrint(buf, "{d:.2}{s}", .{ scaled, unit.suffix }),
+                };
+            }
+        }
+
+        return try std.fmt.bufPrint(buf, "{d}", .{cast_value});
     }
 };
 
@@ -427,16 +641,26 @@ fn performScan(self: *Self) !ScanResults {
     };
 }
 
-fn generateSummary(self: *Self) !std.ArrayList(SummaryEntry) {
-    const entries = try SummaryBuilder.buildTopLevelEntries(self);
-    SummaryBuilder.sortBySize(self, entries.items);
-    return entries;
+fn generateSummary(self: *Self) !Summary {
+    var summary = Summary{
+        .top_level = std.ArrayList(SummaryEntry){},
+        .heaviest = std.ArrayList(SummaryEntry){},
+    };
+    errdefer summary.deinit(self.allocator);
+
+    summary.top_level = try SummaryBuilder.buildTopLevelEntries(self);
+    SummaryBuilder.sortBySize(self, summary.top_level.items);
+
+    summary.heaviest = try SummaryBuilder.buildHeaviestEntries(self, 12);
+
+    return summary;
 }
 
-fn reportResults(self: *Self, results: ScanResults, entries: []const SummaryEntry) !void {
+fn reportResults(self: *Self, results: ScanResults, summary: Summary) !void {
     try Reporter.printHeader(self, results);
     try Reporter.printStatistics(results);
-    try Reporter.printTopDirectories(self, entries);
+    try Reporter.printTopLevelDirectories(self, results.totals, summary.top_level.items);
+    try Reporter.printHeaviestDirectories(self, results.totals, summary.heaviest.items);
     try stdout.flush();
 }
 
@@ -450,9 +674,10 @@ pub fn run(self: *Self) !void {
     const results = try self.performScan();
 
     // Generate summary
-    const entries = try self.generateSummary();
+    var summary = try self.generateSummary();
+    defer summary.deinit(self.allocator);
 
     // End progress and report
     progress.end();
-    try self.reportResults(results, entries.items);
+    try self.reportResults(results, summary);
 }
