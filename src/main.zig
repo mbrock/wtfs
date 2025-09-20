@@ -23,20 +23,20 @@ const Scanner = wtfs.DirScanner(.{
 });
 
 const AtomicUsize = std.atomic.Value(usize);
+const AtomicU16 = std.atomic.Value(u16);
+const invalid_fd: std.posix.fd_t = -1;
 
 const DirectoryNode = struct {
-    parent: ?usize,
-    depth: usize,
+    parent: u32,
     basename: u32,
-    dir: ?std.fs.Dir,
-    fdrefcount: AtomicUsize,
+    fd: std.posix.fd_t = invalid_fd,
+    fdrefcount: AtomicU16,
     total_size: u64 = 0,
     total_files: usize = 0,
     total_dirs: usize = 1,
     inaccessible: bool = false,
 };
-
-const DirectoryStore = std.SegmentedList(DirectoryNode, 0);
+const DirectoryStore = std.MultiArrayList(DirectoryNode);
 
 const TaskQueue = struct {
     mutex: std.Thread.Mutex = .{},
@@ -94,10 +94,10 @@ const Context = struct {
     namedata: *std.ArrayList(u8),
     idxset: *strpool.IndexSet,
 
-    fn getNode(self: *Context, index: usize) *DirectoryNode {
+    fn getNode(self: *Context, index: usize) DirectoryNode {
         self.directories_mutex.lock();
         defer self.directories_mutex.unlock();
-        return self.directories.at(index);
+        return self.directories.get(index);
     }
 
     fn internPath(self: *Context, path: []const u8) !u32 {
@@ -108,21 +108,30 @@ const Context = struct {
     }
 
     fn setTotals(self: *Context, index: usize, size: u64, files: usize) void {
-        const node = self.getNode(index);
-        node.total_size = size;
-        node.total_files = files;
-        node.total_dirs = 1;
+        self.directories_mutex.lock();
+        defer self.directories_mutex.unlock();
+        var slices = self.directories.slice();
+        slices.items(.total_size)[index] = size;
+        slices.items(.total_files)[index] = files;
+        slices.items(.total_dirs)[index] = 1;
     }
 
     fn markInaccessible(self: *Context, index: usize) void {
-        const node = self.getNode(index);
-        node.inaccessible = true;
-        if (node.dir) |*dir| {
-            dir.close();
+        self.directories_mutex.lock();
+        defer self.directories_mutex.unlock();
+        var slices = self.directories.slice();
+        const fdrefs = slices.items(.fdrefcount);
+        const ref_ptr = &fdrefs[index];
+        const current_fd = slices.items(.fd)[index];
+        if (current_fd != invalid_fd) {
+            std.posix.close(current_fd);
+            slices.items(.fd)[index] = invalid_fd;
         }
-        node.total_size = 0;
-        node.total_files = 0;
-        node.total_dirs = 1;
+        ref_ptr.store(0, .release);
+        slices.items(.inaccessible)[index] = true;
+        slices.items(.total_size)[index] = 0;
+        slices.items(.total_files)[index] = 0;
+        slices.items(.total_dirs)[index] = 1;
     }
 
     fn addRoot(self: *Context, path: []const u8, dir: ?std.fs.Dir, inaccessible: bool) !usize {
@@ -134,19 +143,16 @@ const Context = struct {
         self.directories_mutex.lock();
         defer self.directories_mutex.unlock();
 
-        const index = self.directories.count();
-        const node_ptr = try self.directories.addOne(self.allocator);
-        node_ptr.* = .{
-            .parent = null,
-            .depth = 0,
-            .basename = name_copy,
-            .dir = dir_copy,
-            .total_size = 0,
-            .total_files = 0,
-            .total_dirs = 1,
-            .inaccessible = inaccessible,
-            .fdrefcount = AtomicUsize.init(0),
-        };
+        const index = try self.directories.addOne(self.allocator);
+        var slices = self.directories.slice();
+        slices.items(.parent)[index] = 0;
+        slices.items(.basename)[index] = name_copy;
+        slices.items(.fd)[index] = if (dir_copy) |d| d.fd else invalid_fd;
+        slices.items(.total_size)[index] = 0;
+        slices.items(.total_files)[index] = 0;
+        slices.items(.total_dirs)[index] = 1;
+        slices.items(.inaccessible)[index] = inaccessible;
+        slices.items(.fdrefcount)[index] = AtomicU16.init(0);
 
         return index;
     }
@@ -157,22 +163,50 @@ const Context = struct {
         self.directories_mutex.lock();
         defer self.directories_mutex.unlock();
 
-        const parent_depth = self.directories.at(parent_index).depth;
-        const index = self.directories.count();
-        const node_ptr = try self.directories.addOne(self.allocator);
-        node_ptr.* = .{
-            .parent = parent_index,
-            .depth = parent_depth + 1,
-            .basename = name_copy,
-            .dir = null,
-            .total_size = 0,
-            .total_files = 0,
-            .total_dirs = 1,
-            .inaccessible = false,
-            .fdrefcount = .init(0),
-        };
+        const index = try self.directories.addOne(self.allocator);
+        var slices = self.directories.slice();
+        slices.items(.parent)[index] = @intCast(parent_index);
+        slices.items(.basename)[index] = name_copy;
+        slices.items(.fd)[index] = invalid_fd;
+        slices.items(.total_size)[index] = 0;
+        slices.items(.total_files)[index] = 0;
+        slices.items(.total_dirs)[index] = 1;
+        slices.items(.inaccessible)[index] = false;
+        slices.items(.fdrefcount)[index] = AtomicU16.init(0);
 
         return index;
+    }
+
+    fn setDirectoryFd(self: *Context, index: usize, fd: std.posix.fd_t) void {
+        self.directories_mutex.lock();
+        defer self.directories_mutex.unlock();
+        var slices = self.directories.slice();
+        slices.items(.fd)[index] = fd;
+    }
+
+    fn closeDirectory(self: *Context, index: usize) void {
+        self.directories_mutex.lock();
+        defer self.directories_mutex.unlock();
+        var slices = self.directories.slice();
+        const fd = slices.items(.fd)[index];
+        if (fd != invalid_fd) {
+            std.posix.close(fd);
+            slices.items(.fd)[index] = invalid_fd;
+        }
+    }
+
+    fn fdRefAdd(self: *Context, index: usize, value: u16, comptime order: std.builtin.AtomicOrder) u16 {
+        self.directories_mutex.lock();
+        defer self.directories_mutex.unlock();
+        var slices = self.directories.slice();
+        return slices.items(.fdrefcount)[index].fetchAdd(value, order);
+    }
+
+    fn fdRefSub(self: *Context, index: usize, value: u16, comptime order: std.builtin.AtomicOrder) u16 {
+        self.directories_mutex.lock();
+        defer self.directories_mutex.unlock();
+        var slices = self.directories.slice();
+        return slices.items(.fdrefcount)[index].fetchSub(value, order);
     }
 
     fn scheduleDirectory(self: *Context, index: usize) !void {
@@ -205,10 +239,9 @@ const Context = struct {
 
     fn appendPathRecursive(self: *Context, buffer: *std.ArrayList(u8), index: usize) !void {
         const node = self.getNode(index);
-        const parent_index = node.parent;
         const basename = node.basename;
-        if (parent_index) |parent| {
-            try self.appendPathRecursive(buffer, parent);
+        if (index != 0) {
+            try self.appendPathRecursive(buffer, @intCast(node.parent));
             try buffer.append(self.allocator, '/');
         }
         try buffer.appendSlice(
@@ -282,22 +315,24 @@ fn processDirectory(
     // var scanprogress = progress.start(basename, 0);
     // defer scanprogress.end();
 
-    if (node.parent != null) {
-        const parent = ctx.getNode(node.parent.?);
-
-        const opened = std.posix.openat(parent.dir.?.fd, basename, .{
+    var dir_fd: std.posix.fd_t = undefined;
+    if (index != 0) {
+        const parent_index: usize = @intCast(node.parent);
+        const parent = ctx.getNode(parent_index);
+        const opened = std.posix.openat(parent.fd, basename, .{
             .NONBLOCK = true,
             .DIRECTORY = true,
             .NOFOLLOW = true,
         }, 0);
 
-        const refcnt = parent.fdrefcount.fetchSub(1, .seq_cst);
+        const refcnt = ctx.fdRefSub(parent_index, 1, .seq_cst);
         if (refcnt == 1) {
-            parent.dir.?.close();
+            ctx.closeDirectory(parent_index);
         }
 
         if (opened) |fd| {
-            node.dir = std.fs.Dir{ .fd = fd };
+            dir_fd = fd;
+            ctx.setDirectoryFd(index, fd);
         } else |err| switch (err) {
             error.PermissionDenied, error.AccessDenied => {
                 _ = ctx.inaccessible_dirs.fetchAdd(1, .monotonic);
@@ -311,8 +346,7 @@ fn processDirectory(
             else => return err,
         }
     } else {
-        const parent = ctx.getNode(index);
-        const opened = std.posix.openat(parent.dir.?.fd, basename, .{
+        const opened = std.posix.openat(node.fd, basename, .{
             .NONBLOCK = true,
             .DIRECTORY = true,
             .NOFOLLOW = true,
@@ -324,14 +358,18 @@ fn processDirectory(
             },
             else => return err,
         };
-        node.dir = std.fs.Dir{ .fd = opened };
+        if (node.fd != invalid_fd) {
+            std.posix.close(node.fd);
+        }
+        dir_fd = opened;
+        ctx.setDirectoryFd(index, opened);
     }
 
-    var scanner = Scanner.init(node.dir.?.fd, &buf);
+    var scanner = Scanner.init(dir_fd, &buf);
     var total_size: u64 = 0;
     var total_files: usize = 0;
 
-    _ = node.fdrefcount.fetchAdd(1, .acq_rel);
+    _ = ctx.fdRefAdd(index, 1, .acq_rel);
 
     while (true) {
         if (scanner.next()) |it| {
@@ -345,7 +383,7 @@ fn processDirectory(
                     .dir => {
                         if (ctx.skip_hidden and name[0] == '.') continue;
 
-                        _ = node.fdrefcount.fetchAdd(1, .acq_rel);
+                        _ = ctx.fdRefAdd(index, 1, .acq_rel);
                         const child_index = try ctx.addChild(index, name);
                         //                        ctx.progress_node.increaseEstimatedTotalItems(1);
                         try ctx.scheduleDirectory(child_index);
@@ -369,8 +407,8 @@ fn processDirectory(
         }
     }
 
-    if (node.fdrefcount.fetchSub(1, .acq_rel) == 1) {
-        node.dir.?.close();
+    if (ctx.fdRefSub(index, 1, .acq_rel) == 1) {
+        ctx.closeDirectory(index);
     }
 
     ctx.setTotals(index, total_size, total_files);
@@ -493,26 +531,27 @@ pub fn main() !void {
 
     progress_root.end();
 
-    const dir_count = ctx.directories.count();
+    const dir_count = ctx.directories.len;
     progress_root.setName("Summarizing");
     progress_root.setEstimatedTotalItems(dir_count);
+    ctx.directories_mutex.lock();
+    var slices = ctx.directories.slice();
     var idx = dir_count;
     while (idx > 0) {
         idx -= 1;
-        const node = ctx.getNode(idx);
-        if (node.parent) |parent_index| {
-            const parent = ctx.getNode(parent_index);
-            parent.total_size += node.total_size;
-            parent.total_files += node.total_files;
-            parent.total_dirs += node.total_dirs;
+        if (idx != 0) {
+            const parent_index: usize = @intCast(slices.items(.parent)[idx]);
+            slices.items(.total_size)[parent_index] += slices.items(.total_size)[idx];
+            slices.items(.total_files)[parent_index] += slices.items(.total_files)[idx];
+            slices.items(.total_dirs)[parent_index] += slices.items(.total_dirs)[idx];
         }
         progress_root.completeOne();
     }
 
-    const root_node = ctx.getNode(0);
-    const directories_including_root = root_node.total_dirs;
-    const files_total = root_node.total_files;
-    const bytes_total = root_node.total_size;
+    const directories_including_root = slices.items(.total_dirs)[0];
+    const files_total = slices.items(.total_files)[0];
+    const bytes_total = slices.items(.total_size)[0];
+    ctx.directories_mutex.unlock();
     const inaccessible_dirs = ctx.inaccessible_dirs.load(.acquire);
 
     const SummaryEntry = struct {
@@ -525,8 +564,12 @@ pub fn main() !void {
     progress_root.setEstimatedTotalItems(dir_count);
     var depth_index: usize = 0;
     while (depth_index < dir_count) : (depth_index += 1) {
+        if (depth_index == 0) {
+            progress_root.completeOne();
+            continue;
+        }
         const node = ctx.getNode(depth_index);
-        if (node.depth == 1) {
+        if (node.parent == 0) {
             const path_copy = try ctx.buildPathOwned(allocator, depth_index);
             try top_level_entries.append(allocator, .{ .index = depth_index, .path = path_copy });
         }
