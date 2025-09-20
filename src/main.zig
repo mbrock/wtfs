@@ -225,25 +225,31 @@ fn directoryWorker(ctx: *Context) void {
     var progress = ctx.progress_node.start("worker", 0);
 
     var namebuf: [std.fs.max_name_bytes]u8 = undefined;
+    // var progbuf: [256]u8 = undefined;
+    // var mytotalsize: u64 = 0;
 
+    var i: usize = 0;
     while (true) {
         const maybe_index = ctx.task_queue.pop();
         if (maybe_index == null) break;
         const index = maybe_index.?;
 
-        const basename = takename(ctx, ctx.getNode(index).basename, &namebuf);
+        if (@mod(i, 100) == 0) {
+            const basename = takename(ctx, ctx.getNode(index).basename, &namebuf);
+            progress.setName(basename);
+        }
+        i += 1;
 
-        progress.setName(basename);
-
-        progress.increaseEstimatedTotalItems(1);
+        //        progress.increaseEstimatedTotalItems(1);
         defer progress.completeOne();
 
         defer ctx.progress_node.completeOne();
 
-        processDirectory(ctx, &progress, index) catch |err| {
+        _ = processDirectory(ctx, &progress, index) catch |err| blk: {
             std.debug.print("error processing directory {d}: {t}\n", .{ index, err });
             _ = ctx.inaccessible_dirs.fetchAdd(1, .monotonic);
             ctx.markInaccessible(index);
+            break :blk 0;
         };
 
         if (ctx.outstanding.fetchSub(1, .acq_rel) == 1) {
@@ -264,17 +270,17 @@ fn takename(ctx: *Context, idx: u32, buffer: []u8) []const u8 {
 
 fn processDirectory(
     ctx: *Context,
-    progress: *std.Progress.Node,
+    _: *std.Progress.Node,
     index: usize,
-) !void {
+) !usize {
     var buf: [16 * 1024]u8 = undefined;
     var namebuf: [std.fs.max_name_bytes]u8 = undefined;
 
     const node = ctx.getNode(index);
     const basename = takename(ctx, node.basename, &namebuf);
 
-    var scanprogress = progress.start("Opening directory", 0);
-    defer scanprogress.end();
+    // var scanprogress = progress.start(basename, 0);
+    // defer scanprogress.end();
 
     if (node.parent != null) {
         const parent = ctx.getNode(node.parent.?);
@@ -296,7 +302,7 @@ fn processDirectory(
             error.PermissionDenied, error.AccessDenied => {
                 _ = ctx.inaccessible_dirs.fetchAdd(1, .monotonic);
                 ctx.markInaccessible(index);
-                return;
+                return 0;
             },
             error.FileNotFound => {
                 std.debug.panic("directory disappeared: {s}\n", .{basename});
@@ -314,7 +320,7 @@ fn processDirectory(
             error.PermissionDenied, error.AccessDenied => {
                 _ = ctx.inaccessible_dirs.fetchAdd(1, .monotonic);
                 ctx.markInaccessible(index);
-                return;
+                return 0;
             },
             else => return err,
         };
@@ -329,13 +335,11 @@ fn processDirectory(
 
     while (true) {
         if (scanner.next()) |it| {
-            scanprogress.setEstimatedTotalItems(scanner.n);
+            //            scanprogress.setEstimatedTotalItems(scanner.n);
             if (it) |entry| {
                 const name = std.mem.sliceTo(entry.name, 0);
                 if (name.len == 0) continue;
                 if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-
-                scanprogress.setName(name);
 
                 switch (entry.kind) {
                     .dir => {
@@ -343,7 +347,7 @@ fn processDirectory(
 
                         _ = node.fdrefcount.fetchAdd(1, .acq_rel);
                         const child_index = try ctx.addChild(index, name);
-                        progress.increaseEstimatedTotalItems(1);
+                        //                        ctx.progress_node.increaseEstimatedTotalItems(1);
                         try ctx.scheduleDirectory(child_index);
                     },
                     .file => {
@@ -359,7 +363,7 @@ fn processDirectory(
                 // iCloud dataless file
                 _ = ctx.inaccessible_dirs.fetchAdd(1, .monotonic);
                 ctx.markInaccessible(index);
-                return;
+                return 0;
             }
             return err;
         }
@@ -370,6 +374,8 @@ fn processDirectory(
     }
 
     ctx.setTotals(index, total_size, total_files);
+
+    return total_size;
 }
 
 pub fn main() !void {
@@ -430,7 +436,9 @@ pub fn main() !void {
     errdefer progress_root.end();
 
     var pool: std.Thread.Pool = undefined;
-    try pool.init(.{ .allocator = allocator });
+    try pool.init(.{
+        .allocator = allocator,
+    });
     defer pool.deinit();
 
     var wait_group: std.Thread.WaitGroup = .{};
