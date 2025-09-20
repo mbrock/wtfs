@@ -177,6 +177,43 @@ pub extern "c" fn getiopolicy_np(
     scope: IoPolicyScope,
 ) c_int;
 
+pub extern "c" fn openat(
+    dirfd: std.posix.fd_t,
+    path: [*:0]const u8,
+    flags: std.posix.O,
+    mode: std.posix.mode_t,
+) std.posix.fd_t;
+
+pub fn openSubdirectory(
+    parent_fd: std.posix.fd_t,
+    name: [:0]const u8,
+) !std.posix.fd_t {
+    while (true) {
+        const x = openat(parent_fd, name, .{
+            .NONBLOCK = true,
+            .DIRECTORY = true,
+            .NOFOLLOW = true,
+        }, 0);
+
+        if (x < 0) {
+            switch (posix.errno(x)) {
+                .INTR => continue,
+                .BADF => return error.BadFileDescriptor,
+                .NOTDIR => return error.NotDir,
+                .NOENT => return error.FileNotFound,
+                .ACCES => return error.AccessDenied,
+                .PERM => return error.PermissionDenied,
+                .LOOP => return error.TooManySymlinks,
+                .NAMETOOLONG => return error.NameTooLong,
+                .IO => return error.IOError,
+                else => |e| std.debug.panic("unexpected errno {t}", .{e}),
+            }
+        }
+
+        return x;
+    }
+}
+
 /// Represents the type of a file system object
 pub const Kind = enum { file, dir, symlink, other };
 
