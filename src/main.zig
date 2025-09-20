@@ -22,14 +22,25 @@ pub fn main() !void {
     var skip_hidden = false;
     var root_arg: ?[]const u8 = null;
     var large_file_threshold = DiskScan.default_large_file_threshold;
+    var binary_output: ?[]const u8 = null;
 
     const threshold_prefix = "--large-file-threshold=";
+    const binary_prefix = "--binary-output=";
 
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
         const arg = std.mem.sliceTo(args[arg_index], 0);
         if (std.mem.eql(u8, arg, "--skip-hidden")) {
             skip_hidden = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--binary-output")) {
+            arg_index += 1;
+            if (arg_index >= args.len) {
+                try printUsage(exe_name);
+                return;
+            }
+            binary_output = std.mem.sliceTo(args[arg_index], 0);
             continue;
         }
         if (std.mem.eql(u8, arg, "--large-file-threshold")) {
@@ -44,6 +55,10 @@ pub fn main() !void {
                 try printUsage(exe_name);
                 return;
             };
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, binary_prefix)) {
+            binary_output = arg[binary_prefix.len..];
             continue;
         }
         if (std.mem.startsWith(u8, arg, threshold_prefix)) {
@@ -75,7 +90,18 @@ pub fn main() !void {
         .large_file_threshold = large_file_threshold,
     };
 
-    try diskScan.run();
+    if (binary_output) |path| {
+        var binary_file = try std.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
+        defer binary_file.close();
+
+        var binary_buffer: [16 * 1024]u8 = undefined;
+        var file_writer = binary_file.writer(binary_buffer[0..]);
+
+        try diskScan.runWithBinaryOutput(&file_writer.interface, true);
+        try file_writer.end();
+    } else {
+        try diskScan.run();
+    }
 }
 
 fn parseSize(value: []const u8) !u64 {
@@ -125,7 +151,7 @@ fn parseSize(value: []const u8) !u64 {
 
 fn printUsage(exe_name: []const u8) !void {
     try stderr.print(
-        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [dir]\n",
+        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [dir]\n",
         .{exe_name},
     );
     try stderr.print("       SIZE accepts optional K/M/G/T suffix (base 1024)\n", .{});
