@@ -67,7 +67,7 @@ const TaskQueue = struct {
             return null;
         }
 
-        return self.items.swapRemove(0);
+        return self.items.pop();
     }
 
     fn close(self: *TaskQueue) void {
@@ -528,8 +528,6 @@ pub fn main() !void {
     }
 
     wait_group.wait();
-
-    progress_root.end();
 
     const dir_count = ctx.directories.len;
     progress_root.setName("Summarizing");
