@@ -305,6 +305,10 @@ fn processEntry(
             metrics.total_size += file.allocsize;
             metrics.total_files += 1;
             batch_metrics.batch_files += 1;
+
+            if (file.allocsize >= self.ctx.large_file_threshold) {
+                try self.ctx.recordLargeFileLocked(index, name, file.allocsize);
+            }
         },
         .symlink => batch_metrics.batch_symlinks += 1,
         .other => batch_metrics.batch_other += 1,

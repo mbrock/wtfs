@@ -14,6 +14,12 @@ pub const DirectoryNode = struct {
     inaccessible: bool = false,
 };
 
+pub const LargeFile = struct {
+    directory_index: usize,
+    basename: u32,
+    size: u64,
+};
+
 pub const DirectoryStore = std.MultiArrayList(DirectoryNode);
 
 pub const Stats = struct {
@@ -52,6 +58,9 @@ skip_hidden: bool,
 directories_mutex: std.Thread.Mutex = .{},
 task_queue: *TaskQueue,
 outstanding: AtomicUsize = AtomicUsize.init(0),
+
+large_files: *std.ArrayList(LargeFile),
+large_file_threshold: u64,
 
 namelock: std.Thread.Mutex = .{},
 namedata: *std.ArrayList(u8),
@@ -167,6 +176,20 @@ pub fn retainParentFd(self: *Context, parent_index: usize) void {
 pub fn retainParentFdLocked(self: *Context, parent_index: usize) void {
     var slices = self.directories.slice();
     _ = slices.items(.fdrefcount)[parent_index].fetchAdd(1, .acq_rel);
+}
+
+pub fn recordLargeFileLocked(
+    self: *Context,
+    directory_index: usize,
+    name: []const u8,
+    size: u64,
+) !void {
+    const name_copy = try self.internPath(name);
+    try self.large_files.append(self.allocator, .{
+        .directory_index = directory_index,
+        .basename = name_copy,
+        .size = size,
+    });
 }
 
 /// Decrement reference count and close fd if no longer needed (thread-safe)
