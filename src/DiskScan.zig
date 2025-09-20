@@ -490,15 +490,14 @@ const Reporter = struct {
             .{},
         );
         try stdout.print(
-            "  Size         Share   Path                               Files      Dirs   Avg file   Status\n",
+            "  Size         Share   Files      Dirs\n",
             .{},
         );
 
         const limit = @min(entries.len, 10);
         for (entries[0..limit]) |entry| {
-            try printDirectoryEntry(self, totals, entry);
+            try printTopLevelEntry(self, totals, entry);
         }
-        try stdout.print("\n", .{});
     }
 
     fn printHeaviestDirectories(
@@ -509,7 +508,7 @@ const Reporter = struct {
         if (entries.len == 0) return;
 
         try stdout.print("Heaviest directories in tree:\n\n", .{});
-        try stdout.print("  Size         Share   Files      Dirs   Avg file   Path\n", .{});
+        try stdout.print("  Size         Share   Files      Dirs\n", .{});
 
         const ChildMap = std.AutoHashMap(usize, std.ArrayList(usize));
         var child_map = ChildMap.init(self.allocator);
@@ -626,30 +625,22 @@ const Reporter = struct {
         var dirs_buf: [32]u8 = undefined;
         const dirs_str = try formatCount(dirs_buf[0..], dir_count);
 
-        var avg_buf: [32]u8 = undefined;
-        const avg_str = if (files == 0)
-            "-"
-        else blk: {
-            const files_u64 = std.math.cast(u64, files) orelse std.math.maxInt(u64);
-            const avg_bytes = size / @max(files_u64, 1);
-            break :blk try formatBytes(avg_buf[0..], avg_bytes);
-        };
-
         var indent_buf: [64]u8 = undefined;
         const indent_len = @min(depth * 2, indent_buf.len);
         for (indent_buf[0..indent_len]) |*ch| ch.* = ' ';
         const indent = indent_buf[0..indent_len];
 
         const name = if (index == 0) "." else directoryName(self, index);
-        const status = if (inaccessible) "partial" else "";
+        const status_suffix = if (inaccessible) "  (partial)" else "";
 
         try stdout.print(
-            "  {s:>11}  {s:>6}  {s:>9}  {s:>8}  {s:>9}  {s}{s}{s}\n",
-            .{ size_str, share_str, files_str, dirs_str, avg_str, indent, name, status },
+            "  {s:>11}  {s:>6}  files {s:>9}  dirs {s:>8}\n",
+            .{ size_str, share_str, files_str, dirs_str },
         );
+        try stdout.print("      {s}{s}{s}\n\n", .{ indent, name, status_suffix });
     }
 
-    fn printDirectoryEntry(
+    fn printTopLevelEntry(
         self: *Self,
         totals: DirectoryTotals,
         entry: SummaryEntry,
@@ -672,22 +663,13 @@ const Reporter = struct {
 
         var dirs_buf: [32]u8 = undefined;
         const dirs_str = try formatCount(dirs_buf[0..], dir_count);
-
-        var avg_buf: [32]u8 = undefined;
-        const avg_str = if (files == 0)
-            "-"
-        else blk: {
-            const files_u64 = std.math.cast(u64, files) orelse std.math.maxInt(u64);
-            const avg_bytes = size / @max(files_u64, 1);
-            break :blk try formatBytes(avg_buf[0..], avg_bytes);
-        };
-
-        const status = if (inaccessible) "partial" else "";
+        const status_suffix = if (inaccessible) "  (partial)" else "";
 
         try stdout.print(
-            "  {s:>11}  {s:>6}  {s:<36}  {s:>9}  {s:>8}  {s:>9}  {s}\n",
-            .{ size_str, share_str, entry.path, files_str, dirs_str, avg_str, status },
+            "  {s:>11}  {s:>6}  files {s:>9}  dirs {s:>8}\n",
+            .{ size_str, share_str, files_str, dirs_str },
         );
+        try stdout.print("      {s}{s}\n\n", .{ entry.path, status_suffix });
     }
 
     fn formatPercent(buf: []u8, value: u64, total: u64) ![]const u8 {
