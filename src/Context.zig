@@ -139,6 +139,14 @@ pub fn addChild(self: *Context, parent_index: usize, name: []const u8) !usize {
     return index;
 }
 
+// ===== Parent Directory File Descriptor Lifecycle Management =====
+// 
+// These methods manage the reference counting of directory file descriptors.
+// A directory's fd must stay open as long as any child might need to be opened
+// via openat() from it. We use reference counting to track how many pending
+// child operations still need the parent fd.
+
+/// Store the opened file descriptor for a directory (thread-safe)
 pub fn setDirectoryFd(self: *Context, index: usize, fd: std.posix.fd_t) void {
     self.directories_mutex.lock();
     defer self.directories_mutex.unlock();
@@ -146,26 +154,57 @@ pub fn setDirectoryFd(self: *Context, index: usize, fd: std.posix.fd_t) void {
     slices.items(.fd)[index] = fd;
 }
 
-/// Caller must hold directories_mutex.
-pub fn closeDirectory(self: *Context, index: usize) void {
+/// Increment reference count to keep a parent directory fd open (thread-safe)
+/// Call when scheduling a child directory that will need openat() from this parent
+pub fn retainParentFd(self: *Context, parent_index: usize) void {
+    self.directories_mutex.lock();
+    defer self.directories_mutex.unlock();
+    self.retainParentFdLocked(parent_index);
+}
+
+/// Increment reference count when already holding the directories_mutex
+/// Used from batch processing where we hold the lock for performance
+pub fn retainParentFdLocked(self: *Context, parent_index: usize) void {
     var slices = self.directories.slice();
-    const fd = slices.items(.fd)[index];
-    if (fd != invalid_fd) {
-        std.posix.close(fd);
-        slices.items(.fd)[index] = invalid_fd;
+    _ = slices.items(.fdrefcount)[parent_index].fetchAdd(1, .acq_rel);
+}
+
+/// Decrement reference count and close fd if no longer needed (thread-safe)
+/// Call after opening a child directory or when done scanning
+pub fn releaseParentFd(self: *Context, parent_index: usize) void {
+    self.directories_mutex.lock();
+    defer self.directories_mutex.unlock();
+    
+    var slices = self.directories.slice();
+    const prev_count = slices.items(.fdrefcount)[parent_index].fetchSub(1, .acq_rel);
+    
+    // If this was the last child needing this parent fd, close it
+    if (prev_count == 1) {
+        const fd = slices.items(.fd)[parent_index];
+        if (fd != invalid_fd) {
+            std.posix.close(fd);
+            slices.items(.fd)[parent_index] = invalid_fd;
+        }
     }
 }
 
-/// Caller must hold directories_mutex.
-pub fn fdRefAdd(self: *Context, index: usize, value: u16, comptime order: std.builtin.AtomicOrder) u16 {
+/// Release parent fd after successfully opening a child directory from it
+/// Uses stricter memory ordering to ensure parent-child operations are properly sequenced
+pub fn releaseParentFdAfterOpen(self: *Context, parent_index: usize) void {
+    self.directories_mutex.lock();
+    defer self.directories_mutex.unlock();
+    
     var slices = self.directories.slice();
-    return slices.items(.fdrefcount)[index].fetchAdd(value, order);
-}
-
-/// Caller must hold directories_mutex.
-pub fn fdRefSub(self: *Context, index: usize, value: u16, comptime order: std.builtin.AtomicOrder) u16 {
-    var slices = self.directories.slice();
-    return slices.items(.fdrefcount)[index].fetchSub(value, order);
+    const prev_count = slices.items(.fdrefcount)[parent_index].fetchSub(1, .seq_cst);
+    
+    // If this was the last child needing this parent fd, close it
+    if (prev_count == 1) {
+        const fd = slices.items(.fd)[parent_index];
+        if (fd != invalid_fd) {
+            std.posix.close(fd);
+            slices.items(.fd)[parent_index] = invalid_fd;
+        }
+    }
 }
 
 pub fn scheduleDirectory(self: *Context, index: usize) !void {

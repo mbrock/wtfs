@@ -39,13 +39,28 @@ const stdout = &stdout_writer.interface;
 
 // ===== Instance Fields =====
 
+/// Memory allocator for all dynamic allocations during the scan
 allocator: std.mem.Allocator,
+
+/// Whether to skip hidden files and directories (starting with '.')
 skip_hidden: bool = true,
+
+/// Root directory path to scan
 root: []const u8 = ".",
+
+/// Multi-array storage for all discovered directory nodes and their metadata
 directories: Context.DirectoryStore = .empty,
+
+/// Pool of null-terminated directory names referenced by basename indices
 namedata: std.ArrayList(u8) = .empty,
+
+/// Set tracking unique name indices to avoid duplicates in the name pool
 idxset: strpool.IndexSet = .empty,
+
+/// Root progress node for tracking scan progress and reporting to the user
 progress_root: std.Progress.Node = undefined,
+
+/// Atomic statistics counters shared by all worker threads during scanning
 stats: Context.Stats = Context.Stats.init(),
 
 // ===== Platform Configuration =====
