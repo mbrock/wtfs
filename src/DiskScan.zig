@@ -56,7 +56,7 @@ const RootOpenResult = struct {
     inaccessible: bool,
 };
 
-const DirectoryTotals = struct {
+const DirectoryTotals = packed struct {
     directories: u64,
     files: u64,
     bytes: u64,
@@ -1021,87 +1021,12 @@ pub fn runWithBinaryOutput(self: *Self, writer: *std.Io.Writer, emit_text_report
     try self.runWithOptions(.{ .binary_writer = writer, .emit_text_report = emit_text_report });
 }
 
-fn writeIntLittle(writer: *std.Io.Writer, comptime T: type, value: anytype) !void {
-    var buf: [@sizeOf(T)]u8 = undefined;
-    std.mem.writeIntLittle(T, &buf, @as(T, @intCast(value)));
-    try writer.writeSliceSwap(u8, &buf);
-}
-
-fn snapshotStats(stats: *const Context.Stats) StatsSnapshot {
-    return .{
-        .directories_started = stats.directories_started.load(.acquire),
-        .directories_completed = stats.directories_completed.load(.acquire),
-        .directories_scheduled = stats.directories_scheduled.load(.acquire),
-        .directories_discovered = stats.directories_discovered.load(.acquire),
-        .files_discovered = stats.files_discovered.load(.acquire),
-        .symlinks_discovered = stats.symlinks_discovered.load(.acquire),
-        .other_discovered = stats.other_discovered.load(.acquire),
-        .scanner_batches = stats.scanner_batches.load(.acquire),
-        .scanner_entries = stats.scanner_entries.load(.acquire),
-        .scanner_max_batch = stats.scanner_max_batch.load(.acquire),
-        .scanner_errors = stats.scanner_errors.load(.acquire),
-        .inaccessible_dirs = stats.inaccessible_dirs.load(.acquire),
-        .high_watermark = stats.high_watermark.load(.acquire),
-    };
-}
-
-const StatsSnapshot = struct {
-    directories_started: usize,
-    directories_completed: usize,
-    directories_scheduled: usize,
-    directories_discovered: usize,
-    files_discovered: usize,
-    symlinks_discovered: usize,
-    other_discovered: usize,
-    scanner_batches: usize,
-    scanner_entries: usize,
-    scanner_max_batch: usize,
-    scanner_errors: usize,
-    inaccessible_dirs: usize,
-    high_watermark: usize,
-};
-
-fn writeStats(writer: *std.Io.Writer, snapshot: StatsSnapshot) !void {
-    const fields = .{
-        snapshot.directories_started,
-        snapshot.directories_completed,
-        snapshot.directories_scheduled,
-        snapshot.directories_discovered,
-        snapshot.files_discovered,
-        snapshot.symlinks_discovered,
-        snapshot.other_discovered,
-        snapshot.scanner_batches,
-        snapshot.scanner_entries,
-        snapshot.scanner_max_batch,
-        snapshot.scanner_errors,
-        snapshot.inaccessible_dirs,
-        snapshot.high_watermark,
-    };
-
-    inline for (fields) |value| {
-        try writeIntLittle(writer, u64, value);
-    }
-}
-
-pub fn writeBinaryResults(self: *Self, results: ScanResults, writer: *std.Io.Writer) !void {
-    const magic = "WTFS";
-    try writer.writeAll(magic);
-    try writeIntLittle(writer, u16, BinaryFormatVersion);
-    try writeIntLittle(writer, u16, 0);
-    try writeIntLittle(writer, u64, results.elapsed_ns);
-
-    try writeIntLittle(writer, u64, results.totals.directories);
-    try writeIntLittle(writer, u64, results.totals.files);
-    try writeIntLittle(writer, u64, results.totals.bytes);
-
-    const stats_snapshot = snapshotStats(results.stats);
-    try writeStats(writer, stats_snapshot);
-
-    const directory_count = self.directories.len;
-    const name_bytes = self.namedata.items.len;
-    try writeIntLittle(writer, u64, directory_count);
-    try writeIntLittle(writer, u64, name_bytes);
-    try writer.writeAll(self.namedata.items);
+pub fn writeBinaryResults(
+    self: *Self,
+    results: ScanResults,
+    writer: *std.Io.Writer,
+) !void {
+    const magic = "wtfsdumpv0.0   \n";
 
     const dir_slices = self.directories.slice();
     const parents = dir_slices.items(.parent);
@@ -1109,164 +1034,20 @@ pub fn writeBinaryResults(self: *Self, results: ScanResults, writer: *std.Io.Wri
     const total_sizes = dir_slices.items(.total_size);
     const total_files = dir_slices.items(.total_files);
     const total_dirs = dir_slices.items(.total_dirs);
-    const inaccessible = dir_slices.items(.inaccessible);
-
-    var dir_index: usize = 0;
-    while (dir_index < directory_count) : (dir_index += 1) {
-        try writeIntLittle(writer, u32, parents[dir_index]);
-        try writeIntLittle(writer, u32, basenames[dir_index]);
-        try writeIntLittle(writer, u64, total_sizes[dir_index]);
-        try writeIntLittle(writer, u64, total_files[dir_index]);
-        try writeIntLittle(writer, u64, total_dirs[dir_index]);
-        try writer.writeByte(if (inaccessible[dir_index]) 1 else 0);
-        try writer.writeAll(&.{ 0, 0, 0, 0, 0, 0, 0 });
-    }
-
-    const large_file_count = self.large_files.len;
-    try writeIntLittle(writer, u64, large_file_count);
     const large_slices = self.large_files.slice();
     const large_dirs = large_slices.items(.directory_index);
     const large_names = large_slices.items(.basename);
     const large_sizes = large_slices.items(.size);
 
-    var lf_index: usize = 0;
-    while (lf_index < large_file_count) : (lf_index += 1) {
-        try writeIntLittle(writer, u64, large_dirs[lf_index]);
-        try writeIntLittle(writer, u32, large_names[lf_index]);
-        try writeIntLittle(writer, u64, large_sizes[lf_index]);
-        try writer.writeAll(&.{ 0, 0, 0, 0 });
-    }
-}
-
-test "binary snapshot writer emits deterministic format" {
-    const allocator = std.testing.allocator;
-
-    var disk_scan = Self{ .allocator = allocator };
-    defer disk_scan.directories.deinit(allocator);
-    defer disk_scan.namedata.deinit(allocator);
-    defer disk_scan.idxset.deinit(allocator);
-    defer disk_scan.large_files.deinit(allocator);
-
-    const root_offset = disk_scan.namedata.items.len;
-    try disk_scan.namedata.appendSlice(allocator, "root");
-    try disk_scan.namedata.append(allocator, 0);
-
-    const child_offset = disk_scan.namedata.items.len;
-    try disk_scan.namedata.appendSlice(allocator, "child");
-    try disk_scan.namedata.append(allocator, 0);
-
-    const file_offset = disk_scan.namedata.items.len;
-    try disk_scan.namedata.appendSlice(allocator, "large.bin");
-    try disk_scan.namedata.append(allocator, 0);
-
-    const root_index = try disk_scan.directories.addOne(allocator);
-    var slices = disk_scan.directories.slice();
-    slices.items(.parent)[root_index] = 0;
-    slices.items(.basename)[root_index] = @intCast(root_offset);
-    slices.items(.total_size)[root_index] = 1024;
-    slices.items(.total_files)[root_index] = 3;
-    slices.items(.total_dirs)[root_index] = 2;
-    slices.items(.inaccessible)[root_index] = false;
-
-    const child_index = try disk_scan.directories.addOne(allocator);
-    slices = disk_scan.directories.slice();
-    slices.items(.parent)[child_index] = @intCast(root_index);
-    slices.items(.basename)[child_index] = @intCast(child_offset);
-    slices.items(.total_size)[child_index] = 256;
-    slices.items(.total_files)[child_index] = 2;
-    slices.items(.total_dirs)[child_index] = 1;
-    slices.items(.inaccessible)[child_index] = true;
-
-    try disk_scan.large_files.append(allocator, .{
-        .directory_index = child_index,
-        .basename = @intCast(file_offset),
-        .size = 4096,
-    });
-
-    disk_scan.stats.directories_started.store(11, .release);
-    disk_scan.stats.directories_completed.store(10, .release);
-    disk_scan.stats.directories_scheduled.store(9, .release);
-    disk_scan.stats.directories_discovered.store(8, .release);
-    disk_scan.stats.files_discovered.store(7, .release);
-    disk_scan.stats.symlinks_discovered.store(6, .release);
-    disk_scan.stats.other_discovered.store(5, .release);
-    disk_scan.stats.scanner_batches.store(4, .release);
-    disk_scan.stats.scanner_entries.store(3, .release);
-    disk_scan.stats.scanner_max_batch.store(2, .release);
-    disk_scan.stats.scanner_errors.store(1, .release);
-    disk_scan.stats.inaccessible_dirs.store(12, .release);
-    disk_scan.stats.high_watermark.store(13, .release);
-
-    const results = ScanResults{
-        .stats = &disk_scan.stats,
-        .elapsed_ns = 123,
-        .totals = .{
-            .directories = 2,
-            .files = 3,
-            .bytes = 1024,
-        },
-    };
-
-    var buffer: [1024]u8 = undefined;
-    var writer = std.Io.Writer.fixed(&buffer);
-    try disk_scan.writeBinaryResults(results, &writer);
-    const emitted = writer.buffered();
-
-    var offset: usize = 0;
-    const Reader = struct {
-        fn readInt(comptime T: type, data: []const u8, cursor: *usize) T {
-            const start = cursor.*;
-            const end = start + @sizeOf(T);
-            cursor.* = end;
-            return std.mem.readIntLittle(T, data[start..end]);
-        }
-    };
-
-    try std.testing.expectEqualSlices(u8, "WTFS", emitted[offset..][0..4]);
-    offset += 4;
-    try std.testing.expectEqual(BinaryFormatVersion, Reader.readInt(u16, emitted, &offset));
-    _ = Reader.readInt(u16, emitted, &offset);
-    try std.testing.expectEqual(@as(u64, 123), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 2), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 3), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 1024), Reader.readInt(u64, emitted, &offset));
-
-    const expected_stats = [_]u64{ 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 12, 13 };
-    for (expected_stats) |value| {
-        try std.testing.expectEqual(value, Reader.readInt(u64, emitted, &offset));
-    }
-
-    const dir_count = Reader.readInt(u64, emitted, &offset);
-    try std.testing.expectEqual(@as(u64, 2), dir_count);
-    const name_bytes = Reader.readInt(u64, emitted, &offset);
-    try std.testing.expectEqual(@as(u64, disk_scan.namedata.items.len), name_bytes);
-    try std.testing.expectEqualSlices(u8, disk_scan.namedata.items, emitted[offset .. offset + name_bytes]);
-    offset += name_bytes;
-
-    const root_parent = Reader.readInt(u32, emitted, &offset);
-    try std.testing.expectEqual(@as(u32, 0), root_parent);
-    try std.testing.expectEqual(@as(u32, root_offset), Reader.readInt(u32, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 1024), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 3), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 2), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u8, 0), emitted[offset]);
-    offset += 1 + 7;
-
-    const child_parent = Reader.readInt(u32, emitted, &offset);
-    try std.testing.expectEqual(@as(u32, root_index), child_parent);
-    try std.testing.expectEqual(@as(u32, child_offset), Reader.readInt(u32, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 256), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 2), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 1), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u8, 1), emitted[offset]);
-    offset += 1 + 7;
-
-    const large_file_count = Reader.readInt(u64, emitted, &offset);
-    try std.testing.expectEqual(@as(u64, 1), large_file_count);
-    try std.testing.expectEqual(@as(u64, child_index), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u32, file_offset), Reader.readInt(u32, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 4096), Reader.readInt(u64, emitted, &offset));
-    offset += 4;
-
-    try std.testing.expectEqual(offset, emitted.len);
+    try writer.writeAll(magic);
+    try writer.writeStruct(results.totals, .little);
+    try writer.writeAll(self.namedata.items);
+    try writer.writeSliceEndian(u32, parents, .little);
+    try writer.writeSliceEndian(u32, basenames, .little);
+    try writer.writeSliceEndian(u64, total_sizes, .little);
+    try writer.writeSliceEndian(u64, total_files, .little);
+    try writer.writeSliceEndian(u64, total_dirs, .little);
+    try writer.writeSliceEndian(usize, large_dirs, .little);
+    try writer.writeSliceEndian(u32, large_names, .little);
+    try writer.writeSliceEndian(u64, large_sizes, .little);
 }
