@@ -1,5 +1,6 @@
 const std = @import("std");
 const DiskScan = @import("DiskScan.zig");
+const ascii = std.ascii;
 
 var stderr_buffer: [4096]u8 = undefined;
 var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
@@ -20,6 +21,9 @@ pub fn main() !void {
 
     var skip_hidden = false;
     var root_arg: ?[]const u8 = null;
+    var large_file_threshold = DiskScan.default_large_file_threshold;
+
+    const threshold_prefix = "--large-file-threshold=";
 
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
@@ -28,12 +32,35 @@ pub fn main() !void {
             skip_hidden = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--large-file-threshold")) {
+            arg_index += 1;
+            if (arg_index >= args.len) {
+                try printUsage(exe_name);
+                return;
+            }
+            const value_arg = std.mem.sliceTo(args[arg_index], 0);
+            large_file_threshold = parseSize(value_arg) catch {
+                try stderr.print("invalid size for --large-file-threshold: {s}\n", .{value_arg});
+                try printUsage(exe_name);
+                return;
+            };
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, threshold_prefix)) {
+            const value_arg = arg[threshold_prefix.len..];
+            large_file_threshold = parseSize(value_arg) catch {
+                try stderr.print("invalid size for --large-file-threshold: {s}\n", .{value_arg});
+                try printUsage(exe_name);
+                return;
+            };
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help")) {
-            try stderr.print("usage: {s} [--skip-hidden] [dir]\n", .{exe_name});
+            try printUsage(exe_name);
             return;
         }
         if (root_arg != null) {
-            try stderr.print("usage: {s} [--skip-hidden] [dir]\n", .{exe_name});
+            try printUsage(exe_name);
             return;
         }
         root_arg = arg;
@@ -45,7 +72,61 @@ pub fn main() !void {
         .allocator = allocator,
         .skip_hidden = skip_hidden,
         .root = root,
+        .large_file_threshold = large_file_threshold,
     };
 
     try diskScan.run();
+}
+
+fn parseSize(value: []const u8) !u64 {
+    if (value.len == 0) return error.InvalidSize;
+
+    var slice = value;
+    var multiplier: u64 = 1;
+
+    var suffix = ascii.toUpper(slice[slice.len - 1]);
+    if (suffix == 'B') {
+        if (slice.len == 1) return error.InvalidSize;
+        slice = slice[0 .. slice.len - 1];
+        suffix = ascii.toUpper(slice[slice.len - 1]);
+    }
+
+    switch (suffix) {
+        'K' => {
+            multiplier = 1024;
+            slice = slice[0 .. slice.len - 1];
+        },
+        'M' => {
+            multiplier = 1024 * 1024;
+            slice = slice[0 .. slice.len - 1];
+        },
+        'G' => {
+            multiplier = 1024 * 1024 * 1024;
+            slice = slice[0 .. slice.len - 1];
+        },
+        'T' => {
+            multiplier = 1024 * 1024 * 1024 * 1024;
+            slice = slice[0 .. slice.len - 1];
+        },
+        else => {},
+    }
+
+    if (slice.len == 0) return error.InvalidSize;
+
+    const number = std.fmt.parseInt(u64, slice, 10) catch return error.InvalidSize;
+    if (multiplier == 1) return number;
+
+    if (number > std.math.maxInt(u64) / multiplier) {
+        return error.InvalidSize;
+    }
+
+    return number * multiplier;
+}
+
+fn printUsage(exe_name: []const u8) !void {
+    try stderr.print(
+        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [dir]\n",
+        .{exe_name},
+    );
+    try stderr.print("       SIZE accepts optional K/M/G/T suffix (base 1024)\n", .{});
 }

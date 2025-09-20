@@ -16,16 +16,32 @@ const SummaryEntry = struct {
     path: []u8,
 };
 
+const FileSummaryEntry = struct {
+    size: u64,
+    path: []u8,
+};
+
 const Summary = struct {
     top_level: std.ArrayList(SummaryEntry),
     heaviest: std.ArrayList(SummaryEntry),
+    large_files: std.ArrayList(FileSummaryEntry),
 
     fn deinit(self: *Summary, allocator: std.mem.Allocator) void {
         freeEntryList(allocator, &self.top_level);
         freeEntryList(allocator, &self.heaviest);
+        freeFileEntryList(allocator, &self.large_files);
     }
 
     fn freeEntryList(allocator: std.mem.Allocator, list: *std.ArrayList(SummaryEntry)) void {
+        if (list.items.len != 0) {
+            for (list.items) |entry| {
+                allocator.free(entry.path);
+            }
+        }
+        list.deinit(allocator);
+    }
+
+    fn freeFileEntryList(allocator: std.mem.Allocator, list: *std.ArrayList(FileSummaryEntry)) void {
         if (list.items.len != 0) {
             for (list.items) |entry| {
                 allocator.free(entry.path);
@@ -82,6 +98,14 @@ progress_root: std.Progress.Node = undefined,
 /// Atomic statistics counters shared by all worker threads during scanning
 stats: Context.Stats = Context.Stats.init(),
 
+/// Threshold in bytes for recording large files
+large_file_threshold: u64 = default_large_file_threshold,
+
+/// Collection of large files discovered during the scan
+large_files: std.ArrayList(Context.LargeFile) = .empty,
+
+pub const default_large_file_threshold: u64 = 100 * 1024 * 1024;
+
 // ===== Platform Configuration =====
 
 const PlatformConfig = struct {
@@ -119,6 +143,8 @@ fn createScanContext(
         .errprogress = self.progress_root.start("errors", 0),
         .skip_hidden = self.skip_hidden,
         .stats = &self.stats, // Pass pointer to stats
+        .large_files = &self.large_files,
+        .large_file_threshold = self.large_file_threshold,
     };
 }
 
@@ -215,6 +241,25 @@ fn writeFullPath(
 fn buildPath(self: *Self, index: usize) ![]u8 {
     var writer = try std.Io.Writer.Allocating.initCapacity(self.allocator, 256);
     try self.writeFullPath(index, &writer.writer);
+    return try writer.toOwnedSlice();
+}
+
+fn buildFilePath(self: *Self, directory_index: usize, basename_index: u32) ![]u8 {
+    const directory_path = try self.buildPath(directory_index);
+    defer self.allocator.free(directory_path);
+
+    const file_name = std.mem.sliceTo(self.namedata.items[basename_index..], 0);
+
+    var writer = try std.Io.Writer.Allocating.initCapacity(
+        self.allocator,
+        directory_path.len + 1 + file_name.len,
+    );
+    try writer.writer.writeAll(directory_path);
+    if (directory_path.len == 0 or directory_path[directory_path.len - 1] != '/') {
+        try writer.writer.writeByte('/');
+    }
+    try writer.writer.writeAll(file_name);
+
     return try writer.toOwnedSlice();
 }
 
@@ -366,6 +411,35 @@ const SummaryBuilder = struct {
         return entries;
     }
 
+    fn buildLargeFileEntries(self: *Self, max_entries: usize) !std.ArrayList(FileSummaryEntry) {
+        if (max_entries == 0) return std.ArrayList(FileSummaryEntry){};
+
+        var top_indexes = std.ArrayList(usize){};
+        defer top_indexes.deinit(self.allocator);
+
+        const files = self.large_files.items;
+        for (files, 0..) |file, idx| {
+            if (file.size < self.large_file_threshold) continue;
+            try SummaryBuilder.insertFileIndex(self, &top_indexes, idx, max_entries, files);
+        }
+
+        var entries = std.ArrayList(FileSummaryEntry){};
+        errdefer Summary.freeFileEntryList(self.allocator, &entries);
+        try entries.ensureTotalCapacityPrecise(self.allocator, top_indexes.items.len);
+
+        for (top_indexes.items) |file_index| {
+            const file = files[file_index];
+            const path = try buildFilePath(self, file.directory_index, file.basename);
+
+            entries.appendAssumeCapacity(.{
+                .size = file.size,
+                .path = path,
+            });
+        }
+
+        return entries;
+    }
+
     fn insertTopIndex(
         self: *Self,
         list: *std.ArrayList(usize),
@@ -393,6 +467,39 @@ const SummaryBuilder = struct {
         list.items[max_entries - 1] = index;
         var pos: usize = max_entries - 1;
         while (pos > 0 and size > sizes[list.items[pos - 1]]) {
+            list.items[pos] = list.items[pos - 1];
+            pos -= 1;
+        }
+        list.items[pos] = index;
+    }
+
+    fn insertFileIndex(
+        self: *Self,
+        list: *std.ArrayList(usize),
+        index: usize,
+        max_entries: usize,
+        files: []const Context.LargeFile,
+    ) !void {
+        const size = files[index].size;
+        if (size == 0) return;
+
+        if (list.items.len < max_entries) {
+            try list.append(self.allocator, index);
+            var pos = list.items.len - 1;
+            while (pos > 0 and size > files[list.items[pos - 1]].size) {
+                list.items[pos] = list.items[pos - 1];
+                pos -= 1;
+            }
+            list.items[pos] = index;
+            return;
+        }
+
+        const smallest_index = list.items[max_entries - 1];
+        if (size <= files[smallest_index].size) return;
+
+        list.items[max_entries - 1] = index;
+        var pos: usize = max_entries - 1;
+        while (pos > 0 and size > files[list.items[pos - 1]].size) {
             list.items[pos] = list.items[pos - 1];
             pos -= 1;
         }
@@ -723,6 +830,32 @@ const Reporter = struct {
         try stdout.print("      {s}{s}\n\n", .{ entry.path, status_suffix });
     }
 
+    fn printLargeFiles(
+        self: *Self,
+        totals: DirectoryTotals,
+        entries: []const FileSummaryEntry,
+        threshold: u64,
+    ) !void {
+        _ = self;
+        if (entries.len == 0) return;
+
+        var threshold_buf: [32]u8 = undefined;
+        const threshold_str = try formatBytes(threshold_buf[0..], threshold);
+
+        try stdout.print("Largest files (>= {s})\n\n", .{threshold_str});
+
+        for (entries) |entry| {
+            var size_buf: [32]u8 = undefined;
+            const size_str = try formatBytes(size_buf[0..], entry.size);
+
+            var share_buf: [16]u8 = undefined;
+            const share_str = try formatPercent(share_buf[0..], entry.size, totals.bytes);
+
+            try stdout.print("  {s:>11}  {s:>6}\n", .{ size_str, share_str });
+            try stdout.print("      {s}\n\n", .{entry.path});
+        }
+    }
+
     fn formatPercent(buf: []u8, value: u64, total: u64) ![]const u8 {
         if (total == 0) {
             return try std.fmt.bufPrint(buf, "0.0%", .{});
@@ -791,6 +924,8 @@ const Reporter = struct {
 // ===== Main Entry Point =====
 
 fn performScan(self: *Self) !ScanResults {
+    self.large_files.clearRetainingCapacity();
+
     var timer = try std.time.Timer.start();
     try self.gatherPhase();
     const elapsed_ns = timer.read();
@@ -809,6 +944,7 @@ fn generateSummary(self: *Self) !Summary {
     var summary = Summary{
         .top_level = std.ArrayList(SummaryEntry){},
         .heaviest = std.ArrayList(SummaryEntry){},
+        .large_files = std.ArrayList(FileSummaryEntry){},
     };
     errdefer summary.deinit(self.allocator);
 
@@ -816,6 +952,7 @@ fn generateSummary(self: *Self) !Summary {
     SummaryBuilder.sortBySize(self, summary.top_level.items);
 
     summary.heaviest = try SummaryBuilder.buildHeaviestEntries(self, 12);
+    summary.large_files = try SummaryBuilder.buildLargeFileEntries(self, 12);
 
     return summary;
 }
@@ -825,6 +962,7 @@ fn reportResults(self: *Self, results: ScanResults, summary: Summary) !void {
     try Reporter.printStatistics(results);
     try Reporter.printTopLevelDirectories(self, results.totals, summary.top_level.items);
     try Reporter.printHeaviestDirectories(self, results.totals, summary.heaviest.items);
+    try Reporter.printLargeFiles(self, results.totals, summary.large_files.items, self.large_file_threshold);
     try stdout.flush();
 }
 
