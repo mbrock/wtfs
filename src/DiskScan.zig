@@ -104,7 +104,7 @@ large_file_threshold: u64 = default_large_file_threshold,
 /// Collection of large files discovered during the scan
 large_files: Context.LargeFileStore = .empty,
 
-pub const BinaryFormatVersion: u16 = 1;
+pub const BinaryFormatVersion: u16 = 2;
 
 pub const RunOptions = struct {
     /// When true, generate the human readable summary and print it to stdout.
@@ -1021,6 +1021,235 @@ fn writeIntLittle(writer: *std.Io.Writer, comptime T: type, value: anytype) !voi
     try writer.writeSliceSwap(u8, &buf);
 }
 
+fn chunkTag(comptime value: []const u8) [4]u8 {
+    if (value.len != 4) @compileError("chunk tags must be exactly 4 bytes");
+    return .{ value[0], value[1], value[2], value[3] };
+}
+
+fn totalSliceLength(slices: []const []const u8) usize {
+    var total: usize = 0;
+    for (slices) |slice| total += slice.len;
+    return total;
+}
+
+fn writeChunk(
+    writer: *std.Io.Writer,
+    sequence: *u32,
+    tag: [4]u8,
+    payload: []const []const u8,
+) !void {
+    var seq_buf: [4]u8 = undefined;
+    std.mem.writeIntLittle(u32, &seq_buf, sequence.*);
+    sequence.* += 1;
+
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeIntLittle(u64, &len_buf, totalSliceLength(payload));
+
+    const reserved = [4]u8{ 0, 0, 0, 0 };
+    var header = [_][]const u8{
+        tag[0..],
+        seq_buf[0..],
+        reserved[0..],
+        len_buf[0..],
+    };
+
+    try writer.writeVecAll(header[0..]);
+    if (payload.len != 0) {
+        try writer.writeVecAll(payload);
+    }
+}
+
+fn writeInfoChunk(
+    self: *Self,
+    results: ScanResults,
+    writer: *std.Io.Writer,
+    sequence: *u32,
+) !void {
+    _ = self;
+    const snapshot = snapshotStats(results.stats);
+    var values = [_]u64{
+        results.elapsed_ns,
+        results.totals.directories,
+        results.totals.files,
+        results.totals.bytes,
+        snapshot.directories_started,
+        snapshot.directories_completed,
+        snapshot.directories_scheduled,
+        snapshot.directories_discovered,
+        snapshot.files_discovered,
+        snapshot.symlinks_discovered,
+        snapshot.other_discovered,
+        snapshot.scanner_batches,
+        snapshot.scanner_entries,
+        snapshot.scanner_max_batch,
+        snapshot.scanner_errors,
+        snapshot.inaccessible_dirs,
+        snapshot.high_watermark,
+    };
+
+    inline for (&values) |*value| {
+        value.* = std.mem.nativeToLittle(u64, value.*);
+    }
+
+    var count_buf: [2]u8 = undefined;
+    std.mem.writeIntLittle(u16, &count_buf, @intCast(values.len));
+
+    const payload = [_][]const u8{
+        count_buf[0..],
+        std.mem.sliceAsBytes(values[0..]),
+    };
+
+    try writeChunk(writer, sequence, chunkTag("INFO"), &payload);
+}
+
+fn writeNamesChunk(
+    self: *Self,
+    writer: *std.Io.Writer,
+    sequence: *u32,
+) !void {
+    const offset: u64 = 0;
+    const length: u64 = @intCast(self.namedata.items.len);
+
+    var offset_buf: [8]u8 = undefined;
+    var length_buf: [8]u8 = undefined;
+    std.mem.writeIntLittle(u64, &offset_buf, offset);
+    std.mem.writeIntLittle(u64, &length_buf, length);
+
+    const payload = [_][]const u8{
+        offset_buf[0..],
+        length_buf[0..],
+        self.namedata.items,
+    };
+
+    try writeChunk(writer, sequence, chunkTag("NAME"), &payload);
+}
+
+fn writeDirectoryChunks(
+    self: *Self,
+    writer: *std.Io.Writer,
+    sequence: *u32,
+) !void {
+    const total = self.directories.len;
+    if (total == 0) {
+        var offset_buf: [8]u8 = undefined;
+        var count_buf: [8]u8 = undefined;
+        std.mem.writeIntLittle(u64, &offset_buf, 0);
+        std.mem.writeIntLittle(u64, &count_buf, 0);
+        const payload = [_][]const u8{ offset_buf[0..], count_buf[0..] };
+        try writeChunk(writer, sequence, chunkTag("DIRS"), &payload);
+        return;
+    }
+
+    const slices = self.directories.slice();
+    const parents = slices.items(.parent);
+    const basenames = slices.items(.basename);
+    const total_sizes = slices.items(.total_size);
+    const total_files = slices.items(.total_files);
+    const total_dirs = slices.items(.total_dirs);
+    const inaccessible = slices.items(.inaccessible);
+
+    const chunk_capacity = 1024;
+    var parent_chunk: [chunk_capacity]u32 = undefined;
+    var basename_chunk: [chunk_capacity]u32 = undefined;
+    var size_chunk: [chunk_capacity]u64 = undefined;
+    var files_chunk: [chunk_capacity]u64 = undefined;
+    var dirs_chunk: [chunk_capacity]u64 = undefined;
+    var inaccessible_chunk: [chunk_capacity]u8 = undefined;
+
+    var offset: usize = 0;
+    while (offset < total) {
+        const remaining = total - offset;
+        const count = @min(chunk_capacity, remaining);
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const idx = offset + i;
+            parent_chunk[i] = std.mem.nativeToLittle(u32, parents[idx]);
+            basename_chunk[i] = std.mem.nativeToLittle(u32, basenames[idx]);
+            size_chunk[i] = std.mem.nativeToLittle(u64, total_sizes[idx]);
+            files_chunk[i] = std.mem.nativeToLittle(u64, @as(u64, @intCast(total_files[idx])));
+            dirs_chunk[i] = std.mem.nativeToLittle(u64, @as(u64, @intCast(total_dirs[idx])));
+            inaccessible_chunk[i] = if (inaccessible[idx]) 1 else 0;
+        }
+
+        var offset_buf: [8]u8 = undefined;
+        var count_buf: [8]u8 = undefined;
+        std.mem.writeIntLittle(u64, &offset_buf, offset);
+        std.mem.writeIntLittle(u64, &count_buf, count);
+
+        const payload = [_][]const u8{
+            offset_buf[0..],
+            count_buf[0..],
+            std.mem.sliceAsBytes(parent_chunk[0..count]),
+            std.mem.sliceAsBytes(basename_chunk[0..count]),
+            std.mem.sliceAsBytes(size_chunk[0..count]),
+            std.mem.sliceAsBytes(files_chunk[0..count]),
+            std.mem.sliceAsBytes(dirs_chunk[0..count]),
+            std.mem.sliceAsBytes(inaccessible_chunk[0..count]),
+        };
+
+        try writeChunk(writer, sequence, chunkTag("DIRS"), &payload);
+        offset += count;
+    }
+}
+
+fn writeLargeFileChunks(
+    self: *Self,
+    writer: *std.Io.Writer,
+    sequence: *u32,
+) !void {
+    const total = self.large_files.len;
+    if (total == 0) {
+        var offset_buf: [8]u8 = undefined;
+        var count_buf: [8]u8 = undefined;
+        std.mem.writeIntLittle(u64, &offset_buf, 0);
+        std.mem.writeIntLittle(u64, &count_buf, 0);
+        const payload = [_][]const u8{ offset_buf[0..], count_buf[0..] };
+        try writeChunk(writer, sequence, chunkTag("LARG"), &payload);
+        return;
+    }
+
+    const slices = self.large_files.slice();
+    const directories = slices.items(.directory_index);
+    const basenames = slices.items(.basename);
+    const sizes = slices.items(.size);
+
+    const chunk_capacity = 1024;
+    var dir_chunk: [chunk_capacity]u64 = undefined;
+    var basename_chunk: [chunk_capacity]u32 = undefined;
+    var size_chunk: [chunk_capacity]u64 = undefined;
+
+    var offset: usize = 0;
+    while (offset < total) {
+        const remaining = total - offset;
+        const count = @min(chunk_capacity, remaining);
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const idx = offset + i;
+            dir_chunk[i] = std.mem.nativeToLittle(u64, @as(u64, @intCast(directories[idx])));
+            basename_chunk[i] = std.mem.nativeToLittle(u32, basenames[idx]);
+            size_chunk[i] = std.mem.nativeToLittle(u64, sizes[idx]);
+        }
+
+        var offset_buf: [8]u8 = undefined;
+        var count_buf: [8]u8 = undefined;
+        std.mem.writeIntLittle(u64, &offset_buf, offset);
+        std.mem.writeIntLittle(u64, &count_buf, count);
+
+        const payload = [_][]const u8{
+            offset_buf[0..],
+            count_buf[0..],
+            std.mem.sliceAsBytes(dir_chunk[0..count]),
+            std.mem.sliceAsBytes(basename_chunk[0..count]),
+            std.mem.sliceAsBytes(size_chunk[0..count]),
+        };
+
+        try writeChunk(writer, sequence, chunkTag("LARG"), &payload);
+        offset += count;
+    }
+}
+
 fn snapshotStats(stats: *const Context.Stats) StatsSnapshot {
     return .{
         .directories_started = stats.directories_started.load(.acquire),
@@ -1055,81 +1284,16 @@ const StatsSnapshot = struct {
     high_watermark: usize,
 };
 
-fn writeStats(writer: *std.Io.Writer, snapshot: StatsSnapshot) !void {
-    const fields = .{
-        snapshot.directories_started,
-        snapshot.directories_completed,
-        snapshot.directories_scheduled,
-        snapshot.directories_discovered,
-        snapshot.files_discovered,
-        snapshot.symlinks_discovered,
-        snapshot.other_discovered,
-        snapshot.scanner_batches,
-        snapshot.scanner_entries,
-        snapshot.scanner_max_batch,
-        snapshot.scanner_errors,
-        snapshot.inaccessible_dirs,
-        snapshot.high_watermark,
-    };
-
-    inline for (fields) |value| {
-        try writeIntLittle(writer, u64, value);
-    }
-}
-
 pub fn writeBinaryResults(self: *Self, results: ScanResults, writer: *std.Io.Writer) !void {
     const magic = "WTFS";
     try writer.writeAll(magic);
     try writeIntLittle(writer, u16, BinaryFormatVersion);
     try writeIntLittle(writer, u16, 0);
-    try writeIntLittle(writer, u64, results.elapsed_ns);
-
-    try writeIntLittle(writer, u64, results.totals.directories);
-    try writeIntLittle(writer, u64, results.totals.files);
-    try writeIntLittle(writer, u64, results.totals.bytes);
-
-    const stats_snapshot = snapshotStats(results.stats);
-    try writeStats(writer, stats_snapshot);
-
-    const directory_count = self.directories.len;
-    const name_bytes = self.namedata.items.len;
-    try writeIntLittle(writer, u64, directory_count);
-    try writeIntLittle(writer, u64, name_bytes);
-    try writer.writeAll(self.namedata.items);
-
-    const dir_slices = self.directories.slice();
-    const parents = dir_slices.items(.parent);
-    const basenames = dir_slices.items(.basename);
-    const total_sizes = dir_slices.items(.total_size);
-    const total_files = dir_slices.items(.total_files);
-    const total_dirs = dir_slices.items(.total_dirs);
-    const inaccessible = dir_slices.items(.inaccessible);
-
-    var dir_index: usize = 0;
-    while (dir_index < directory_count) : (dir_index += 1) {
-        try writeIntLittle(writer, u32, parents[dir_index]);
-        try writeIntLittle(writer, u32, basenames[dir_index]);
-        try writeIntLittle(writer, u64, total_sizes[dir_index]);
-        try writeIntLittle(writer, u64, total_files[dir_index]);
-        try writeIntLittle(writer, u64, total_dirs[dir_index]);
-        try writer.writeByte(if (inaccessible[dir_index]) 1 else 0);
-        try writer.writeAll(&.{ 0, 0, 0, 0, 0, 0, 0 });
-    }
-
-    const large_file_count = self.large_files.len;
-    try writeIntLittle(writer, u64, large_file_count);
-    const large_slices = self.large_files.slice();
-    const large_dirs = large_slices.items(.directory_index);
-    const large_names = large_slices.items(.basename);
-    const large_sizes = large_slices.items(.size);
-
-    var lf_index: usize = 0;
-    while (lf_index < large_file_count) : (lf_index += 1) {
-        try writeIntLittle(writer, u64, large_dirs[lf_index]);
-        try writeIntLittle(writer, u32, large_names[lf_index]);
-        try writeIntLittle(writer, u64, large_sizes[lf_index]);
-        try writer.writeAll(&.{ 0, 0, 0, 0 });
-    }
+    var sequence: u32 = 0;
+    try self.writeInfoChunk(results, writer, &sequence);
+    try self.writeNamesChunk(writer, &sequence);
+    try self.writeDirectoryChunks(writer, &sequence);
+    try self.writeLargeFileChunks(writer, &sequence);
 }
 
 test "binary snapshot writer emits deterministic format" {
@@ -1214,53 +1378,133 @@ test "binary snapshot writer emits deterministic format" {
             cursor.* = end;
             return std.mem.readIntLittle(T, data[start..end]);
         }
+
+        fn readBytes(data: []const u8, cursor: *usize, len: usize) []const u8 {
+            const start = cursor.*;
+            const end = start + len;
+            cursor.* = end;
+            return data[start..end];
+        }
+    };
+
+    const Chunk = struct {
+        tag: [4]u8,
+        seq: u32,
+        reserved: u32,
+        payload: []const u8,
+    };
+
+    const ChunkReader = struct {
+        fn readChunk(data: []const u8, cursor: *usize) Chunk {
+            var tag: [4]u8 = undefined;
+            var i: usize = 0;
+            while (i < 4) : (i += 1) {
+                tag[i] = data[cursor.* + i];
+            }
+            cursor.* += 4;
+            const seq = Reader.readInt(u32, data, cursor);
+            const reserved = Reader.readInt(u32, data, cursor);
+            const length = Reader.readInt(u64, data, cursor);
+            const payload = Reader.readBytes(data, cursor, @intCast(length));
+            return .{ .tag = tag, .seq = seq, .reserved = reserved, .payload = payload };
+        }
     };
 
     try std.testing.expectEqualSlices(u8, "WTFS", emitted[offset..][0..4]);
     offset += 4;
     try std.testing.expectEqual(BinaryFormatVersion, Reader.readInt(u16, emitted, &offset));
     _ = Reader.readInt(u16, emitted, &offset);
-    try std.testing.expectEqual(@as(u64, 123), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 2), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 3), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 1024), Reader.readInt(u64, emitted, &offset));
 
-    const expected_stats = [_]u64{ 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 12, 13 };
-    for (expected_stats) |value| {
-        try std.testing.expectEqual(value, Reader.readInt(u64, emitted, &offset));
+    const info_chunk = ChunkReader.readChunk(emitted, &offset);
+    try std.testing.expectEqualSlices(u8, "INFO", info_chunk.tag[0..]);
+    try std.testing.expectEqual(@as(u32, 0), info_chunk.seq);
+    try std.testing.expectEqual(@as(u32, 0), info_chunk.reserved);
+    var info_cursor: usize = 0;
+    const info_count = Reader.readInt(u16, info_chunk.payload, &info_cursor);
+    const expected_info = [_]u64{
+        123,
+        2,
+        3,
+        1024,
+        11,
+        10,
+        9,
+        8,
+        7,
+        6,
+        5,
+        4,
+        3,
+        2,
+        1,
+        12,
+        13,
+    };
+    try std.testing.expectEqual(@as(u16, expected_info.len), info_count);
+    for (expected_info) |value| {
+        try std.testing.expectEqual(value, Reader.readInt(u64, info_chunk.payload, &info_cursor));
     }
+    try std.testing.expectEqual(info_cursor, info_chunk.payload.len);
 
-    const dir_count = Reader.readInt(u64, emitted, &offset);
+    const name_chunk = ChunkReader.readChunk(emitted, &offset);
+    try std.testing.expectEqualSlices(u8, "NAME", name_chunk.tag[0..]);
+    try std.testing.expectEqual(@as(u32, 1), name_chunk.seq);
+    try std.testing.expectEqual(@as(u32, 0), name_chunk.reserved);
+    var name_cursor: usize = 0;
+    try std.testing.expectEqual(@as(u64, 0), Reader.readInt(u64, name_chunk.payload, &name_cursor));
+    const name_length = Reader.readInt(u64, name_chunk.payload, &name_cursor);
+    try std.testing.expectEqual(@as(u64, disk_scan.namedata.items.len), name_length);
+    const name_bytes = Reader.readBytes(name_chunk.payload, &name_cursor, @intCast(name_length));
+    try std.testing.expectEqualSlices(u8, disk_scan.namedata.items, name_bytes);
+    try std.testing.expectEqual(name_cursor, name_chunk.payload.len);
+
+    const dirs_chunk = ChunkReader.readChunk(emitted, &offset);
+    try std.testing.expectEqualSlices(u8, "DIRS", dirs_chunk.tag[0..]);
+    try std.testing.expectEqual(@as(u32, 2), dirs_chunk.seq);
+    try std.testing.expectEqual(@as(u32, 0), dirs_chunk.reserved);
+    var dir_cursor: usize = 0;
+    try std.testing.expectEqual(@as(u64, 0), Reader.readInt(u64, dirs_chunk.payload, &dir_cursor));
+    const dir_count = Reader.readInt(u64, dirs_chunk.payload, &dir_cursor);
     try std.testing.expectEqual(@as(u64, 2), dir_count);
-    const name_bytes = Reader.readInt(u64, emitted, &offset);
-    try std.testing.expectEqual(@as(u64, disk_scan.namedata.items.len), name_bytes);
-    try std.testing.expectEqualSlices(u8, disk_scan.namedata.items, emitted[offset .. offset + name_bytes]);
-    offset += name_bytes;
 
-    const root_parent = Reader.readInt(u32, emitted, &offset);
-    try std.testing.expectEqual(@as(u32, 0), root_parent);
-    try std.testing.expectEqual(@as(u32, root_offset), Reader.readInt(u32, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 1024), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 3), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 2), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u8, 0), emitted[offset]);
-    offset += 1 + 7;
+    const expected_parents = [_]u32{ 0, @intCast(root_index) };
+    const expected_basenames = [_]u32{ @intCast(root_offset), @intCast(child_offset) };
+    const expected_sizes = [_]u64{ 1024, 256 };
+    const expected_files = [_]u64{ 3, 2 };
+    const expected_dirs = [_]u64{ 2, 1 };
+    const expected_inaccessible = [_]u8{ 0, 1 };
 
-    const child_parent = Reader.readInt(u32, emitted, &offset);
-    try std.testing.expectEqual(@as(u32, root_index), child_parent);
-    try std.testing.expectEqual(@as(u32, child_offset), Reader.readInt(u32, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 256), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 2), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 1), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u8, 1), emitted[offset]);
-    offset += 1 + 7;
+    for (expected_parents) |value| {
+        try std.testing.expectEqual(value, Reader.readInt(u32, dirs_chunk.payload, &dir_cursor));
+    }
+    for (expected_basenames) |value| {
+        try std.testing.expectEqual(value, Reader.readInt(u32, dirs_chunk.payload, &dir_cursor));
+    }
+    for (expected_sizes) |value| {
+        try std.testing.expectEqual(value, Reader.readInt(u64, dirs_chunk.payload, &dir_cursor));
+    }
+    for (expected_files) |value| {
+        try std.testing.expectEqual(value, Reader.readInt(u64, dirs_chunk.payload, &dir_cursor));
+    }
+    for (expected_dirs) |value| {
+        try std.testing.expectEqual(value, Reader.readInt(u64, dirs_chunk.payload, &dir_cursor));
+    }
+    const inaccessible_bytes = Reader.readBytes(dirs_chunk.payload, &dir_cursor, expected_inaccessible.len);
+    try std.testing.expectEqualSlices(u8, &expected_inaccessible, inaccessible_bytes);
+    try std.testing.expectEqual(dir_cursor, dirs_chunk.payload.len);
 
-    const large_file_count = Reader.readInt(u64, emitted, &offset);
-    try std.testing.expectEqual(@as(u64, 1), large_file_count);
-    try std.testing.expectEqual(@as(u64, child_index), Reader.readInt(u64, emitted, &offset));
-    try std.testing.expectEqual(@as(u32, file_offset), Reader.readInt(u32, emitted, &offset));
-    try std.testing.expectEqual(@as(u64, 4096), Reader.readInt(u64, emitted, &offset));
-    offset += 4;
+    const large_chunk = ChunkReader.readChunk(emitted, &offset);
+    try std.testing.expectEqualSlices(u8, "LARG", large_chunk.tag[0..]);
+    try std.testing.expectEqual(@as(u32, 3), large_chunk.seq);
+    try std.testing.expectEqual(@as(u32, 0), large_chunk.reserved);
+    var large_cursor: usize = 0;
+    try std.testing.expectEqual(@as(u64, 0), Reader.readInt(u64, large_chunk.payload, &large_cursor));
+    const large_count = Reader.readInt(u64, large_chunk.payload, &large_cursor);
+    try std.testing.expectEqual(@as(u64, 1), large_count);
+    try std.testing.expectEqual(@as(u64, child_index), Reader.readInt(u64, large_chunk.payload, &large_cursor));
+    try std.testing.expectEqual(@as(u32, file_offset), Reader.readInt(u32, large_chunk.payload, &large_cursor));
+    try std.testing.expectEqual(@as(u64, 4096), Reader.readInt(u64, large_chunk.payload, &large_cursor));
+    try std.testing.expectEqual(large_cursor, large_chunk.payload.len);
 
     try std.testing.expectEqual(offset, emitted.len);
 }
