@@ -8,12 +8,36 @@ const ATTR_BIT_MAP_COUNT: u16 = 5;
 
 const CommonAttrMask = packed struct(u32) {
     name: bool = false,
-    pad0: u1 = 0,
+    devid: bool = false,
     fsid: bool = false,
-    obj_type: bool = false,
-    pad1: u21 = 0,
-    file_id: bool = false,
-    pad2: u5 = 0,
+    objtype: bool = false,
+    objtag: bool = false,
+    objid: bool = false,
+    objpermanentid: bool = false,
+    parobjid: bool = false,
+    script: bool = false,
+    crtime: bool = false,
+    modtime: bool = false,
+    chgtime: bool = false,
+    acctime: bool = false,
+    bkuptime: bool = false,
+    fndrinfo: bool = false,
+    ownerid: bool = false,
+    groupid: bool = false,
+    accessmask: bool = false,
+    flags: bool = false,
+    gen_count: bool = false,
+    document_id: bool = false,
+    useraccess: bool = false,
+    extended_security: bool = false,
+    uuid: bool = false,
+    grpuuid: bool = false,
+    fileid: bool = false,
+    parentid: bool = false,
+    fullpath: bool = false,
+    addedtime: bool = false,
+    @"error": bool = false,
+    data_protect_flags: bool = false,
     returned_attrs: bool = true,
 };
 
@@ -110,8 +134,8 @@ pub fn PayloadFor(mask: AttrGroupMask) type {
         returned: AttributeSet,
         name_ref: if (mask.common.name) AttrRef else void,
         fsid: if (mask.common.fsid) Fsid else void,
-        objtype: if (mask.common.obj_type) u32 else void,
-        fileid: if (mask.common.file_id) u64 else void,
+        objtype: if (mask.common.objtype) u32 else void,
+        objid: if (mask.common.objid) u64 else void,
     };
 }
 
@@ -123,6 +147,36 @@ extern "c" fn getattrlistbulk(
     options: FsOptMask,
 ) c_int;
 
+pub const IoPolicyType = enum(c_int) {
+    disk = 0,
+    vfs_atime_updates = 2,
+    vfs_materialize_dataless_files = 3,
+    vfs_statfs_no_data_volume = 4,
+    vfs_trigger_resolve = 5,
+    vfs_ignore_content_protection = 6,
+    vfs_ignore_permissions = 7,
+    vfs_skip_mtime_update = 8,
+    vfs_allow_low_space_writes = 9,
+    vfs_disallow_rw_for_o_evtonly = 10,
+};
+
+pub const IoPolicyScope = enum(c_int) {
+    process = 0,
+    thread = 1,
+    darwin_bg = 2,
+};
+
+pub extern "c" fn setiopolicy_np(
+    iotype: IoPolicyType,
+    scope: IoPolicyScope,
+    policy: c_int,
+) c_int;
+
+pub extern "c" fn getiopolicy_np(
+    iotype: IoPolicyType,
+    scope: IoPolicyScope,
+) c_int;
+
 /// Represents the type of a file system object
 pub const Kind = enum { file, dir, symlink, other };
 
@@ -131,9 +185,9 @@ pub const Kind = enum { file, dir, symlink, other };
 pub fn EntryFor(mask: AttrGroupMask) type {
     return struct {
         name: if (mask.common.name) [:0]const u8 else void,
-        kind: if (mask.common.obj_type) Kind else void,
+        kind: if (mask.common.objtype) Kind else void,
         fsid: if (mask.common.fsid) Fsid else void,
-        fileid: if (mask.common.file_id) u64 else void,
+        objid: if (mask.common.objid) u64 else void,
         details: union(enum) {
             dir: struct {
                 linkcount: if (mask.dir.linkcount) u32 else void,
@@ -193,7 +247,7 @@ pub fn DirScanner(mask: AttrGroupMask) type {
                 if (n < 0) {
                     switch (posix.errno(n)) {
                         .INTR, .AGAIN => {},
-                        .NOENT => return error.FileNotFound,
+                        .NOENT => unreachable,
                         .NOTDIR => return error.NotDir,
                         .BADF => return error.BadFileDescriptor,
                         .ACCES => return error.PermissionDenied,
@@ -202,6 +256,7 @@ pub fn DirScanner(mask: AttrGroupMask) type {
                         .INVAL => return error.InvalidArgument,
                         .IO => return error.ReadFailed,
                         .TIMEDOUT => return error.TimedOut,
+                        .DEADLK => return error.DeadLock, // iCloud dataless
                         else => |e| std.debug.panic("unexpected errno {t}", .{e}),
                     }
                 }
@@ -252,7 +307,7 @@ pub fn DirScanner(mask: AttrGroupMask) type {
                         else => .other,
                     },
                     .fsid = payload.fsid,
-                    .fileid = payload.fileid,
+                    .objid = payload.objid,
                     .details = undefined,
                 };
 
@@ -288,15 +343,6 @@ pub fn DirScanner(mask: AttrGroupMask) type {
         };
     } else {
         return struct {
-            comptime {
-                if (!(mask.common.name and mask.common.obj_type and mask.dir.datalength and mask.file.totalsize)) {
-                    @compileError("fallback DirScanner only supports the mask used by main.zig");
-                }
-                if (mask.common.fsid or mask.common.file_id or mask.dir.linkcount or mask.dir.entrycount or mask.dir.mountstatus or mask.dir.allocsize or mask.dir.ioblocksize or mask.file.linkcount or mask.file.allocsize) {
-                    @compileError("fallback DirScanner only supports the mask used by main.zig");
-                }
-            }
-
             pub const Payload = PayloadFor(mask);
             pub const Entry = struct {
                 name: [:0]const u8,
