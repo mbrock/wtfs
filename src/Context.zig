@@ -74,7 +74,7 @@ pub fn getNode(self: *Context, index: usize) DirectoryNode {
     return self.directories.get(index);
 }
 
-fn internPath(self: *Context, path: []const u8) !u32 {
+pub fn internPath(self: *Context, path: []const u8) !u32 {
     self.namelock.lock();
     defer self.namelock.unlock();
 
@@ -131,26 +131,8 @@ pub fn addRoot(self: *Context, path: []const u8, dir: ?std.fs.Dir, inaccessible:
     return index;
 }
 
-/// Caller must hold directories_mutex.
-pub fn addChild(self: *Context, parent_index: usize, name: []const u8) !usize {
-    const name_copy = try self.internPath(name);
-
-    const index = try self.directories.addOne(self.allocator);
-    var slices = self.directories.slice();
-    slices.items(.parent)[index] = @intCast(parent_index);
-    slices.items(.basename)[index] = name_copy;
-    slices.items(.fd)[index] = invalid_fd;
-    slices.items(.total_size)[index] = 0;
-    slices.items(.total_files)[index] = 0;
-    slices.items(.total_dirs)[index] = 1;
-    slices.items(.inaccessible)[index] = false;
-    slices.items(.fdrefcount)[index] = AtomicU16.init(0);
-
-    return index;
-}
-
 // ===== Parent Directory File Descriptor Lifecycle Management =====
-// 
+//
 // These methods manage the reference counting of directory file descriptors.
 // A directory's fd must stay open as long as any child might need to be opened
 // via openat() from it. We use reference counting to track how many pending
@@ -198,10 +180,10 @@ pub fn recordLargeFileLocked(
 pub fn releaseParentFd(self: *Context, parent_index: usize) void {
     self.directories_mutex.lock();
     defer self.directories_mutex.unlock();
-    
+
     var slices = self.directories.slice();
     const prev_count = slices.items(.fdrefcount)[parent_index].fetchSub(1, .acq_rel);
-    
+
     // If this was the last child needing this parent fd, close it
     if (prev_count == 1) {
         const fd = slices.items(.fd)[parent_index];
@@ -217,10 +199,10 @@ pub fn releaseParentFd(self: *Context, parent_index: usize) void {
 pub fn releaseParentFdAfterOpen(self: *Context, parent_index: usize) void {
     self.directories_mutex.lock();
     defer self.directories_mutex.unlock();
-    
+
     var slices = self.directories.slice();
     const prev_count = slices.items(.fdrefcount)[parent_index].fetchSub(1, .seq_cst);
-    
+
     // If this was the last child needing this parent fd, close it
     if (prev_count == 1) {
         const fd = slices.items(.fd)[parent_index];
@@ -229,11 +211,4 @@ pub fn releaseParentFdAfterOpen(self: *Context, parent_index: usize) void {
             slices.items(.fd)[parent_index] = invalid_fd;
         }
     }
-}
-
-pub fn scheduleDirectory(self: *Context, index: usize) !void {
-    _ = self.outstanding.fetchAdd(1, .acq_rel);
-    errdefer _ = self.outstanding.fetchSub(1, .acq_rel);
-    try self.task_queue.push(self.allocator, index);
-    _ = self.stats.directories_scheduled.fetchAdd(1, .monotonic);
 }

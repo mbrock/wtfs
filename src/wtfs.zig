@@ -5,18 +5,18 @@ const posix = std.posix;
 // ===== Darwin/macOS System Constants =====
 // From <sys/attr.h> and <sys/vnode.h>
 
-const ATTR_BIT_MAP_COUNT: u16 = 5;
+pub const ATTR_BIT_MAP_COUNT: u16 = 5;
 
 // Vnode (file system object) types from <sys/vnode.h>
-const VNON: u32 = 0;   // No type
-const VREG: u32 = 1;   // Regular file
-const VDIR: u32 = 2;   // Directory
-const VBLK: u32 = 3;   // Block device
-const VCHR: u32 = 4;   // Character device
-const VLNK: u32 = 5;   // Symbolic link
-const VSOCK: u32 = 6;  // Socket
-const VFIFO: u32 = 7;  // FIFO/pipe
-const VBAD: u32 = 8;   // Bad/invalid
+const VNON: u32 = 0; // No type
+const VREG: u32 = 1; // Regular file
+const VDIR: u32 = 2; // Directory
+const VBLK: u32 = 3; // Block device
+const VCHR: u32 = 4; // Character device
+const VLNK: u32 = 5; // Symbolic link
+const VSOCK: u32 = 6; // Socket
+const VFIFO: u32 = 7; // FIFO/pipe
+const VBAD: u32 = 8; // Bad/invalid
 
 // ===== Attribute Masks =====
 // These control which attributes getattrlistbulk will return
@@ -53,7 +53,7 @@ const CommonAttrMask = packed struct(u32) {
     addedtime: bool = false,
     @"error": bool = false,
     data_protect_flags: bool = false,
-    returned_attrs: bool = true,  // Always request this
+    returned_attrs: bool = true, // Always request this
 };
 
 const DirAttrMask = packed struct(u32) {
@@ -81,7 +81,7 @@ const AttrGroupMask = packed struct(u160) {
     fork: u32 = 0,
 };
 
-const FsOptMask = packed struct(u32) {
+pub const FsOptMask = packed struct(u32) {
     nofollow: bool = false,
     pad0: u1 = 0,
     report_fullsize: bool = false,
@@ -91,13 +91,13 @@ const FsOptMask = packed struct(u32) {
 
 // ===== System Types =====
 
-const AttrList = packed struct {
+pub const AttrList = packed struct {
     bitmapcount: u16,
     reserved: u16,
     attrs: AttrGroupMask,
 };
 
-const AttributeSet = packed struct {
+pub const AttributeSet = packed struct {
     attrs: AttrGroupMask,
 };
 
@@ -106,10 +106,7 @@ const AttrRef = packed struct {
     len: u32,
 };
 
-const Fsid = packed struct { 
-    id0: i32, 
-    id1: i32 
-};
+const Fsid = packed struct { id0: i32, id1: i32 };
 
 // ===== I/O Policy API (macOS-specific) =====
 
@@ -149,7 +146,7 @@ pub extern "c" fn getiopolicy_np(
 
 // ===== System Calls =====
 
-extern "c" fn getattrlistbulk(
+pub extern "c" fn getattrlistbulk(
     dirfd: std.posix.fd_t,
     alist: *const AttrList,
     attrbuf: *anyopaque,
@@ -167,12 +164,7 @@ pub extern "c" fn openat(
 // ===== Public API =====
 
 /// Represents the type of a file system object
-pub const Kind = enum { 
-    file, 
-    dir, 
-    symlink, 
-    other 
-};
+pub const Kind = enum { file, dir, symlink, other };
 
 /// Open a subdirectory using openat() from a parent file descriptor
 /// This is used during directory traversal to avoid path construction
@@ -189,7 +181,7 @@ pub fn openSubdirectory(
 
         if (fd < 0) {
             switch (posix.errno(fd)) {
-                .INTR => continue,  // Retry on interrupt
+                .INTR => continue, // Retry on interrupt
                 .BADF => return error.BadFileDescriptor,
                 .NOTDIR => return error.NotDir,
                 .NOENT => return error.FileNotFound,
@@ -287,11 +279,12 @@ fn MacOSDirScanner(mask: AttrGroupMask) type {
     return struct {
         pub const Payload = PayloadFor(mask);
         pub const Entry = EntryFor(mask);
+        pub const Mask = mask;
 
         fd: std.posix.fd_t,
         reader: std.io.Reader,
         buf: []u8,
-        n: usize = 0,  // Number of entries in current batch
+        n: usize = 0, // Number of entries in current batch
 
         /// Initialize a new scanner with a directory file descriptor and buffer
         /// The buffer will be used for storing the bulk attribute results
@@ -317,28 +310,29 @@ fn MacOSDirScanner(mask: AttrGroupMask) type {
                 .attrs = mask,
             };
 
-            const n = getattrlistbulk(self.fd, &al, self.buf.ptr, self.buf.len, opts_mask);
-            if (n < 0) {
-                switch (posix.errno(n)) {
-                    .INTR, .AGAIN => {},  // Transient errors, return empty batch
-                    .NOENT => unreachable,
-                    .NOTDIR => return error.NotDir,
-                    .BADF => return error.BadFileDescriptor,
-                    .ACCES => return error.PermissionDenied,
-                    .FAULT => return error.BadAddress,
-                    .RANGE => return error.BufferTooSmall,
-                    .INVAL => return error.InvalidArgument,
-                    .IO => return error.ReadFailed,
-                    .TIMEDOUT => return error.TimedOut,
-                    .DEADLK => return error.DeadLock, // iCloud dataless file
-                    else => |e| std.debug.panic("unexpected errno {t}", .{e}),
+            while (true) {
+                const n = getattrlistbulk(self.fd, &al, self.buf.ptr, self.buf.len, opts_mask);
+                if (n < 0) {
+                    switch (posix.errno(n)) {
+                        .INTR, .AGAIN => return error.Interrupted,
+                        .NOENT => unreachable,
+                        .NOTDIR => return error.NotDir,
+                        .BADF => return error.BadFileDescriptor,
+                        .ACCES => return error.PermissionDenied,
+                        .FAULT => return error.BadAddress,
+                        .RANGE => return error.BufferTooSmall,
+                        .INVAL => return error.InvalidArgument,
+                        .IO => return error.ReadFailed,
+                        .TIMEDOUT => return error.TimedOut,
+                        .DEADLK => return error.DeadLock, // iCloud dataless file
+                        else => |e| std.debug.panic("unexpected errno {t}", .{e}),
+                    }
                 }
+
+                self.n = @abs(n);
+                self.reader = std.io.Reader.fixed(self.buf);
+                return;
             }
-
-            if (n == 0) return;  // End of directory
-
-            self.n = @abs(n);
-            self.reader = std.io.Reader.fixed(self.buf);
         }
 
         /// Ensure a batch of entries is available. Returns false when no
@@ -438,7 +432,7 @@ fn PosixDirScanner(mask: AttrGroupMask) type {
         const EntryDetails = @FieldType(Entry, "details");
         const DirPayload = @FieldType(EntryDetails, "dir");
         const FilePayload = @FieldType(EntryDetails, "file");
-        
+
         // Check which stat fields are available on this platform
         const stat_has_nlink = @hasField(posix.Stat, "nlink");
         const stat_has_blocks = @hasField(posix.Stat, "blocks");
@@ -499,10 +493,10 @@ fn PosixDirScanner(mask: AttrGroupMask) type {
             if (comptime mask.common.objid) entry.objid = 0;
 
             // Determine if we need to stat for additional attributes
-            const needs_dir_stat = comptime mask.dir.linkcount or mask.dir.allocsize or 
-                                          mask.dir.ioblocksize or mask.dir.datalength;
-            const needs_file_stat = comptime mask.file.linkcount or mask.file.totalsize or 
-                                           mask.file.allocsize;
+            const needs_dir_stat = comptime mask.dir.linkcount or mask.dir.allocsize or
+                mask.dir.ioblocksize or mask.dir.datalength;
+            const needs_file_stat = comptime mask.file.linkcount or mask.file.totalsize or
+                mask.file.allocsize;
 
             // Fill in type-specific details
             entry.details = switch (entry_kind) {

@@ -168,7 +168,10 @@ fn initializeRootDirectory(self: *Self, ctx: *Context) !void {
         self.progress_root.completeOne();
         ctx.task_queue.close();
     } else {
-        try ctx.scheduleDirectory(root_index);
+        _ = ctx.outstanding.fetchAdd(1, .acq_rel);
+        errdefer _ = ctx.outstanding.fetchSub(1, .acq_rel);
+        try ctx.task_queue.push(self.allocator, root_index);
+        _ = ctx.stats.directories_scheduled.fetchAdd(1, .monotonic);
     }
 }
 
@@ -980,7 +983,10 @@ fn reportResults(self: *Self, results: ScanResults, summary: Summary) !void {
 
 fn runWithOptions(self: *Self, options: RunOptions) !void {
     // Initialize progress tracking
-    var progress = std.Progress.start(.{ .root_name = "wtfs" });
+    var progress = std.Progress.start(.{
+        .root_name = "wtfs",
+        .refresh_rate_ns = 40 * std.time.ns_per_ms,
+    });
     errdefer progress.end();
     self.progress_root = progress;
 
