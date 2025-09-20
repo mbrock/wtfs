@@ -344,15 +344,13 @@ pub fn DirScanner(mask: AttrGroupMask) type {
     } else {
         return struct {
             pub const Payload = PayloadFor(mask);
-            pub const Entry = struct {
-                name: [:0]const u8,
-                kind: Kind,
-                details: union(enum) {
-                    dir: struct { datalength: u64 },
-                    file: struct { totalsize: u64 },
-                    other: void,
-                },
-            };
+            pub const Entry = EntryFor(mask);
+            const EntryDetails = @FieldType(Entry, "details");
+            const DirPayload = @FieldType(EntryDetails, "dir");
+            const FilePayload = @FieldType(EntryDetails, "file");
+            const stat_has_nlink = @hasField(posix.Stat, "nlink");
+            const stat_has_blocks = @hasField(posix.Stat, "blocks");
+            const stat_has_blksize = @hasField(posix.Stat, "blksize");
 
             dir: std.fs.Dir,
             iterator: std.fs.Dir.Iterator,
@@ -369,17 +367,26 @@ pub fn DirScanner(mask: AttrGroupMask) type {
                 return scanner;
             }
 
+            fn copyName(self: *@This(), name: []const u8) error{BufferTooSmall}![:0]const u8 {
+                if (name.len + 1 > self.buf.len) {
+                    return error.BufferTooSmall;
+                }
+
+                const dest = self.buf[0 .. name.len + 1];
+                std.mem.copyForwards(u8, dest[0..name.len], name);
+                dest[name.len] = 0;
+                return dest[0..name.len :0];
+            }
+
+            fn statAt(self: *@This(), name: [:0]const u8) !posix.Stat {
+                return try posix.fstatat(self.dir.fd, name, 0);
+            }
+
             /// Get the next directory entry, or null if no more entries.
             pub fn next(self: *@This()) !?Entry {
                 while (try self.iterator.next()) |dir_entry| {
-                    const name = dir_entry.name;
-                    if (name.len + 1 > self.buf.len) {
-                        return error.BufferTooSmall;
-                    }
-
-                    const dest = self.buf[0 .. name.len + 1];
-                    std.mem.copyForwards(u8, dest[0..name.len], name);
-                    dest[name.len] = 0;
+                    const raw_name = dir_entry.name;
+                    const name_z = try self.copyName(raw_name);
 
                     const entry_kind: Kind = switch (dir_entry.kind) {
                         .directory => .dir,
@@ -388,23 +395,73 @@ pub fn DirScanner(mask: AttrGroupMask) type {
                         else => .other,
                     };
 
-                    var entry = Entry{
-                        .name = dest[0..name.len :0],
-                        .kind = entry_kind,
-                        .details = .{ .other = {} },
-                    };
+                    var entry: Entry = undefined;
+                    if (comptime mask.common.name) entry.name = name_z;
+                    if (comptime mask.common.objtype) entry.kind = entry_kind;
+                    if (comptime mask.common.fsid) entry.fsid = .{ .id0 = 0, .id1 = 0 };
+                    if (comptime mask.common.objid) entry.objid = 0;
 
-                    switch (entry_kind) {
-                        .dir => {
-                            const stat = try self.dir.statFile(name);
-                            entry.details = .{ .dir = .{ .datalength = stat.size } };
+                    const needs_dir_stat = comptime mask.dir.linkcount or mask.dir.allocsize or mask.dir.ioblocksize or mask.dir.datalength;
+                    const needs_file_stat = comptime mask.file.linkcount or mask.file.totalsize or mask.file.allocsize;
+
+                    entry.details = switch (entry_kind) {
+                        .dir => blk: {
+                            var payload: DirPayload = std.mem.zeroes(DirPayload);
+                            if (needs_dir_stat) {
+                                const stat = try self.statAt(name_z);
+                                if (comptime mask.dir.linkcount) {
+                                    if (stat_has_nlink) {
+                                        payload.linkcount = @intCast(stat.nlink);
+                                    } else {
+                                        payload.linkcount = 0;
+                                    }
+                                }
+                                if (comptime mask.dir.allocsize) {
+                                    if (stat_has_blocks) {
+                                        const blocks: u64 = @intCast(stat.blocks);
+                                        payload.allocsize = blocks * 512;
+                                    } else {
+                                        payload.allocsize = 0;
+                                    }
+                                }
+                                if (comptime mask.dir.ioblocksize) {
+                                    if (stat_has_blksize) {
+                                        payload.ioblocksize = @intCast(stat.blksize);
+                                    } else {
+                                        payload.ioblocksize = 0;
+                                    }
+                                }
+                                if (comptime mask.dir.datalength) payload.datalength = @intCast(stat.size);
+                            }
+                            if (comptime mask.dir.entrycount) payload.entrycount = 0;
+                            if (comptime mask.dir.mountstatus) payload.mountstatus = 0;
+                            break :blk .{ .dir = payload };
                         },
-                        .file => {
-                            const stat = try self.dir.statFile(name);
-                            entry.details = .{ .file = .{ .totalsize = stat.size } };
+                        .file => blk: {
+                            var payload: FilePayload = std.mem.zeroes(FilePayload);
+                            if (needs_file_stat) {
+                                const stat = try self.statAt(name_z);
+                                if (comptime mask.file.linkcount) {
+                                    if (stat_has_nlink) {
+                                        payload.linkcount = @intCast(stat.nlink);
+                                    } else {
+                                        payload.linkcount = 0;
+                                    }
+                                }
+                                if (comptime mask.file.totalsize) payload.totalsize = @intCast(stat.size);
+                                if (comptime mask.file.allocsize) {
+                                    if (stat_has_blocks) {
+                                        const blocks: u64 = @intCast(stat.blocks);
+                                        payload.allocsize = blocks * 512;
+                                    } else {
+                                        payload.allocsize = @intCast(stat.size);
+                                    }
+                                }
+                            }
+                            break :blk .{ .file = payload };
                         },
-                        else => {},
-                    }
+                        else => .{ .other = {} },
+                    };
 
                     return entry;
                 }

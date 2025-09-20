@@ -425,11 +425,13 @@ pub fn main() !void {
     defer idxset.deinit(allocator);
 
     // forbid on-demand file content loading; don't pull in data from iCloud
-    switch (wtfs.setiopolicy_np(.vfs_materialize_dataless_files, .process, 1)) {
-        0 => {},
-        else => |rc| {
-            std.debug.panic("setiopolicy_np: {t}", .{std.posix.errno(rc)});
-        },
+    if (builtin.target.os.tag == .macos) {
+        switch (wtfs.setiopolicy_np(.vfs_materialize_dataless_files, .process, 1)) {
+            0 => {},
+            else => |rc| {
+                std.debug.panic("setiopolicy_np: {t}", .{std.posix.errno(rc)});
+            },
+        }
     }
 
     var progress_root = std.Progress.start(.{ .root_name = "Scanning" });
