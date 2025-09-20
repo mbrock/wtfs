@@ -1,115 +1,37 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const platform = @import("mac/platform.zig");
+const scanner_stream = @import("scanner_stream.zig");
+pub const stream = scanner_stream;
+
+pub const ATTR_BIT_MAP_COUNT = platform.ATTR_BIT_MAP_COUNT;
+const CommonAttrMask = platform.CommonAttrMask;
+const DirAttrMask = platform.DirAttrMask;
+const FileAttrMask = platform.FileAttrMask;
+pub const AttrGroupMask = platform.AttrGroupMask;
+const FsOptMask = platform.FsOptMask;
+const AttrList = platform.AttrList;
+const AttributeSet = platform.AttributeSet;
+const AttrRef = platform.AttrRef;
+pub const Fsid = platform.Fsid;
 
 // ===== Darwin/macOS System Constants =====
 // From <sys/attr.h> and <sys/vnode.h>
 
-const ATTR_BIT_MAP_COUNT: u16 = 5;
-
 // Vnode (file system object) types from <sys/vnode.h>
-const VNON: u32 = 0;   // No type
-const VREG: u32 = 1;   // Regular file
-const VDIR: u32 = 2;   // Directory
-const VBLK: u32 = 3;   // Block device
-const VCHR: u32 = 4;   // Character device
-const VLNK: u32 = 5;   // Symbolic link
-const VSOCK: u32 = 6;  // Socket
-const VFIFO: u32 = 7;  // FIFO/pipe
-const VBAD: u32 = 8;   // Bad/invalid
+const VNON: u32 = 0; // No type
+const VREG: u32 = 1; // Regular file
+const VDIR: u32 = 2; // Directory
+const VBLK: u32 = 3; // Block device
+const VCHR: u32 = 4; // Character device
+const VLNK: u32 = 5; // Symbolic link
+const VSOCK: u32 = 6; // Socket
+const VFIFO: u32 = 7; // FIFO/pipe
+const VBAD: u32 = 8; // Bad/invalid
 
 // ===== Attribute Masks =====
 // These control which attributes getattrlistbulk will return
-
-const CommonAttrMask = packed struct(u32) {
-    name: bool = false,
-    devid: bool = false,
-    fsid: bool = false,
-    objtype: bool = false,
-    objtag: bool = false,
-    objid: bool = false,
-    objpermanentid: bool = false,
-    parobjid: bool = false,
-    script: bool = false,
-    crtime: bool = false,
-    modtime: bool = false,
-    chgtime: bool = false,
-    acctime: bool = false,
-    bkuptime: bool = false,
-    fndrinfo: bool = false,
-    ownerid: bool = false,
-    groupid: bool = false,
-    accessmask: bool = false,
-    flags: bool = false,
-    gen_count: bool = false,
-    document_id: bool = false,
-    useraccess: bool = false,
-    extended_security: bool = false,
-    uuid: bool = false,
-    grpuuid: bool = false,
-    fileid: bool = false,
-    parentid: bool = false,
-    fullpath: bool = false,
-    addedtime: bool = false,
-    @"error": bool = false,
-    data_protect_flags: bool = false,
-    returned_attrs: bool = true,  // Always request this
-};
-
-const DirAttrMask = packed struct(u32) {
-    linkcount: bool = false,
-    entrycount: bool = false,
-    mountstatus: bool = false,
-    allocsize: bool = false,
-    ioblocksize: bool = false,
-    datalength: bool = false,
-    pad0: u26 = 0,
-};
-
-const FileAttrMask = packed struct(u32) {
-    linkcount: bool = false,
-    totalsize: bool = false,
-    allocsize: bool = false,
-    pad0: u29 = 0,
-};
-
-const AttrGroupMask = packed struct(u160) {
-    common: CommonAttrMask = .{},
-    vol: u32 = 0,
-    dir: DirAttrMask = .{},
-    file: FileAttrMask = .{},
-    fork: u32 = 0,
-};
-
-const FsOptMask = packed struct(u32) {
-    nofollow: bool = false,
-    pad0: u1 = 0,
-    report_fullsize: bool = false,
-    pack_invalid_attrs: bool = false,
-    pad1: u28 = 0,
-};
-
-// ===== System Types =====
-
-const AttrList = packed struct {
-    bitmapcount: u16,
-    reserved: u16,
-    attrs: AttrGroupMask,
-};
-
-const AttributeSet = packed struct {
-    attrs: AttrGroupMask,
-};
-
-const AttrRef = packed struct {
-    off: i32,
-    len: u32,
-};
-
-const Fsid = packed struct { 
-    id0: i32, 
-    id1: i32 
-};
 
 // ===== I/O Policy API (macOS-specific) =====
 
@@ -149,14 +71,6 @@ pub extern "c" fn getiopolicy_np(
 
 // ===== System Calls =====
 
-extern "c" fn getattrlistbulk(
-    dirfd: std.posix.fd_t,
-    alist: *const AttrList,
-    attrbuf: *anyopaque,
-    buflen: usize,
-    options: FsOptMask,
-) c_int;
-
 pub extern "c" fn openat(
     dirfd: std.posix.fd_t,
     path: [*:0]const u8,
@@ -167,12 +81,7 @@ pub extern "c" fn openat(
 // ===== Public API =====
 
 /// Represents the type of a file system object
-pub const Kind = enum { 
-    file, 
-    dir, 
-    symlink, 
-    other 
-};
+pub const Kind = enum { file, dir, symlink, other };
 
 /// Open a subdirectory using openat() from a parent file descriptor
 /// This is used during directory traversal to avoid path construction
@@ -189,7 +98,7 @@ pub fn openSubdirectory(
 
         if (fd < 0) {
             switch (posix.errno(fd)) {
-                .INTR => continue,  // Retry on interrupt
+                .INTR => continue, // Retry on interrupt
                 .BADF => return error.BadFileDescriptor,
                 .NOTDIR => return error.NotDir,
                 .NOENT => return error.FileNotFound,
@@ -291,7 +200,8 @@ fn MacOSDirScanner(mask: AttrGroupMask) type {
         fd: std.posix.fd_t,
         reader: std.io.Reader,
         buf: []u8,
-        n: usize = 0,  // Number of entries in current batch
+        stream: scanner_stream.AttrBulkReader,
+        n: usize = 0, // Number of entries in current batch
 
         /// Initialize a new scanner with a directory file descriptor and buffer
         /// The buffer will be used for storing the bulk attribute results
@@ -300,45 +210,20 @@ fn MacOSDirScanner(mask: AttrGroupMask) type {
                 .fd = fd,
                 .reader = std.io.Reader.fixed(buf),
                 .buf = buf,
+                .stream = scanner_stream.makeAttrBulkReader(fd, mask, buf),
             };
         }
 
         /// Fetch a new batch of entries from the kernel
         fn refill(self: *@This()) !void {
-            const opts_mask = FsOptMask{
-                .nofollow = true,
-                .report_fullsize = true,
-                .pack_invalid_attrs = true,
-            };
-
-            var al = AttrList{
-                .bitmapcount = ATTR_BIT_MAP_COUNT,
-                .reserved = 0,
-                .attrs = mask,
-            };
-
-            const n = getattrlistbulk(self.fd, &al, self.buf.ptr, self.buf.len, opts_mask);
-            if (n < 0) {
-                switch (posix.errno(n)) {
-                    .INTR, .AGAIN => {},  // Transient errors, return empty batch
-                    .NOENT => unreachable,
-                    .NOTDIR => return error.NotDir,
-                    .BADF => return error.BadFileDescriptor,
-                    .ACCES => return error.PermissionDenied,
-                    .FAULT => return error.BadAddress,
-                    .RANGE => return error.BufferTooSmall,
-                    .INVAL => return error.InvalidArgument,
-                    .IO => return error.ReadFailed,
-                    .TIMEDOUT => return error.TimedOut,
-                    .DEADLK => return error.DeadLock, // iCloud dataless file
-                    else => |e| std.debug.panic("unexpected errno {t}", .{e}),
-                }
+            const has_batch = try self.stream.fillBatch();
+            if (!has_batch) {
+                self.n = 0;
+                return;
             }
 
-            if (n == 0) return;  // End of directory
-
-            self.n = @abs(n);
-            self.reader = std.io.Reader.fixed(self.buf);
+            self.n = self.stream.lastEntries();
+            self.reader = std.io.Reader.fixed(self.stream.batchSlice());
         }
 
         /// Ensure a batch of entries is available. Returns false when no
@@ -438,7 +323,7 @@ fn PosixDirScanner(mask: AttrGroupMask) type {
         const EntryDetails = @FieldType(Entry, "details");
         const DirPayload = @FieldType(EntryDetails, "dir");
         const FilePayload = @FieldType(EntryDetails, "file");
-        
+
         // Check which stat fields are available on this platform
         const stat_has_nlink = @hasField(posix.Stat, "nlink");
         const stat_has_blocks = @hasField(posix.Stat, "blocks");
@@ -499,10 +384,10 @@ fn PosixDirScanner(mask: AttrGroupMask) type {
             if (comptime mask.common.objid) entry.objid = 0;
 
             // Determine if we need to stat for additional attributes
-            const needs_dir_stat = comptime mask.dir.linkcount or mask.dir.allocsize or 
-                                          mask.dir.ioblocksize or mask.dir.datalength;
-            const needs_file_stat = comptime mask.file.linkcount or mask.file.totalsize or 
-                                           mask.file.allocsize;
+            const needs_dir_stat = comptime mask.dir.linkcount or mask.dir.allocsize or
+                mask.dir.ioblocksize or mask.dir.datalength;
+            const needs_file_stat = comptime mask.file.linkcount or mask.file.totalsize or
+                mask.file.allocsize;
 
             // Fill in type-specific details
             entry.details = switch (entry_kind) {
