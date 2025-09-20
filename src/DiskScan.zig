@@ -104,6 +104,9 @@ large_file_threshold: u64 = default_large_file_threshold,
 /// Collection of large files discovered during the scan
 large_files: Context.LargeFileStore = .empty,
 
+/// Optional writer receiving raw directory batches during scanning
+stream_writer: ?*std.Io.Writer = null,
+
 pub const BinaryFormatVersion: u16 = 1;
 
 pub const RunOptions = struct {
@@ -154,6 +157,7 @@ fn createScanContext(
         .stats = &self.stats, // Pass pointer to stats
         .large_files = &self.large_files,
         .large_file_threshold = self.large_file_threshold,
+        .stream_out = self.stream_writer,
     };
 }
 
@@ -984,6 +988,9 @@ fn runWithOptions(self: *Self, options: RunOptions) !void {
     errdefer progress.end();
     self.progress_root = progress;
 
+    self.stream_writer = options.binary_writer;
+    defer self.stream_writer = null;
+
     // Perform the scan
     const results = try self.performScan();
 
@@ -996,10 +1003,6 @@ fn runWithOptions(self: *Self, options: RunOptions) !void {
 
     // End progress and report
     progress.end();
-
-    if (options.binary_writer) |writer| {
-        try self.writeBinaryResults(results, writer);
-    }
 
     if (have_summary) {
         defer summary_storage.deinit(self.allocator);

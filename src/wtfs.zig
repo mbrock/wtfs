@@ -8,15 +8,15 @@ const posix = std.posix;
 const ATTR_BIT_MAP_COUNT: u16 = 5;
 
 // Vnode (file system object) types from <sys/vnode.h>
-const VNON: u32 = 0;   // No type
-const VREG: u32 = 1;   // Regular file
-const VDIR: u32 = 2;   // Directory
-const VBLK: u32 = 3;   // Block device
-const VCHR: u32 = 4;   // Character device
-const VLNK: u32 = 5;   // Symbolic link
-const VSOCK: u32 = 6;  // Socket
-const VFIFO: u32 = 7;  // FIFO/pipe
-const VBAD: u32 = 8;   // Bad/invalid
+const VNON: u32 = 0; // No type
+const VREG: u32 = 1; // Regular file
+const VDIR: u32 = 2; // Directory
+const VBLK: u32 = 3; // Block device
+const VCHR: u32 = 4; // Character device
+const VLNK: u32 = 5; // Symbolic link
+const VSOCK: u32 = 6; // Socket
+const VFIFO: u32 = 7; // FIFO/pipe
+const VBAD: u32 = 8; // Bad/invalid
 
 // ===== Attribute Masks =====
 // These control which attributes getattrlistbulk will return
@@ -53,7 +53,7 @@ const CommonAttrMask = packed struct(u32) {
     addedtime: bool = false,
     @"error": bool = false,
     data_protect_flags: bool = false,
-    returned_attrs: bool = true,  // Always request this
+    returned_attrs: bool = true, // Always request this
 };
 
 const DirAttrMask = packed struct(u32) {
@@ -106,10 +106,7 @@ const AttrRef = packed struct {
     len: u32,
 };
 
-const Fsid = packed struct { 
-    id0: i32, 
-    id1: i32 
-};
+const Fsid = packed struct { id0: i32, id1: i32 };
 
 // ===== I/O Policy API (macOS-specific) =====
 
@@ -167,12 +164,7 @@ pub extern "c" fn openat(
 // ===== Public API =====
 
 /// Represents the type of a file system object
-pub const Kind = enum { 
-    file, 
-    dir, 
-    symlink, 
-    other 
-};
+pub const Kind = enum { file, dir, symlink, other };
 
 /// Open a subdirectory using openat() from a parent file descriptor
 /// This is used during directory traversal to avoid path construction
@@ -189,7 +181,7 @@ pub fn openSubdirectory(
 
         if (fd < 0) {
             switch (posix.errno(fd)) {
-                .INTR => continue,  // Retry on interrupt
+                .INTR => continue, // Retry on interrupt
                 .BADF => return error.BadFileDescriptor,
                 .NOTDIR => return error.NotDir,
                 .NOENT => return error.FileNotFound,
@@ -291,7 +283,7 @@ fn MacOSDirScanner(mask: AttrGroupMask) type {
         fd: std.posix.fd_t,
         reader: std.io.Reader,
         buf: []u8,
-        n: usize = 0,  // Number of entries in current batch
+        n: usize = 0, // Number of entries in current batch
 
         /// Initialize a new scanner with a directory file descriptor and buffer
         /// The buffer will be used for storing the bulk attribute results
@@ -320,7 +312,7 @@ fn MacOSDirScanner(mask: AttrGroupMask) type {
             const n = getattrlistbulk(self.fd, &al, self.buf.ptr, self.buf.len, opts_mask);
             if (n < 0) {
                 switch (posix.errno(n)) {
-                    .INTR, .AGAIN => {},  // Transient errors, return empty batch
+                    .INTR, .AGAIN => {}, // Transient errors, return empty batch
                     .NOENT => unreachable,
                     .NOTDIR => return error.NotDir,
                     .BADF => return error.BadFileDescriptor,
@@ -335,7 +327,7 @@ fn MacOSDirScanner(mask: AttrGroupMask) type {
                 }
             }
 
-            if (n == 0) return;  // End of directory
+            if (n == 0) return; // End of directory
 
             self.n = @abs(n);
             self.reader = std.io.Reader.fixed(self.buf);
@@ -349,6 +341,16 @@ fn MacOSDirScanner(mask: AttrGroupMask) type {
                 try self.refill();
             }
             return self.n != 0;
+        }
+
+        /// Prepare the scanner to decode a raw batch previously fetched
+        /// into the buffer. The byte length must not exceed the buffer
+        /// capacity and entry_count indicates how many directory entries
+        /// are contained in the batch.
+        pub fn resetFromRaw(self: *@This(), byte_len: usize, entry_count: usize) void {
+            std.debug.assert(byte_len <= self.buf.len);
+            self.n = entry_count;
+            self.reader = std.io.Reader.fixed(self.buf[0..byte_len]);
         }
 
         /// Get the next entry from the current batch or null if the batch
@@ -438,7 +440,7 @@ fn PosixDirScanner(mask: AttrGroupMask) type {
         const EntryDetails = @FieldType(Entry, "details");
         const DirPayload = @FieldType(EntryDetails, "dir");
         const FilePayload = @FieldType(EntryDetails, "file");
-        
+
         // Check which stat fields are available on this platform
         const stat_has_nlink = @hasField(posix.Stat, "nlink");
         const stat_has_blocks = @hasField(posix.Stat, "blocks");
@@ -499,10 +501,10 @@ fn PosixDirScanner(mask: AttrGroupMask) type {
             if (comptime mask.common.objid) entry.objid = 0;
 
             // Determine if we need to stat for additional attributes
-            const needs_dir_stat = comptime mask.dir.linkcount or mask.dir.allocsize or 
-                                          mask.dir.ioblocksize or mask.dir.datalength;
-            const needs_file_stat = comptime mask.file.linkcount or mask.file.totalsize or 
-                                           mask.file.allocsize;
+            const needs_dir_stat = comptime mask.dir.linkcount or mask.dir.allocsize or
+                mask.dir.ioblocksize or mask.dir.datalength;
+            const needs_file_stat = comptime mask.file.linkcount or mask.file.totalsize or
+                mask.file.allocsize;
 
             // Fill in type-specific details
             entry.details = switch (entry_kind) {

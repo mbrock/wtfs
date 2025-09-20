@@ -59,6 +59,8 @@ skip_hidden: bool,
 directories_mutex: std.Thread.Mutex = .{},
 task_queue: *TaskQueue,
 outstanding: AtomicUsize = AtomicUsize.init(0),
+stream_out: ?*std.Io.Writer = null,
+stream_mutex: std.Thread.Mutex = .{},
 
 large_files: *LargeFileStore,
 large_file_threshold: u64,
@@ -150,7 +152,7 @@ pub fn addChild(self: *Context, parent_index: usize, name: []const u8) !usize {
 }
 
 // ===== Parent Directory File Descriptor Lifecycle Management =====
-// 
+//
 // These methods manage the reference counting of directory file descriptors.
 // A directory's fd must stay open as long as any child might need to be opened
 // via openat() from it. We use reference counting to track how many pending
@@ -198,10 +200,10 @@ pub fn recordLargeFileLocked(
 pub fn releaseParentFd(self: *Context, parent_index: usize) void {
     self.directories_mutex.lock();
     defer self.directories_mutex.unlock();
-    
+
     var slices = self.directories.slice();
     const prev_count = slices.items(.fdrefcount)[parent_index].fetchSub(1, .acq_rel);
-    
+
     // If this was the last child needing this parent fd, close it
     if (prev_count == 1) {
         const fd = slices.items(.fd)[parent_index];
@@ -217,10 +219,10 @@ pub fn releaseParentFd(self: *Context, parent_index: usize) void {
 pub fn releaseParentFdAfterOpen(self: *Context, parent_index: usize) void {
     self.directories_mutex.lock();
     defer self.directories_mutex.unlock();
-    
+
     var slices = self.directories.slice();
     const prev_count = slices.items(.fdrefcount)[parent_index].fetchSub(1, .seq_cst);
-    
+
     // If this was the last child needing this parent fd, close it
     if (prev_count == 1) {
         const fd = slices.items(.fd)[parent_index];
