@@ -218,6 +218,12 @@ fn buildPath(self: *Self, index: usize) ![]u8 {
     return try writer.toOwnedSlice();
 }
 
+fn directoryName(self: *Self, index: usize) []const u8 {
+    const slices = self.directories.slice();
+    const base_index = slices.items(.basename)[index];
+    return std.mem.sliceTo(self.namedata.items[base_index..], 0);
+}
+
 // ===== Statistics Processing =====
 
 const StatsAggregator = struct {
@@ -502,20 +508,145 @@ const Reporter = struct {
     ) !void {
         if (entries.len == 0) return;
 
-        try stdout.print(
-            "Heaviest directories in tree:\n\n",
-            .{},
-        );
-        try stdout.print(
-            "  Size         Share   Path                               Files      Dirs   Avg file   Status\n",
-            .{},
-        );
+        try stdout.print("Heaviest directories in tree:\n\n", .{});
+        try stdout.print("  Size         Share   Files      Dirs   Avg file   Path\n", .{});
 
-        const limit = @min(entries.len, 15);
-        for (entries[0..limit]) |entry| {
-            try printDirectoryEntry(self, totals, entry);
+        const ChildMap = std.AutoHashMap(usize, std.ArrayList(usize));
+        var child_map = ChildMap.init(self.allocator);
+        defer {
+            var iter = child_map.iterator();
+            while (iter.next()) |entry| {
+                entry.value_ptr.*.deinit(self.allocator);
+            }
+            child_map.deinit();
         }
+
+        var node_set = std.AutoHashMap(usize, void).init(self.allocator);
+        defer node_set.deinit();
+
+        const slices = self.directories.slice();
+
+        for (entries) |entry| {
+            var current = entry.index;
+            while (true) {
+                try node_set.put(current, {});
+                if (current == 0) break;
+
+                const parent_index: usize = @intCast(slices.items(.parent)[current]);
+                try node_set.put(parent_index, {});
+
+                const gop = try child_map.getOrPut(parent_index);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = std.ArrayList(usize){};
+                }
+                const children_ptr = gop.value_ptr;
+                if (std.mem.indexOfScalar(usize, children_ptr.items, current) == null) {
+                    try children_ptr.append(self.allocator, current);
+                }
+
+                if (parent_index == 0) {
+                    current = 0;
+                    break;
+                }
+                current = parent_index;
+            }
+        }
+
+        try node_set.put(0, {});
+
+        var sort_iter = child_map.iterator();
+        while (sort_iter.next()) |entry| {
+            const children_ptr = entry.value_ptr;
+            const SortCtx = struct {
+                directories: *Context.DirectoryStore,
+
+                fn bySize(ctx: @This(), lhs: usize, rhs: usize) bool {
+                    const dir_slices = ctx.directories.slice();
+                    const sizes = dir_slices.items(.total_size);
+                    const lhs_size = sizes[lhs];
+                    const rhs_size = sizes[rhs];
+                    if (lhs_size != rhs_size) return lhs_size > rhs_size;
+                    return lhs < rhs;
+                }
+            };
+
+            if (children_ptr.items.len > 1) {
+                std.sort.heap(
+                    usize,
+                    children_ptr.items,
+                    SortCtx{ .directories = &self.directories },
+                    SortCtx.bySize,
+                );
+            }
+        }
+
+        try printHeaviestNode(self, &child_map, &node_set, totals, 0, 0, true);
         try stdout.print("\n", .{});
+    }
+
+    fn printHeaviestNode(
+        self: *Self,
+        child_map: *std.AutoHashMap(usize, std.ArrayList(usize)),
+        node_set: *std.AutoHashMap(usize, void),
+        totals: DirectoryTotals,
+        index: usize,
+        depth: usize,
+        include_self: bool,
+    ) !void {
+        if (!node_set.contains(index)) return;
+
+        if (include_self) {
+            try printHeaviestLine(self, totals, index, depth);
+        }
+
+        if (child_map.getPtr(index)) |children| {
+            for (children.items) |child_index| {
+                try printHeaviestNode(self, child_map, node_set, totals, child_index, depth + 1, true);
+            }
+        }
+    }
+
+    fn printHeaviestLine(self: *Self, totals: DirectoryTotals, index: usize, depth: usize) !void {
+        const slices = self.directories.slice();
+        const inaccessible = slices.items(.inaccessible)[index];
+        const size = slices.items(.total_size)[index];
+        const files = slices.items(.total_files)[index];
+        const dirs_total = slices.items(.total_dirs)[index];
+        const dir_count = if (dirs_total == 0) 0 else dirs_total - 1;
+
+        var size_buf: [32]u8 = undefined;
+        const size_str = try formatBytes(size_buf[0..], size);
+
+        var share_buf: [16]u8 = undefined;
+        const share_str = try formatPercent(share_buf[0..], size, totals.bytes);
+
+        var files_buf: [32]u8 = undefined;
+        const files_str = try formatCount(files_buf[0..], files);
+
+        var dirs_buf: [32]u8 = undefined;
+        const dirs_str = try formatCount(dirs_buf[0..], dir_count);
+
+        var avg_buf: [32]u8 = undefined;
+        const avg_str = if (files == 0)
+            "-"
+        else blk: {
+            const files_u64 = std.math.cast(u64, files) orelse std.math.maxInt(u64);
+            const avg_bytes = size / @max(files_u64, 1);
+            break :blk try formatBytes(avg_buf[0..], avg_bytes);
+        };
+
+        var indent_buf: [64]u8 = undefined;
+        const indent_len = @min(depth * 2, indent_buf.len);
+        for (indent_buf[0..indent_len]) |*ch| ch.* = ' ';
+        const indent = indent_buf[0..indent_len];
+
+        const name = if (index == 0) "." else directoryName(self, index);
+        const status = if (inaccessible) "partial" else "";
+
+        try stdout.print(
+            "  {s:>11}  {s:>6}  {s:>9}  {s:>8}  {s:>9}  {s}{s}{s}\n",
+            .{ size_str, share_str, files_str, dirs_str, avg_str, indent, name, status },
+        );
     }
 
     fn printDirectoryEntry(
