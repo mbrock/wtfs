@@ -3,24 +3,21 @@ set -euo pipefail
 
 usage() {
     cat <<USAGE
-Usage: $(basename "$0") [--release] [--binary ./zig-out/bin/wtfs] [--trace PATH] [--] [wtfs args...]
+Usage: $(basename "$0") [--release] [--binary ./zig-out/bin/wtfs] [--] [wtfs args...]
 
 Runs wtfs under Linux perf sampling. Captures perf.data and emits perf report hints.
 
   --release        Build the release-fast variant before profiling.
   --binary PATH    Path to the wtfs executable (default: ./zig-out/bin/wtfs).
-  --trace PATH     Optional trace output passed through (--trace-uring=PATH).
   --help           Show this help message.
 
 Examples:
   $(basename "$0") --release -- /var/log
-  $(basename "$0") --trace /tmp/trace.log -- --skip-hidden /
 USAGE
 }
 
 build_mode=debug
 binary="./zig-out/bin/wtfs"
-trace_arg=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -30,10 +27,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --binary)
             binary="$2"
-            shift 2
-            ;;
-        --trace)
-            trace_arg="--trace-uring=$2"
             shift 2
             ;;
         --help)
@@ -75,7 +68,7 @@ perf_data="perf.data"
 rm -f "$perf_data"
 
 echo "[wtfs-profile] Running perf record..."
-perf record --call-graph dwarf --output "$perf_data" "$binary" ${trace_arg:+$trace_arg} "${wtfs_args[@]}"
+perf record --call-graph dwarf --output "$perf_data" "$binary" "${wtfs_args[@]}"
 
 cat <<REPORT
 

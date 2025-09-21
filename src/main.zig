@@ -7,7 +7,6 @@ comptime {
 
 const std = @import("std");
 const DiskScan = @import("DiskScan.zig");
-const Trace = @import("Trace.zig");
 const ascii = std.ascii;
 
 var stderr_buffer: [4096]u8 = undefined;
@@ -27,33 +26,13 @@ pub fn main() !void {
     else
         "wtfs";
 
-    if (args.len >= 2) {
-        const subcommand = std.mem.sliceTo(args[1], 0);
-        if (std.mem.eql(u8, subcommand, "trace-summary")) {
-            if (args.len < 3) {
-                try stderr.print("trace-summary requires a trace file path\n", .{});
-                try printUsage(exe_name);
-                return;
-            }
-
-            var stdout_buffer: [4096]u8 = undefined;
-            var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-            defer stdout_writer.end() catch {};
-
-            try Trace.summarizeFile(allocator, std.mem.sliceTo(args[2], 0), &stdout_writer.interface);
-            return;
-        }
-    }
-
     var skip_hidden = false;
     var root_arg: ?[]const u8 = null;
     var large_file_threshold = DiskScan.default_large_file_threshold;
     var binary_output: ?[]const u8 = null;
-    var trace_output: ?[]const u8 = null;
 
     const threshold_prefix = "--large-file-threshold=";
     const binary_prefix = "--binary-output=";
-    const trace_prefix = "--trace-uring=";
 
     defer stderr.flush() catch {};
 
@@ -62,14 +41,6 @@ pub fn main() !void {
         const arg = std.mem.sliceTo(args[arg_index], 0);
         if (std.mem.eql(u8, arg, "--skip-hidden")) {
             skip_hidden = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--trace-uring")) {
-            trace_output = "wtfs-uring.log";
-            continue;
-        }
-        if (std.mem.startsWith(u8, arg, trace_prefix)) {
-            trace_output = arg[trace_prefix.len..];
             continue;
         }
         if (std.mem.eql(u8, arg, "--binary-output")) {
@@ -126,7 +97,6 @@ pub fn main() !void {
         .skip_hidden = skip_hidden,
         .root = root,
         .large_file_threshold = large_file_threshold,
-        .trace_output = trace_output,
     };
 
     if (binary_output) |path| {
@@ -190,9 +160,8 @@ fn parseSize(value: []const u8) !u64 {
 
 fn printUsage(exe_name: []const u8) !void {
     try stderr.print(
-        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [--trace-uring[=PATH]] [dir]\n",
+        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [dir]\n",
         .{exe_name},
     );
     try stderr.print("       SIZE accepts optional K/M/G/T suffix (base 1024)\n", .{});
-    try stderr.print("       {s} trace-summary <trace.log>\n", .{exe_name});
 }
