@@ -5,6 +5,8 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const ShiftInt = std.math.Log2Int(usize);
 const MAX_SHELVES = @bitSizeOf(usize);
+const builtin = @import("builtin");
+const test_threads = @import("test_threading.zig");
 
 /// Shared storage for fabricating pointers to zero-sized fields.
 var zst_sentinel_byte: u8 = 0;
@@ -647,4 +649,135 @@ test "SegmentedMultiArray segmented view pointer edits" {
         sum += @as(i128, val);
     }
     try testing.expect(sum > 0);
+}
+
+test "SegmentedMultiArray concurrent reserveBlock" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const Row = struct { writer: usize, value: usize };
+    var thread_safe_allocator = std.heap.ThreadSafeAllocator{
+        .child_allocator = testing.allocator,
+    };
+    const alloc = thread_safe_allocator.allocator();
+
+    var sma = SegmentedMultiArray(Row, 0){};
+    defer sma.deinit(alloc);
+
+    const thread_count = 6;
+    const block = 1024;
+    const total = thread_count * block;
+
+    var group = try test_threads.ThreadTestGroup.init(thread_count);
+
+    const Worker = struct {
+        fn run(
+            thread_id: usize,
+            array: *SegmentedMultiArray(Row, 0),
+            allocator: Allocator,
+            block_count: usize,
+        ) void {
+            const base = array.reserveBlock(allocator, block_count) catch |err| {
+                std.debug.panic("reserveBlock failed: {s}", .{@errorName(err)});
+            };
+
+            for (0..block_count) |offset| {
+                const idx = base + offset;
+                array.ptr(.writer, idx).* = thread_id;
+                array.ptr(.value, idx).* = idx;
+            }
+        }
+    };
+
+    try group.spawnMany(6, Worker.run, .{ &sma, alloc, block });
+    group.wait();
+
+    try testing.expectEqual(@as(usize, total), sma.len.load(.acquire));
+
+    var seen = try testing.allocator.alloc(bool, total);
+    defer testing.allocator.free(seen);
+    @memset(seen, false);
+
+    var per_writer = [_]usize{0} ** thread_count;
+
+    for (0..total) |i| {
+        const row = sma.get(i);
+        try testing.expect(row.value < total);
+        try testing.expect(!seen[row.value]);
+        seen[row.value] = true;
+        try testing.expect(row.writer < thread_count);
+        per_writer[row.writer] += 1;
+    }
+
+    for (per_writer) |count| {
+        try testing.expectEqual(block, count);
+    }
+
+    for (seen) |flag| try testing.expect(flag);
+}
+
+test "SegmentedMultiArray concurrent addOne" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const Row = struct { writer: usize, value: usize };
+    var thread_safe_allocator = std.heap.ThreadSafeAllocator{
+        .child_allocator = testing.allocator,
+    };
+    const alloc = thread_safe_allocator.allocator();
+
+    var sma = SegmentedMultiArray(Row, 16){};
+    defer sma.deinit(alloc);
+
+    const thread_count = 4;
+    const per_thread = 2000;
+    const total = thread_count * per_thread;
+
+    var group = try test_threads.ThreadTestGroup.init(thread_count);
+
+    const Worker = struct {
+        fn run(
+            thread_id: usize,
+            array: *SegmentedMultiArray(Row, 16),
+            allocator: Allocator,
+            repeats: usize,
+        ) void {
+            for (0..repeats) |_| {
+                const idx = array.addOne(allocator) catch |err| {
+                    std.debug.panic("addOne failed: {s}", .{@errorName(err)});
+                };
+                array.ptr(.writer, idx).* = thread_id;
+                array.ptr(.value, idx).* = idx;
+            }
+        }
+    };
+
+    try group.spawnMany(thread_count, Worker.run, .{
+        &sma,
+        alloc,
+        per_thread,
+    });
+
+    group.wait();
+
+    try testing.expectEqual(@as(usize, total), sma.len.load(.acquire));
+
+    var seen = try testing.allocator.alloc(bool, total);
+    defer testing.allocator.free(seen);
+    @memset(seen, false);
+
+    var per_writer = [_]usize{0} ** thread_count;
+
+    for (0..total) |i| {
+        const row = sma.get(i);
+        try testing.expect(row.value < total);
+        try testing.expect(!seen[row.value]);
+        seen[row.value] = true;
+        try testing.expect(row.writer < thread_count);
+        per_writer[row.writer] += 1;
+    }
+
+    for (per_writer) |count| {
+        try testing.expectEqual(per_thread, count);
+    }
+
+    for (seen) |flag| try testing.expect(flag);
 }
