@@ -7,6 +7,7 @@ comptime {
 
 const std = @import("std");
 const DiskScan = @import("DiskScan.zig");
+const Trace = @import("Trace.zig");
 const ascii = std.ascii;
 
 var stderr_buffer: [4096]u8 = undefined;
@@ -25,6 +26,24 @@ pub fn main() !void {
         std.mem.sliceTo(args[0], 0)
     else
         "wtfs";
+
+    if (args.len >= 2) {
+        const subcommand = std.mem.sliceTo(args[1], 0);
+        if (std.mem.eql(u8, subcommand, "trace-summary")) {
+            if (args.len < 3) {
+                try stderr.print("trace-summary requires a trace file path\n", .{});
+                try printUsage(exe_name);
+                return;
+            }
+
+            var stdout_buffer: [4096]u8 = undefined;
+            var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+            defer stdout_writer.end() catch {};
+
+            try Trace.summarizeFile(allocator, std.mem.sliceTo(args[2], 0), &stdout_writer.interface);
+            return;
+        }
+    }
 
     var skip_hidden = false;
     var root_arg: ?[]const u8 = null;
@@ -175,4 +194,5 @@ fn printUsage(exe_name: []const u8) !void {
         .{exe_name},
     );
     try stderr.print("       SIZE accepts optional K/M/G/T suffix (base 1024)\n", .{});
+    try stderr.print("       {s} trace-summary <trace.log>\n", .{exe_name});
 }

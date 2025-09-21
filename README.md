@@ -164,6 +164,19 @@ Output:
 * src                               x96
 ```
 
+## io_uring trace summaries
+
+When running on Linux with `--trace-uring` enabled, wtfs writes a binary log of
+io_uring activity. You can generate a human-readable summary of this trace with
+the `trace-summary` subcommand:
+
+```bash
+./zig-out/bin/wtfs trace-summary wtfs-uring.log
+```
+
+The summary groups completions, fallbacks, queue drain activity, and cache hits,
+making it easier to understand io_uring behaviour during a scan.
+
 ## License
 
 MIT License - See [LICENSE](LICENSE) file for details.
