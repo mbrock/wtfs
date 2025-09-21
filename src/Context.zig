@@ -2,6 +2,7 @@ const std = @import("std");
 
 const strpool = @import("pool.zig");
 const TaskQueue = @import("TaskQueue.zig");
+const SysDispatcher = @import("SysDispatcher.zig");
 
 pub const DirectoryNode = struct {
     parent: u32,
@@ -48,6 +49,8 @@ errprogress: std.Progress.Node,
 
 skip_hidden: bool,
 large_file_threshold: u64,
+
+dispatcher: *SysDispatcher.Dispatcher,
 
 pub fn internPath(self: *Context, path: []const u8) !u32 {
     self.namelock.lock();

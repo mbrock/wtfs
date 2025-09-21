@@ -30,15 +30,27 @@ pub fn main() !void {
     var root_arg: ?[]const u8 = null;
     var large_file_threshold = DiskScan.default_large_file_threshold;
     var binary_output: ?[]const u8 = null;
+    var trace_output: ?[]const u8 = null;
 
     const threshold_prefix = "--large-file-threshold=";
     const binary_prefix = "--binary-output=";
+    const trace_prefix = "--trace-uring=";
+
+    defer stderr.flush() catch {};
 
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
         const arg = std.mem.sliceTo(args[arg_index], 0);
         if (std.mem.eql(u8, arg, "--skip-hidden")) {
             skip_hidden = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--trace-uring")) {
+            trace_output = "wtfs-uring.log";
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, trace_prefix)) {
+            trace_output = arg[trace_prefix.len..];
             continue;
         }
         if (std.mem.eql(u8, arg, "--binary-output")) {
@@ -95,6 +107,7 @@ pub fn main() !void {
         .skip_hidden = skip_hidden,
         .root = root,
         .large_file_threshold = large_file_threshold,
+        .trace_output = trace_output,
     };
 
     if (binary_output) |path| {
@@ -158,7 +171,7 @@ fn parseSize(value: []const u8) !u64 {
 
 fn printUsage(exe_name: []const u8) !void {
     try stderr.print(
-        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [dir]\n",
+        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [--trace-uring[=PATH]] [dir]\n",
         .{exe_name},
     );
     try stderr.print("       SIZE accepts optional K/M/G/T suffix (base 1024)\n", .{});

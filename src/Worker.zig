@@ -57,7 +57,7 @@ progress: std.Progress.Node,
 errprogress: std.Progress.Node,
 
 /// Platform syscall dispatcher used for directory opens and metadata
-dispatcher: SysDispatcher.Dispatcher,
+dispatcher: *SysDispatcher.Dispatcher,
 
 /// Buffers for various operations
 path_buffer: std.ArrayList(u8),
@@ -81,7 +81,7 @@ pub fn directoryWorker(ctx: *Context) void {
         .allocator = ctx.allocator,
         .progress = ctx.progress_node,
         .errprogress = ctx.errprogress,
-        .dispatcher = undefined,
+        .dispatcher = ctx.dispatcher,
         .path_buffer = std.ArrayList(u8){},
         .progress_buffer = undefined,
         .progress_writer = undefined,
@@ -90,10 +90,6 @@ pub fn directoryWorker(ctx: *Context) void {
         .timer = std.time.Timer.start() catch unreachable,
         .items_processed = 0,
     };
-    worker.dispatcher = SysDispatcher.Dispatcher.init(.{ .allocator = ctx.allocator, .entries = null }) catch |err| {
-        std.debug.panic("dispatcher init failed: {s}", .{@errorName(err)});
-    };
-    defer worker.dispatcher.deinit();
     defer worker.path_buffer.deinit(worker.allocator);
 
     worker.progress_writer = std.Io.Writer.fixed(&worker.progress_buffer);
@@ -210,7 +206,7 @@ fn scanDirectory(
     dir_fd: std.posix.fd_t,
     metrics: *ScanMetrics,
 ) !void {
-    var scanner = Scanner.init(dir_fd, &self.scan_buffer, &self.dispatcher);
+    var scanner = Scanner.init(dir_fd, &self.scan_buffer, self.dispatcher);
 
     self.ctx.retainParentFd(index);
     defer self.ctx.releaseParentFd(index);
