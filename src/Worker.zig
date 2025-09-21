@@ -294,11 +294,6 @@ fn processBatch(
     metrics: *ScanMetrics,
     node: std.Progress.Node,
 ) !void {
-    self.ctx.directories_mutex.lock();
-
-    var lock_released = false;
-    defer if (!lock_released) self.ctx.directories_mutex.unlock();
-
     var batch_entries: usize = 0;
     var batch_metrics = ScanMetrics{};
 
@@ -306,8 +301,6 @@ fn processBatch(
         const entrynode = node.start("entry", 0);
 
         const maybe_entry = scanner.next() catch |err| {
-            self.ctx.directories_mutex.unlock();
-            lock_released = true;
             return self.handleScanError(index, err);
         };
 
@@ -320,9 +313,6 @@ fn processBatch(
         try self.processEntry(index, entry, metrics, &batch_metrics);
         entrynode.end();
     }
-
-    self.ctx.directories_mutex.unlock();
-    lock_released = true;
 }
 
 fn processEntry(
@@ -342,8 +332,7 @@ fn processEntry(
         .dir => {
             if (self.ctx.skip_hidden and name[0] == '.') return;
             // Keep parent fd open until child task can openat() from it
-            // (We already hold the mutex in processBatch, so use the locked version)
-            self.ctx.retainParentFdLocked(index);
+            self.ctx.retainParentFd(index);
             const child_index = try self.addChild(index, name);
             try self.scheduleDirectory(child_index);
             batch_metrics.batch_dirs += 1;
@@ -355,7 +344,7 @@ fn processEntry(
             batch_metrics.batch_files += 1;
 
             if (file.allocsize >= self.ctx.large_file_threshold) {
-                try self.ctx.recordLargeFileLocked(index, name, file.allocsize);
+                try self.ctx.recordLargeFile(index, name, file.allocsize);
             }
         },
         .symlink => batch_metrics.batch_symlinks += 1,
@@ -363,9 +352,10 @@ fn processEntry(
     }
 }
 
-/// Caller must hold directories_mutex.
 pub fn addChild(self: *Worker, parent_index: usize, name: []const u8) !usize {
     const name_copy = try self.ctx.internPath(name);
+    self.ctx.directories_mutex.lock();
+    defer self.ctx.directories_mutex.unlock();
     const index = try self.ctx.directories.addOne(self.allocator);
     var slices = self.ctx.directories.slice();
     slices.items(.parent)[index] = @intCast(parent_index);

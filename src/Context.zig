@@ -148,6 +148,18 @@ pub fn recordLargeFileLocked(
     });
 }
 
+pub fn recordLargeFile(
+    self: *Context,
+    directory_index: usize,
+    name: []const u8,
+    size: u64,
+) !void {
+    self.directories_mutex.lock();
+    defer self.directories_mutex.unlock();
+
+    try self.recordLargeFileLocked(directory_index, name, size);
+}
+
 /// Decrement reference count and close fd if no longer needed (thread-safe)
 /// Call after opening a child directory or when done scanning
 pub fn releaseParentFd(self: *Context, parent_index: usize) void {
