@@ -553,27 +553,33 @@ fn generateSummary(self: *Self) !Summary {
 }
 
 fn reportResults(self: *Self, results: ScanResults, summary: Summary) !void {
-    try Reporter.printHeader(stdout, self.root, results);
-    try Reporter.printTopLevelDirectories(
-        &self.directories,
-        stdout,
-        results.totals,
-        summary.top_level.items,
-    );
-    try Reporter.printHeaviestDirectories(
-        self.allocator,
-        stdout,
+    const report_data = Reporter.ReportData.init(
         &self.directories,
         &self.namedata,
+        &self.idxset,
+        &self.large_files,
         results.totals,
+    );
+
+    var top_level = try Reporter.buildTopLevelSummary(
+        self.allocator,
+        report_data,
+        summary.top_level.items,
+        10,
+    );
+    defer top_level.deinit(self.allocator);
+
+    var heaviest = try Reporter.buildHeaviestSummary(
+        self.allocator,
+        report_data,
         summary.heaviest.items,
     );
-    try Reporter.printLargeFiles(
-        stdout,
-        results.totals,
-        summary.large_files.items,
-        self.large_file_threshold,
-    );
+    defer heaviest.deinit(self.allocator);
+
+    try Reporter.printHeader(stdout, self.root, results);
+    try Reporter.printTopLevelDirectories(stdout, report_data, top_level);
+    try Reporter.printHeaviestDirectories(stdout, report_data, heaviest);
+    try Reporter.printLargeFiles(stdout, report_data, summary.large_files.items, self.large_file_threshold);
     try stdout.flush();
 }
 
