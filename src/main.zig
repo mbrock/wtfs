@@ -1,3 +1,7 @@
+comptime {
+    _ = @import("TabWriter.zig");
+}
+
 const std = @import("std");
 const DiskScan = @import("DiskScan.zig");
 const ascii = std.ascii;

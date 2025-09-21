@@ -14,6 +14,8 @@ const Allocator = std.mem.Allocator;
 
 const TabWriter = Tabular.TabWriter;
 const Column = Tabular.Column;
+const BorderStyle = Tabular.BorderStyle;
+const TabWriterOptions = Tabular.Options;
 
 pub fn printHeader(stdout: *Writer, root: []const u8, results: ScanResults) !void {
     try stdout.print("{s}: {d} dirs, {d} files, {Bi:.1} total\n\n", .{
@@ -103,16 +105,26 @@ pub fn printTopLevelDirectories(stdout: *Writer, data: ReportData, summary: TopL
 
     try stdout.print("Top-level directories by total size:\n\n", .{});
 
-    var table = TabWriter.init(stdout, &[_]Column{
-        Column{ .width = 32 },
+    const header_label = "Directory";
+    const max_width: usize = 60;
+    var directory_width: usize = header_label.len;
+    for (summary.rows.items) |row| {
+        const candidate = if (row.path.len > max_width) max_width else row.path.len;
+        if (candidate > directory_width) directory_width = candidate;
+    }
+
+    var columns = [_]Column{
+        Column{ .width = directory_width },
         Column{ .width = 11, .alignment = .right },
         Column{ .width = 7, .alignment = .right },
         Column{ .width = 12, .alignment = .right },
         Column{ .width = 11, .alignment = .right },
-    });
+    };
+
+    var table = TabWriter.initWithOptions(stdout, columns[0..], .{ .style = BorderStyle.box });
 
     try table.writeHeader(&[_][]const u8{ "Directory", "Size", "Share", "Files", "Dirs" });
-    try table.writeSeparator('-');
+    try table.writeSeparator("─");
 
     for (summary.rows.items) |row| {
         var size_buf: [32]u8 = undefined;
@@ -127,8 +139,10 @@ pub fn printTopLevelDirectories(stdout: *Writer, data: ReportData, summary: TopL
         var dirs_buf: [32]u8 = undefined;
         const dirs_str = try formatCount(dirs_buf[0..], row.dirs);
 
+        const path_slice = sliceRight(row.path, directory_width);
+
         try table.writeRow(&[_][]const u8{
-            row.path,
+            path_slice,
             size_str,
             share_str,
             files_str,
@@ -136,6 +150,7 @@ pub fn printTopLevelDirectories(stdout: *Writer, data: ReportData, summary: TopL
         });
     }
 
+    try table.finish();
     try stdout.writeByte('\n');
 }
 
@@ -241,21 +256,37 @@ pub fn printHeaviestDirectories(stdout: *Writer, data: ReportData, summary: Heav
 
     try stdout.print("Heaviest directories in tree:\n\n", .{});
 
-    var table = TabWriter.init(stdout, &[_]Column{
-        Column{ .width = 32 },
+    const header_label = "Directory";
+    const max_width: usize = 64;
+    var label_width: usize = header_label.len;
+    for (summary.rows.items) |row| {
+        var indent = row.depth * 2;
+        const indent_cap = if (max_width == 0 or max_width == 1) 0 else max_width - 1;
+        if (indent > indent_cap) indent = indent_cap;
+        const raw_name = if (row.index == 0) "." else DiskScan.directoryName(data.directories, data.namedata, row.index);
+        const remaining = max_width - indent;
+        const name_take = if (remaining == 0) 0 else @min(raw_name.len, remaining);
+        const total = indent + name_take;
+        if (total > label_width) label_width = total;
+    }
+
+    var columns = [_]Column{
+        Column{ .width = label_width },
         Column{ .width = 11, .alignment = .right },
         Column{ .width = 7, .alignment = .right },
-    });
+    };
+
+    var table = TabWriter.initWithOptions(stdout, columns[0..], .{ .style = BorderStyle.box });
 
     try table.writeHeader(&[_][]const u8{ "Directory", "Size", "Share" });
-    try table.writeSeparator('-');
+    try table.writeSeparator("─");
 
     const slices = data.directories.slice();
     const sizes = slices.items(.total_size);
 
     for (summary.rows.items) |row| {
-        var name_buf: [128]u8 = undefined;
-        const label = formatDirectoryLabel(name_buf[0..], data, row.index, row.depth);
+        var label_buf: [128]u8 = undefined;
+        const label = formatDirectoryLabel(label_buf[0..label_width], data, row.index, row.depth, label_width);
 
         var size_buf: [32]u8 = undefined;
         const size_str = try formatBytes(size_buf[0..], sizes[row.index]);
@@ -266,6 +297,7 @@ pub fn printHeaviestDirectories(stdout: *Writer, data: ReportData, summary: Heav
         try table.writeRow(&[_][]const u8{ label, size_str, share_str });
     }
 
+    try table.finish();
     try stdout.writeByte('\n');
 }
 
@@ -282,14 +314,24 @@ pub fn printLargeFiles(
 
     try stdout.print("Largest files (>= {s})\n\n", .{threshold_str});
 
-    var table = TabWriter.init(stdout, &[_]Column{
+    const header_label = "Path";
+    const max_width: usize = 52;
+    var path_width: usize = header_label.len;
+    for (entries) |entry| {
+        const candidate = if (entry.path.len > max_width) max_width else entry.path.len;
+        if (candidate > path_width) path_width = candidate;
+    }
+
+    var columns = [_]Column{
         Column{ .width = 11, .alignment = .right },
         Column{ .width = 7, .alignment = .right },
-        Column{ .width = 0 },
-    });
+        Column{ .width = path_width },
+    };
+
+    var table = TabWriter.initWithOptions(stdout, columns[0..], .{ .style = BorderStyle.box });
 
     try table.writeHeader(&[_][]const u8{ "Size", "Share", "Path" });
-    try table.writeSeparator('-');
+    try table.writeSeparator("─");
 
     for (entries) |entry| {
         var size_buf: [32]u8 = undefined;
@@ -298,14 +340,18 @@ pub fn printLargeFiles(
         var share_buf: [16]u8 = undefined;
         const share_str = try formatPercent(share_buf[0..], entry.size, data.totals.bytes);
 
-        const path = entry.path;
-        const slice_start = if (path.len > 52) path.len - 52 else 0;
-        const path_slice = path[slice_start..];
+        const path_slice = sliceRight(entry.path, path_width);
 
         try table.writeRow(&[_][]const u8{ size_str, share_str, path_slice });
     }
 
+    try table.finish();
     try stdout.writeByte('\n');
+}
+
+fn sliceRight(value: []const u8, width: usize) []const u8 {
+    if (width == 0 or value.len <= width) return value;
+    return value[value.len - width ..];
 }
 
 fn appendHeaviest(
@@ -335,25 +381,27 @@ fn formatDirectoryLabel(
     data: ReportData,
     index: usize,
     depth: usize,
+    max_width: usize,
 ) []const u8 {
-    if (buffer.len == 0) return "";
+    if (buffer.len == 0 or max_width == 0) return "";
 
-    const indent_cap = if (buffer.len <= 1) 0 else buffer.len - 1;
-    const requested_indent = depth * 2;
-    const indent_len = if (requested_indent > indent_cap) indent_cap else requested_indent;
+    const limit = if (max_width > buffer.len) buffer.len else max_width;
+    if (limit == 0) return "";
 
-    if (indent_len != 0) {
-        var i: usize = 0;
-        while (i < indent_len) : (i += 1) {
-            buffer[i] = ' ';
-        }
+    var indent_len = depth * 2;
+    const indent_cap = if (limit <= 1) 0 else limit - 1;
+    if (indent_len > indent_cap) indent_len = indent_cap;
+
+    var i: usize = 0;
+    while (i < indent_len) : (i += 1) {
+        buffer[i] = ' ';
     }
 
     const raw_name = if (index == 0) "." else DiskScan.directoryName(data.directories, data.namedata, index);
-    const available = buffer.len - indent_len;
-    if (available == 0) return buffer[0..indent_len];
+    const remaining = limit - indent_len;
+    if (remaining == 0) return buffer[0..indent_len];
 
-    const slice_start = if (raw_name.len > available) raw_name.len - available else 0;
+    const slice_start = if (raw_name.len > remaining) raw_name.len - remaining else 0;
     const name_slice = raw_name[slice_start..];
     @memcpy(buffer[indent_len .. indent_len + name_slice.len], name_slice);
 
