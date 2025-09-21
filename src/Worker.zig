@@ -392,7 +392,7 @@ fn handleOpenError(
     err: anyerror,
 ) !std.posix.fd_t {
     switch (err) {
-        error.PermissionDenied, error.AccessDenied => {
+        error.PermissionDenied, error.AccessDenied, error.FileNotFound => {
             self.ctx.markInaccessible(index);
             return Context.invalid_fd;
         },

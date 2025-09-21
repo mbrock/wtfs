@@ -194,9 +194,20 @@ const LinuxBackend = if (use_linux) struct {
         self.sq_mutex.unlock();
 
         const cqe = self.awaitCompletion(token, 0) catch |err| return mapOpenSubmitError(err, parent_fd, name);
+
         if (self.trace) |trace| {
             trace.logCompletion("open", token, cqe.res);
         }
+
+        if (cqe.res < 0) {
+            const errno_linux: linux.E = @enumFromInt(@as(u32, @intCast(-cqe.res)));
+            const errno_posix: posix.E = @enumFromInt(@intFromEnum(errno_linux));
+            if (errno_posix == .BADF) {
+                if (self.trace) |trace| trace.logFallback("open", "cqe_badf");
+                return error.FileNotFound;
+            }
+        }
+
         return handleOpenResult(cqe.res);
     }
 
@@ -239,6 +250,10 @@ const LinuxBackend = if (use_linux) struct {
         if (cqe.res < 0) {
             const errno_linux: linux.E = @enumFromInt(@as(u32, @intCast(-cqe.res)));
             const errno_posix: posix.E = @enumFromInt(@intFromEnum(errno_linux));
+            if (errno_posix == .BADF) {
+                if (self.trace) |trace| trace.logFallback("stat", "cqe_badf");
+                return error.FileNotFound;
+            }
             return mapStatError(errno_posix);
         }
 
