@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const wtfs = @import("wtfs").mac;
-const strpool = @import("wtfs").strpool;
+const dirscan = @import("DirScanner.zig");
+const strpool = @import("pool.zig");
 
 const TaskQueue = @import("TaskQueue.zig");
 const Context = @import("Context.zig");
@@ -112,7 +112,9 @@ const PlatformConfig = struct {
     fn preventICloudDownload() void {
         if (builtin.target.os.tag == .macos) {
             // Forbid on-demand file content loading; don't pull in data from iCloud
-            switch (wtfs.setiopolicy_np(.vfs_materialize_dataless_files, .process, 1)) {
+            // macOS-only: keep Spotlight/iCloud from paging in file contents.
+            // Linux fast paths live in SysDispatcher/DirScanner instead.
+            switch (dirscan.setiopolicy_np(.vfs_materialize_dataless_files, .process, 1)) {
                 0 => {},
                 else => |rc| {
                     std.debug.panic("setiopolicy_np: {t}", .{std.posix.errno(rc)});

@@ -1,5 +1,5 @@
 const std = @import("std");
-const strpool = @import("wtfs").strpool;
+const strpool = @import("pool.zig");
 
 const Context = @import("Context.zig");
 const DiskScan = @import("DiskScan.zig");

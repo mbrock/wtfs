@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const strpool = @import("wtfs").strpool;
+const strpool = @import("pool.zig");
 const TaskQueue = @import("TaskQueue.zig");
 
 pub const DirectoryNode = struct {

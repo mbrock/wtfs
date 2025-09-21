@@ -1,6 +1,11 @@
+// DirScanner handles per-platform directory iteration. macOS gets the
+// getattrlistbulk fast path; other OSes presently fall back to readdir + stat.
+// Linux callers pass in a SysDispatcher so metadata can ride io_uring without
+// exposing those details to higher layers.
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const SysDispatcher = @import("SysDispatcher.zig");
 
 // ===== Darwin/macOS System Constants =====
 // From <sys/attr.h> and <sys/vnode.h>
@@ -154,49 +159,10 @@ pub extern "c" fn getattrlistbulk(
     options: FsOptMask,
 ) c_int;
 
-pub extern "c" fn openat(
-    dirfd: std.posix.fd_t,
-    path: [*:0]const u8,
-    flags: std.posix.O,
-    mode: std.posix.mode_t,
-) std.posix.fd_t;
-
 // ===== Public API =====
 
 /// Represents the type of a file system object
 pub const Kind = enum { file, dir, symlink, other };
-
-/// Open a subdirectory using openat() from a parent file descriptor
-/// This is used during directory traversal to avoid path construction
-pub fn openSubdirectory(
-    parent_fd: std.posix.fd_t,
-    name: [:0]const u8,
-) !std.posix.fd_t {
-    while (true) {
-        const fd = openat(parent_fd, name, .{
-            .NONBLOCK = true,
-            .DIRECTORY = true,
-            .NOFOLLOW = true,
-        }, 0);
-
-        if (fd < 0) {
-            switch (posix.errno(fd)) {
-                .INTR => continue, // Retry on interrupt
-                .BADF => return error.BadFileDescriptor,
-                .NOTDIR => return error.NotDir,
-                .NOENT => return error.FileNotFound,
-                .ACCES => return error.AccessDenied,
-                .PERM => return error.PermissionDenied,
-                .LOOP => return error.TooManySymlinks,
-                .NAMETOOLONG => return error.NameTooLong,
-                .IO => return error.IOError,
-                else => |e| std.debug.panic("unexpected errno {t}", .{e}),
-            }
-        }
-
-        return fd;
-    }
-}
 
 // ===== Type Generation Helpers =====
 
@@ -265,17 +231,39 @@ pub fn EntryFor(mask: AttrGroupMask) type {
 /// Creates a directory scanner type that efficiently iterates over directory entries
 /// On macOS: Uses getattrlistbulk for batched, high-performance scanning
 /// On other platforms: Falls back to standard POSIX directory iteration
+const DefaultStatProvider = struct {
+    pub const ContextType = void;
+
+    pub fn statAt(_: ContextType, dir_fd: std.posix.fd_t, name: [:0]const u8) posix.FStatAtError!posix.Stat {
+        return posix.fstatat(dir_fd, name, 0);
+    }
+};
+
+pub const DispatcherStatProvider = struct {
+    pub const ContextType = *SysDispatcher.Dispatcher;
+
+    pub fn statAt(dispatcher: ContextType, dir_fd: std.posix.fd_t, name: [:0]const u8) posix.FStatAtError!posix.Stat {
+        // TODO: Once getdents rides io_uring, we can collapse the remaining
+        // synchronous pieces that still live in Worker.refill.
+        return dispatcher.statAt(dir_fd, name);
+    }
+};
+
 pub fn DirScanner(mask: AttrGroupMask) type {
+    return DirScannerWithProvider(mask, DefaultStatProvider);
+}
+
+pub fn DirScannerWithProvider(mask: AttrGroupMask, comptime Provider: type) type {
     if (builtin.target.os.tag == .macos) {
-        return MacOSDirScanner(mask);
+        return MacOSDirScanner(mask, Provider);
     } else {
-        return PosixDirScanner(mask);
+        return PosixDirScanner(mask, Provider);
     }
 }
 
 // ===== macOS Implementation =====
 
-fn MacOSDirScanner(mask: AttrGroupMask) type {
+fn MacOSDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
     return struct {
         pub const Payload = PayloadFor(mask);
         pub const Entry = EntryFor(mask);
@@ -284,15 +272,17 @@ fn MacOSDirScanner(mask: AttrGroupMask) type {
         fd: std.posix.fd_t,
         reader: std.io.Reader,
         buf: []u8,
+        provider_ctx: Provider.ContextType,
         n: usize = 0, // Number of entries in current batch
 
         /// Initialize a new scanner with a directory file descriptor and buffer
         /// The buffer will be used for storing the bulk attribute results
-        pub fn init(fd: std.posix.fd_t, buf: []u8) @This() {
+        pub fn init(fd: std.posix.fd_t, buf: []u8, provider_ctx: Provider.ContextType) @This() {
             return .{
                 .fd = fd,
                 .reader = std.io.Reader.fixed(buf),
                 .buf = buf,
+                .provider_ctx = provider_ctx,
             };
         }
 
@@ -425,7 +415,7 @@ fn MacOSDirScanner(mask: AttrGroupMask) type {
 
 // ===== POSIX Fallback Implementation =====
 
-fn PosixDirScanner(mask: AttrGroupMask) type {
+fn PosixDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
     return struct {
         pub const Payload = PayloadFor(mask);
         pub const Entry = EntryFor(mask);
@@ -441,14 +431,16 @@ fn PosixDirScanner(mask: AttrGroupMask) type {
         dir: std.fs.Dir,
         iterator: std.fs.Dir.Iterator,
         buf: []u8,
+        provider_ctx: Provider.ContextType,
         pending_entry: ?Entry = null,
 
         /// Initialize a new scanner with a directory file descriptor and buffer
-        pub fn init(fd: std.posix.fd_t, buf: []u8) @This() {
+        pub fn init(fd: std.posix.fd_t, buf: []u8, provider_ctx: Provider.ContextType) @This() {
             var scanner = @This(){
                 .dir = .{ .fd = fd },
                 .iterator = undefined,
                 .buf = buf,
+                .provider_ctx = provider_ctx,
             };
             scanner.iterator = scanner.dir.iterateAssumeFirstIteration();
             return scanner;
@@ -468,7 +460,7 @@ fn PosixDirScanner(mask: AttrGroupMask) type {
 
         /// Stat a file relative to our directory
         fn statAt(self: *@This(), name: [:0]const u8) !posix.Stat {
-            return try posix.fstatat(self.dir.fd, name, 0);
+            return try Provider.statAt(self.provider_ctx, self.dir.fd, name);
         }
 
         /// Fetch the next directory entry from the iterator
@@ -611,7 +603,7 @@ test "POSIX DirScanner iterates entries with requested metadata" {
     var iterable_dir = try tmp.dir.openDir(".", .{ .iterate = true });
     const dup_fd = try std.posix.dup(iterable_dir.fd);
     iterable_dir.close();
-    var scanner = Scanner.init(dup_fd, name_buf[0..]);
+    var scanner = Scanner.init(dup_fd, name_buf[0..], @as(void, {}));
     defer scanner.dir.close();
 
     var saw_file = false;
@@ -656,7 +648,7 @@ test "POSIX DirScanner copyName reports buffer exhaustion" {
     var iterable_dir = try tmp.dir.openDir(".", .{ .iterate = true });
     const dup_fd = try std.posix.dup(iterable_dir.fd);
     iterable_dir.close();
-    var scanner = Scanner.init(dup_fd, tiny_buf[0..]);
+    var scanner = Scanner.init(dup_fd, tiny_buf[0..], @as(void, {}));
     defer scanner.dir.close();
 
     try std.testing.expectError(error.BufferTooSmall, scanner.copyName("long"));

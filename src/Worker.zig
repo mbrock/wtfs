@@ -1,13 +1,18 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const posix = std.posix;
 const Context = @import("Context.zig");
-const wtfs = @import("wtfs").mac;
+const dirscan = @import("DirScanner.zig");
+const SysDispatcher = @import("SysDispatcher.zig");
 
 const Worker = @This();
 
 // ===== Configuration =====
 
 /// Scanner configured to read names, object types, and file sizes.
-const Scanner = wtfs.DirScanner(.{
+/// On Linux the provider points at the dispatcher so statx can run via
+/// io_uring, otherwise it collapses to the POSIX defaults.
+const Scanner = dirscan.DirScannerWithProvider(.{
     .common = .{
         .name = true,
         .objtype = true,
@@ -19,7 +24,7 @@ const Scanner = wtfs.DirScanner(.{
         .totalsize = false,
         .allocsize = true,
     },
-});
+}, dirscan.DispatcherStatProvider);
 
 // ===== Types =====
 
@@ -51,6 +56,9 @@ progress: std.Progress.Node,
 /// Separate global error progress node
 errprogress: std.Progress.Node,
 
+/// Platform syscall dispatcher used for directory opens and metadata
+dispatcher: SysDispatcher.Dispatcher,
+
 /// Buffers for various operations
 path_buffer: std.ArrayList(u8),
 progress_buffer: [256]u8,
@@ -73,6 +81,7 @@ pub fn directoryWorker(ctx: *Context) void {
         .allocator = ctx.allocator,
         .progress = ctx.progress_node,
         .errprogress = ctx.errprogress,
+        .dispatcher = undefined,
         .path_buffer = std.ArrayList(u8){},
         .progress_buffer = undefined,
         .progress_writer = undefined,
@@ -81,6 +90,10 @@ pub fn directoryWorker(ctx: *Context) void {
         .timer = std.time.Timer.start() catch unreachable,
         .items_processed = 0,
     };
+    worker.dispatcher = SysDispatcher.Dispatcher.init(.{ .allocator = ctx.allocator, .entries = null }) catch |err| {
+        std.debug.panic("dispatcher init failed: {s}", .{@errorName(err)});
+    };
+    defer worker.dispatcher.deinit();
     defer worker.path_buffer.deinit(worker.allocator);
 
     worker.progress_writer = std.Io.Writer.fixed(&worker.progress_buffer);
@@ -153,7 +166,7 @@ fn openChildDirectory(
 ) !std.posix.fd_t {
     const parent_index = self.ctx.directories.items(.parent)[index];
     const parent = self.ctx.directories.items(.fd)[parent_index];
-    const opened = wtfs.openSubdirectory(parent, basename);
+    const opened = self.dispatcher.openDirectory(parent, basename);
 
     // We've successfully used the parent fd for openat(), release our reference
     self.ctx.releaseParentFdAfterOpen(parent_index);
@@ -172,11 +185,7 @@ fn openRootDirectory(
     basename: [:0]const u8,
 ) !std.posix.fd_t {
     const fd = self.ctx.directories.items(.fd)[index];
-    const opened = std.posix.openat(fd, basename, .{
-        .NONBLOCK = true,
-        .DIRECTORY = true,
-        .NOFOLLOW = true,
-    }, 0) catch |err| switch (err) {
+    const opened = self.dispatcher.openDirectory(fd, basename) catch |err| switch (err) {
         error.PermissionDenied, error.AccessDenied => {
             self.progress.completeOne();
             self.ctx.markInaccessible(index);
@@ -201,7 +210,7 @@ fn scanDirectory(
     dir_fd: std.posix.fd_t,
     metrics: *ScanMetrics,
 ) !void {
-    var scanner = Scanner.init(dir_fd, &self.scan_buffer);
+    var scanner = Scanner.init(dir_fd, &self.scan_buffer, &self.dispatcher);
 
     self.ctx.retainParentFd(index);
     defer self.ctx.releaseParentFd(index);
@@ -210,11 +219,19 @@ fn scanDirectory(
     defer node.end();
 
     while (true) {
-        if (scanner.n == 0) self.refill(&scanner, node) catch |err| {
-            return self.handleScanError(index, err);
-        };
-        if (scanner.n == 0) break;
-        node.increaseEstimatedTotalItems(scanner.n);
+        if (comptime builtin.target.os.tag == .macos) {
+            if (scanner.n == 0) self.refill(&scanner, node) catch |err| {
+                return self.handleScanError(index, err);
+            };
+            if (scanner.n == 0) break;
+            node.increaseEstimatedTotalItems(scanner.n);
+        } else {
+            // Non-macOS: the scanner may be backed by an async dispatcher. We
+            // still refill synchronously for now, but once getdents runs on the
+            // ring this loop should continue to work unchanged.
+            if (!(try scanner.fill())) break;
+            node.increaseEstimatedTotalItems(1);
+        }
 
         try self.processBatch(index, &scanner, metrics, node);
     }
@@ -222,14 +239,18 @@ fn scanDirectory(
 
 /// Fetch a new batch of entries from the kernel
 fn refill(self: *Worker, scanner: *Scanner, node: std.Progress.Node) !void {
-    const opts_mask = wtfs.FsOptMask{
+    if (comptime builtin.target.os.tag != .macos) {
+        return;
+    }
+
+    const opts_mask = dirscan.FsOptMask{
         .nofollow = true,
         .report_fullsize = true,
         .pack_invalid_attrs = true,
     };
 
-    var al = wtfs.AttrList{
-        .bitmapcount = wtfs.ATTR_BIT_MAP_COUNT,
+    var al = dirscan.AttrList{
+        .bitmapcount = dirscan.ATTR_BIT_MAP_COUNT,
         .reserved = 0,
         .attrs = Scanner.Mask,
     };
@@ -241,7 +262,7 @@ fn refill(self: *Worker, scanner: *Scanner, node: std.Progress.Node) !void {
         self.progress_writer.print("fill #{d:<4} {d}K", .{ i, scanner.buf.len / 1024 }) catch unreachable;
         self.progress_writer = undefined;
 
-        const n = wtfs.getattrlistbulk(scanner.fd, &al, scanner.buf.ptr, scanner.buf.len, opts_mask);
+        const n = dirscan.getattrlistbulk(scanner.fd, &al, scanner.buf.ptr, scanner.buf.len, opts_mask);
         node.completeOne();
 
         i += 1;
