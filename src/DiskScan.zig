@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dirscan = @import("DirScanner.zig");
 const strpool = @import("pool.zig");
+const Trace = @import("Trace.zig");
 
 const TaskQueue = @import("TaskQueue.zig");
 const Context = @import("Context.zig");
@@ -188,25 +189,26 @@ fn gatherPhase(self: *Self) !void {
 
     var trace_buffer: [8 * 1024]u8 = undefined;
     var trace_file: ?std.fs.File = null;
-    var trace_writer_storage: std.fs.File.Writer = undefined;
-    var trace_sink_storage: SysDispatcher.TraceSink = undefined;
+    var trace_stream: std.fs.File.Writer = undefined;
+    var trace_writer: Trace.Writer = undefined;
     var trace_enabled = false;
-    var trace_sink_ptr: ?*SysDispatcher.TraceSink = null;
+    var trace_ptr: ?*Trace.Writer = null;
     if (self.trace_output) |trace_path| {
         var file = try std.fs.cwd().createFile(trace_path, .{ .truncate = true, .read = false });
-        trace_writer_storage = file.writer(trace_buffer[0..]);
-        trace_sink_storage = SysDispatcher.TraceSink.init(&trace_writer_storage.interface);
+        trace_stream = file.writer(trace_buffer[0..]);
+        trace_writer = try Trace.Writer.init(self.allocator, &trace_stream.interface);
         trace_file = file;
-        trace_sink_ptr = &trace_sink_storage;
+        trace_ptr = &trace_writer;
         trace_enabled = true;
     }
     defer if (trace_file) |file| file.close();
-    defer if (trace_enabled) trace_writer_storage.end() catch {};
+    defer if (trace_enabled) trace_stream.end() catch {};
+    defer if (trace_enabled) trace_writer.deinit();
 
     var dispatcher = SysDispatcher.Dispatcher.init(.{
         .allocator = self.allocator,
         .entries = null,
-        .trace = trace_sink_ptr,
+        .trace = trace_ptr,
     }) catch |err| {
         std.debug.panic("dispatcher init failed: {s}", .{@errorName(err)});
     };

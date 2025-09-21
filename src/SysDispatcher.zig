@@ -8,78 +8,15 @@ const posix = std.posix;
 
 const use_linux = builtin.target.os.tag == .linux;
 const linux = std.os.linux;
-const Io = std.Io;
 const mem = std.mem;
 const AutoHashMap = std.AutoHashMap;
 const AtomicU64 = std.atomic.Value(u64);
+const Trace = @import("Trace.zig");
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
     entries: ?u16 = null,
-    trace: ?*TraceSink = null,
-};
-
-pub const TraceSink = struct {
-    mutex: std.Thread.Mutex = .{},
-    writer: *Io.Writer,
-
-    pub fn init(writer: *Io.Writer) TraceSink {
-        return .{ .writer = writer };
-    }
-
-    fn line(self: *TraceSink, comptime fmt_string: []const u8, args: anytype) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.writer.print(fmt_string, args) catch return;
-        self.writer.writeByte('\n') catch return;
-    }
-
-    pub fn logSubmitOpen(self: *TraceSink, token: u64, parent_fd: posix.fd_t, name: []const u8) void {
-        self.line("submit kind=open token={d} parent_fd={d} name=\"{s}\"", .{ token, parent_fd, name });
-    }
-
-    pub fn logSubmitStat(self: *TraceSink, token: u64, dir_fd: posix.fd_t, name: []const u8) void {
-        self.line("submit kind=stat token={d} dir_fd={d} name=\"{s}\"", .{ token, dir_fd, name });
-    }
-
-    pub fn logFallback(self: *TraceSink, kind: []const u8, reason: []const u8) void {
-        self.line("fallback kind={s} reason={s}", .{ kind, reason });
-    }
-
-    pub fn logDrain(
-        self: *TraceSink,
-        token: u64,
-        wait_nr: u32,
-        total: usize,
-        matched: bool,
-        others: usize,
-        sample: []const u64,
-    ) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.writer.print(
-            "drain token={d} wait={d} count={d} matched={s}",
-            .{ token, wait_nr, total, if (matched) "true" else "false" },
-        ) catch return;
-        if (others > 0) {
-            self.writer.print(" others_total={d} sample=", .{others}) catch return;
-            self.writer.writeByte('[') catch return;
-            for (sample, 0..) |value, idx| {
-                if (idx != 0) self.writer.writeByte(',') catch return;
-                self.writer.print("{d}", .{value}) catch return;
-            }
-            self.writer.writeByte(']') catch return;
-        }
-        self.writer.writeByte('\n') catch return;
-    }
-
-    pub fn logCacheHit(self: *TraceSink, token: u64, res: i32) void {
-        self.line("cache_hit token={d} res={d}", .{ token, res });
-    }
-
-    pub fn logCompletion(self: *TraceSink, kind: []const u8, token: u64, res: i32) void {
-        self.line("completion kind={s} token={d} res={d}", .{ kind, token, res });
-    }
+    trace: ?*Trace.Writer = null,
 };
 
 const Backend = switch (builtin.target.os.tag) {
@@ -142,7 +79,7 @@ const LinuxBackend = if (use_linux) struct {
     pending_mutex: std.Thread.Mutex = .{},
     pending: AutoHashMap(u64, linux.io_uring_cqe),
     next_user_data: AtomicU64,
-    trace: ?*TraceSink,
+    trace: ?*Trace.Writer,
 
     pub fn init(config: Config) !LinuxBackend {
         const entries = config.entries orelse 128;
@@ -168,9 +105,7 @@ const LinuxBackend = if (use_linux) struct {
         self.sq_mutex.lock();
         var sqe = self.ring.get_sqe() catch |err| {
             self.sq_mutex.unlock();
-            if (self.trace) |trace| {
-                trace.logFallback("open", "sq_full");
-            }
+            if (self.trace) |trace| trace.logFallback(.open, "sq_full");
             return switch (err) {
                 error.SubmissionQueueFull => posix.openat(parent_fd, name, SyncBackend.directoryFlags(), 0),
             };
@@ -180,30 +115,24 @@ const LinuxBackend = if (use_linux) struct {
         sqe.prep_openat(dir_fd, name.ptr, directoryLinuxFlags(), 0);
         sqe.user_data = token;
 
-        if (self.trace) |trace| {
-            trace.logSubmitOpen(token, parent_fd, mem.sliceTo(name, 0));
-        }
+        if (self.trace) |trace| trace.logSubmitOpen(token, parent_fd, mem.sliceTo(name, 0));
 
         _ = self.ring.submit_and_wait(1) catch |err| {
             self.sq_mutex.unlock();
-            if (self.trace) |trace| {
-                trace.logFallback("open", @errorName(err));
-            }
+            if (self.trace) |trace| trace.logFallback(.open, @errorName(err));
             return mapOpenSubmitError(err, parent_fd, name);
         };
         self.sq_mutex.unlock();
 
         const cqe = self.awaitCompletion(token, 0) catch |err| return mapOpenSubmitError(err, parent_fd, name);
 
-        if (self.trace) |trace| {
-            trace.logCompletion("open", token, cqe.res);
-        }
+        if (self.trace) |trace| trace.logCompletion(.open, token, cqe.res);
 
         if (cqe.res < 0) {
             const errno_linux: linux.E = @enumFromInt(@as(u32, @intCast(-cqe.res)));
             const errno_posix: posix.E = @enumFromInt(@intFromEnum(errno_linux));
             if (errno_posix == .BADF) {
-                if (self.trace) |trace| trace.logFallback("open", "cqe_badf");
+                if (self.trace) |trace| trace.logFallback(.open, "cqe_badf");
                 return error.FileNotFound;
             }
         }
@@ -217,9 +146,7 @@ const LinuxBackend = if (use_linux) struct {
         self.sq_mutex.lock();
         var sqe = self.ring.get_sqe() catch |err| {
             self.sq_mutex.unlock();
-            if (self.trace) |trace| {
-                trace.logFallback("stat", "sq_full");
-            }
+            if (self.trace) |trace| trace.logFallback(.stat, "sq_full");
             return switch (err) {
                 error.SubmissionQueueFull => posix.fstatat(dir_fd, name, 0),
             };
@@ -230,28 +157,22 @@ const LinuxBackend = if (use_linux) struct {
         sqe.prep_statx(fd, name.ptr, 0, linux.STATX_BASIC_STATS, &statx_buf);
         sqe.user_data = token;
 
-        if (self.trace) |trace| {
-            trace.logSubmitStat(token, dir_fd, mem.sliceTo(name, 0));
-        }
+        if (self.trace) |trace| trace.logSubmitStat(token, dir_fd, mem.sliceTo(name, 0));
 
         _ = self.ring.submit_and_wait(1) catch |err| {
             self.sq_mutex.unlock();
-            if (self.trace) |trace| {
-                trace.logFallback("stat", @errorName(err));
-            }
+            if (self.trace) |trace| trace.logFallback(.stat, @errorName(err));
             return mapStatSubmitError(err, dir_fd, name);
         };
         self.sq_mutex.unlock();
 
         const cqe = self.awaitCompletion(token, 0) catch |err| return mapStatSubmitError(err, dir_fd, name);
-        if (self.trace) |trace| {
-            trace.logCompletion("stat", token, cqe.res);
-        }
+        if (self.trace) |trace| trace.logCompletion(.stat, token, cqe.res);
         if (cqe.res < 0) {
             const errno_linux: linux.E = @enumFromInt(@as(u32, @intCast(-cqe.res)));
             const errno_posix: posix.E = @enumFromInt(@intFromEnum(errno_linux));
             if (errno_posix == .BADF) {
-                if (self.trace) |trace| trace.logFallback("stat", "cqe_badf");
+                if (self.trace) |trace| trace.logFallback(.stat, "cqe_badf");
                 return error.FileNotFound;
             }
             return mapStatError(errno_posix);
@@ -317,8 +238,6 @@ const LinuxBackend = if (use_linux) struct {
     ) !?linux.io_uring_cqe {
         var result: ?linux.io_uring_cqe = null;
         var other_count: usize = 0;
-        var sample_buf: [4]u64 = undefined;
-        var sample_len: usize = 0;
 
         self.pending_mutex.lock();
         for (cqes) |cqe| {
@@ -327,17 +246,11 @@ const LinuxBackend = if (use_linux) struct {
             } else {
                 self.pending.putAssumeCapacity(cqe.user_data, cqe);
                 other_count += 1;
-                if (sample_len < sample_buf.len) {
-                    sample_buf[sample_len] = cqe.user_data;
-                    sample_len += 1;
-                }
             }
         }
         self.pending_mutex.unlock();
 
-        if (self.trace) |trace| {
-            trace.logDrain(token, wait_nr, cqes.len, result != null, other_count, sample_buf[0..sample_len]);
-        }
+        if (self.trace) |trace| trace.logDrain(token, wait_nr, cqes.len, result != null, other_count);
 
         return result;
     }
@@ -348,9 +261,7 @@ const LinuxBackend = if (use_linux) struct {
         self.pending_mutex.unlock();
 
         if (entry) |hit| {
-            if (self.trace) |trace| {
-                trace.logCacheHit(token, hit.value.res);
-            }
+            if (self.trace) |trace| trace.logCacheHit(token, hit.value.res);
             return hit.value;
         }
         return null;
