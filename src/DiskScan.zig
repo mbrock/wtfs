@@ -278,8 +278,8 @@ test "path helpers use shared directory data" {
     slices.items(.parent)[child_index] = @intCast(root_index);
     slices.items(.basename)[child_index] = @intCast(child_name_offset);
 
-    try std.testing.expectEqualStrings("root", disk_scan.directoryName(root_index));
-    try std.testing.expectEqualStrings("child", disk_scan.directoryName(child_index));
+    try std.testing.expectEqualStrings("root", directoryName(&disk_scan.directories, &disk_scan.namedata, root_index));
+    try std.testing.expectEqualStrings("child", directoryName(&disk_scan.directories, &disk_scan.namedata, child_index));
 
     var root_buffer: [32]u8 = undefined;
     var root_writer = std.Io.Writer.fixed(&root_buffer);

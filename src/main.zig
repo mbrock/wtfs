@@ -1,5 +1,8 @@
 comptime {
     _ = @import("TabWriter.zig");
+    _ = @import("DiskScan.zig");
+    _ = @import("DirScanner.zig");
+    _ = @import("SysDispatcher.zig");
 }
 
 const std = @import("std");

@@ -2,6 +2,8 @@ const std = @import("std");
 
 const extra_targets = [_]std.Target.Query{
     .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
+    // .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
+    // .{ .cpu_arch = .x86_64, .os_tag = .freebsd },
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
 };
 
@@ -22,6 +24,7 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(exe);
 
+    const test_step = b.step("test", "Run tests");
     inline for (extra_targets) |query| {
         const resolved = b.resolveTargetQuery(query);
 
@@ -41,6 +44,17 @@ pub fn build(b: *std.Build) !void {
             .dest_dir = .{ .override = .{ .custom = triple } },
         });
         b.getInstallStep().dependOn(&install.step);
+
+        const tests = b.addTest(.{
+            .root_module = cross_module,
+        });
+        const run_tests = b.addRunArtifact(tests);
+        run_tests.skip_foreign_checks = true;
+
+        test_step.dependOn(&run_tests.step);
+        const stepname = std.fmt.allocPrint(b.allocator, "test-{s}", .{triple}) catch unreachable;
+        const xtest_step = b.step(stepname, stepname);
+        xtest_step.dependOn(&run_tests.step);
     }
 
     _ = b.step("run", "Run the app");
