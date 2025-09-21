@@ -1,5 +1,6 @@
 const std = @import("std");
-const TabWriter = @import("TabWriter.zig");
+const Tabular = @import("TabWriter.zig");
+const TabWriter = Tabular.TabWriter;
 
 pub const magic: u32 = 0x52545457; // "WTTR"
 pub const version: u16 = 1;
@@ -295,7 +296,7 @@ pub const Reader = struct {
 
     pub fn next(self: *Reader) !?Event {
         if (self.exhausted) return null;
-        self.arena.reset(.retain_capacity);
+        _ = self.arena.reset(.retain_capacity);
 
         const record = self.reader.takeStruct(EventRecord, .little) catch |err| switch (err) {
             error.EndOfStream => {
@@ -305,8 +306,9 @@ pub const Reader = struct {
             else => return err,
         };
 
-        return switch (record.payload) {
-            .submit => |data| blk: {
+        return switch (record.tag) {
+            .submit => blk: {
+                const data = record.payload.submit;
                 const name = try self.readBytes(data.name_len);
                 break :blk Event{ .submit = .{
                     .timestamp_ns = record.timestamp_ns,
@@ -316,7 +318,8 @@ pub const Reader = struct {
                     .name = name,
                 } };
             },
-            .completion => |data| blk: {
+            .completion => blk: {
+                const data = record.payload.completion;
                 const duration = if (data.duration_ns == std.math.maxInt(u64)) null else data.duration_ns;
                 break :blk Event{ .completion = .{
                     .timestamp_ns = record.timestamp_ns,
@@ -326,7 +329,8 @@ pub const Reader = struct {
                     .duration_ns = duration,
                 } };
             },
-            .fallback => |data| blk: {
+            .fallback => blk: {
+                const data = record.payload.fallback;
                 const reason = try self.readBytes(data.reason_len);
                 break :blk Event{ .fallback = .{
                     .timestamp_ns = record.timestamp_ns,
@@ -334,7 +338,8 @@ pub const Reader = struct {
                     .reason = reason,
                 } };
             },
-            .drain => |data| blk: {
+            .drain => blk: {
+                const data = record.payload.drain;
                 break :blk Event{ .drain = .{
                     .timestamp_ns = record.timestamp_ns,
                     .token = record.token,
@@ -344,7 +349,8 @@ pub const Reader = struct {
                     .others = data.others,
                 } };
             },
-            .cache_hit => |data| blk: {
+            .cache_hit => blk: {
+                const data = record.payload.cache_hit;
                 break :blk Event{ .cache_hit = .{
                     .timestamp_ns = record.timestamp_ns,
                     .token = record.token,
@@ -355,9 +361,9 @@ pub const Reader = struct {
     }
 
     fn readBytes(self: *Reader, len: u32) ![]const u8 {
-        if (len == 0) return &[]u8{};
+        if (len == 0) return &[_]u8{};
         const buf = try self.arena.allocator().alloc(u8, len);
-        try self.reader.readNoEof(buf);
+        try self.reader.*.readSliceAll(buf);
         return buf;
     }
 };
@@ -367,10 +373,11 @@ pub fn summarizeFile(
     path: []const u8,
     stdout: *std.Io.Writer,
 ) !void {
-    var file = try std.fs.cwd().openFile(path, .{ .read = true });
+    var file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
     defer file.close();
 
-    var reader_iface = file.reader();
+    var reader_buffer: [8 * 1024]u8 = undefined;
+    var reader_iface = file.reader(reader_buffer[0..]);
     var trace_reader = try Reader.init(allocator, &reader_iface.interface);
     defer trace_reader.deinit();
 
@@ -470,7 +477,7 @@ pub fn summarizeFile(
         }
     }
 
-    var duration_columns = [_]TabWriter.Column{
+    var duration_columns = [_]Tabular.Column{
         .{ .width = 10 },
         .{ .width = 10, .alignment = .right },
         .{ .width = 12, .alignment = .right },
@@ -521,7 +528,7 @@ pub fn summarizeFile(
     try duration_table.finish();
     try stdout.writeByte('\n');
 
-    var result_columns = [_]TabWriter.Column{
+    var result_columns = [_]Tabular.Column{
         .{ .width = 10 },
         .{ .width = 10, .alignment = .right },
         .{ .width = 10, .alignment = .right },
@@ -532,18 +539,19 @@ pub fn summarizeFile(
     try result_table.writeHeader(&[_][]const u8{ "Operation", "Result", "Count" });
     try result_table.writeSeparator("-");
 
-    var result_entries = std.ArrayList(struct { res: i32, count: usize }).init(allocator);
-    defer result_entries.deinit();
+    const ResultEntry = struct { res: i32, count: usize };
+    var result_entries = std.ArrayList(ResultEntry){};
+    defer result_entries.deinit(allocator);
 
-    for (result_maps, 0..) |*map, idx| {
+    for (&result_maps, 0..) |map, idx| {
         result_entries.clearRetainingCapacity();
         var it = map.iterator();
         while (it.next()) |entry| {
-            try result_entries.append(.{ .res = entry.key_ptr.*, .count = entry.value_ptr.* });
+            try result_entries.append(allocator, .{ .res = entry.key_ptr.*, .count = entry.value_ptr.* });
         }
 
-        std.sort.sort(struct { res: i32, count: usize }, result_entries.items, {}, struct {
-            fn lessThan(_: void, lhs: struct { res: i32, count: usize }, rhs: struct { res: i32, count: usize }) bool {
+        std.sort.heap(ResultEntry, result_entries.items, {}, struct {
+            fn lessThan(_: void, lhs: ResultEntry, rhs: ResultEntry) bool {
                 return lhs.res < rhs.res;
             }
         }.lessThan);
@@ -566,7 +574,7 @@ pub fn summarizeFile(
     try stdout.writeByte('\n');
 
     try stdout.writeAll("Fallbacks\n");
-    var fallback_columns = [_]TabWriter.Column{
+    var fallback_columns = [_]Tabular.Column{
         .{ .width = 10 },
         .{ .width = 20 },
         .{ .width = 10, .alignment = .right },
@@ -575,18 +583,19 @@ pub fn summarizeFile(
     try fallback_table.writeHeader(&[_][]const u8{ "Operation", "Reason", "Count" });
     try fallback_table.writeSeparator("-");
 
-    var reason_entries = std.ArrayList(struct { reason: []const u8, count: usize }).init(allocator);
-    defer reason_entries.deinit();
+    const ReasonEntry = struct { reason: []const u8, count: usize };
+    var reason_entries = std.ArrayList(ReasonEntry){};
+    defer reason_entries.deinit(allocator);
 
-    for (fallback_maps, 0..) |*map, idx| {
+    for (&fallback_maps, 0..) |map, idx| {
         reason_entries.clearRetainingCapacity();
         var it = map.iterator();
         while (it.next()) |entry| {
-            try reason_entries.append(.{ .reason = entry.key_ptr.*, .count = entry.value_ptr.* });
+            try reason_entries.append(allocator, .{ .reason = entry.key_ptr.*, .count = entry.value_ptr.* });
         }
 
-        std.sort.sort(struct { reason: []const u8, count: usize }, reason_entries.items, {}, struct {
-            fn lessThan(_: void, lhs: struct { reason: []const u8, count: usize }, rhs: struct { reason: []const u8, count: usize }) bool {
+        std.sort.heap(ReasonEntry, reason_entries.items, {}, struct {
+            fn lessThan(_: void, lhs: ReasonEntry, rhs: ReasonEntry) bool {
                 return std.mem.lessThan(u8, lhs.reason, rhs.reason);
             }
         }.lessThan);
