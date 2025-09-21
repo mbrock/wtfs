@@ -2,13 +2,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const dirscan = @import("DirScanner.zig");
 const strpool = @import("pool.zig");
-const Trace = @import("Trace.zig");
 
 const TaskQueue = @import("TaskQueue.zig");
 const Context = @import("Context.zig");
 const Worker = @import("Worker.zig");
 const Reporter = @import("Report.zig");
-const SysDispatcher = @import("SysDispatcher.zig");
 
 const Self = @This();
 
@@ -38,9 +36,6 @@ large_file_threshold: u64 = default_large_file_threshold,
 
 /// Collection of large files discovered during the scan
 large_files: std.MultiArrayList(Context.LargeFile) = .empty,
-
-/// Optional path to write io_uring trace events
-trace_output: ?[]const u8 = null,
 
 pub const SummaryEntry = struct {
     index: usize,
@@ -135,7 +130,6 @@ fn createScanContext(
     wait_group: *std.Thread.WaitGroup,
     queue_progress: *std.Progress.Node,
     task_queue: *TaskQueue,
-    dispatcher: *SysDispatcher.Dispatcher,
 ) Context {
     return Context{
         .allocator = self.allocator,
@@ -150,7 +144,6 @@ fn createScanContext(
         .skip_hidden = self.skip_hidden,
         .large_files = &self.large_files,
         .large_file_threshold = self.large_file_threshold,
-        .dispatcher = dispatcher,
     };
 }
 
@@ -187,39 +180,11 @@ fn gatherPhase(self: *Self) !void {
         .progress = &queue_progress,
     };
 
-    var trace_buffer: [8 * 1024]u8 = undefined;
-    var trace_file: ?std.fs.File = null;
-    var trace_stream: std.fs.File.Writer = undefined;
-    var trace_writer: Trace.Writer = undefined;
-    var trace_enabled = false;
-    var trace_ptr: ?*Trace.Writer = null;
-    if (self.trace_output) |trace_path| {
-        var file = try std.fs.cwd().createFile(trace_path, .{ .truncate = true, .read = false });
-        trace_stream = file.writer(trace_buffer[0..]);
-        trace_writer = try Trace.Writer.init(self.allocator, &trace_stream.interface);
-        trace_file = file;
-        trace_ptr = &trace_writer;
-        trace_enabled = true;
-    }
-    defer if (trace_file) |file| file.close();
-    defer if (trace_enabled) trace_stream.end() catch {};
-    defer if (trace_enabled) trace_writer.deinit();
-
-    var dispatcher = SysDispatcher.Dispatcher.init(.{
-        .allocator = self.allocator,
-        .entries = null,
-        .trace = trace_ptr,
-    }) catch |err| {
-        std.debug.panic("dispatcher init failed: {s}", .{@errorName(err)});
-    };
-    defer dispatcher.deinit();
-
     var ctx = self.createScanContext(
         &worker_pool,
         &wait_group,
         &queue_progress,
         &task_queue,
-        &dispatcher,
     );
     defer ctx.task_queue.deinit(self.allocator);
 

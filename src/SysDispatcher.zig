@@ -8,15 +8,12 @@ const posix = std.posix;
 
 const use_linux = builtin.target.os.tag == .linux;
 const linux = std.os.linux;
-const mem = std.mem;
 const AutoHashMap = std.AutoHashMap;
 const AtomicU64 = std.atomic.Value(u64);
-const Trace = @import("Trace.zig");
 
 pub const Config = struct {
     allocator: std.mem.Allocator,
     entries: ?u16 = null,
-    trace: ?*Trace.Writer = null,
 };
 
 const Backend = switch (builtin.target.os.tag) {
@@ -74,12 +71,8 @@ const SyncBackend = struct {
 const LinuxBackend = if (use_linux) struct {
     ring: linux.IoUring,
     allocator: std.mem.Allocator,
-    sq_mutex: std.Thread.Mutex = .{},
-    cq_mutex: std.Thread.Mutex = .{},
-    pending_mutex: std.Thread.Mutex = .{},
     pending: AutoHashMap(u64, linux.io_uring_cqe),
     next_user_data: AtomicU64,
-    trace: ?*Trace.Writer,
 
     pub fn init(config: Config) !LinuxBackend {
         const entries = config.entries orelse 128;
@@ -88,7 +81,6 @@ const LinuxBackend = if (use_linux) struct {
             .allocator = config.allocator,
             .pending = AutoHashMap(u64, linux.io_uring_cqe).init(config.allocator),
             .next_user_data = AtomicU64.init(1),
-            .trace = config.trace,
         };
         errdefer backend.ring.deinit();
 
@@ -102,10 +94,7 @@ const LinuxBackend = if (use_linux) struct {
     }
 
     pub fn openDirectory(self: *LinuxBackend, parent_fd: posix.fd_t, name: [:0]const u8) posix.OpenError!posix.fd_t {
-        self.sq_mutex.lock();
         var sqe = self.ring.get_sqe() catch |err| {
-            self.sq_mutex.unlock();
-            if (self.trace) |trace| trace.logFallback(.open, "sq_full");
             return switch (err) {
                 error.SubmissionQueueFull => posix.openat(parent_fd, name, SyncBackend.directoryFlags(), 0),
             };
@@ -115,24 +104,16 @@ const LinuxBackend = if (use_linux) struct {
         sqe.prep_openat(dir_fd, name.ptr, directoryLinuxFlags(), 0);
         sqe.user_data = token;
 
-        if (self.trace) |trace| trace.logSubmitOpen(token, parent_fd, mem.sliceTo(name, 0));
-
         _ = self.ring.submit_and_wait(1) catch |err| {
-            self.sq_mutex.unlock();
-            if (self.trace) |trace| trace.logFallback(.open, @errorName(err));
             return mapOpenSubmitError(err, parent_fd, name);
         };
-        self.sq_mutex.unlock();
 
         const cqe = self.awaitCompletion(token, 0) catch |err| return mapOpenSubmitError(err, parent_fd, name);
-
-        if (self.trace) |trace| trace.logCompletion(.open, token, cqe.res);
 
         if (cqe.res < 0) {
             const errno_linux: linux.E = @enumFromInt(@as(u32, @intCast(-cqe.res)));
             const errno_posix: posix.E = @enumFromInt(@intFromEnum(errno_linux));
             if (errno_posix == .BADF) {
-                if (self.trace) |trace| trace.logFallback(.open, "cqe_badf");
                 return error.FileNotFound;
             }
         }
@@ -143,10 +124,7 @@ const LinuxBackend = if (use_linux) struct {
     pub fn statAt(self: *LinuxBackend, dir_fd: posix.fd_t, name: [:0]const u8) posix.FStatAtError!posix.Stat {
         var statx_buf = std.mem.zeroes(linux.Statx);
 
-        self.sq_mutex.lock();
         var sqe = self.ring.get_sqe() catch |err| {
-            self.sq_mutex.unlock();
-            if (self.trace) |trace| trace.logFallback(.stat, "sq_full");
             return switch (err) {
                 error.SubmissionQueueFull => posix.fstatat(dir_fd, name, 0),
             };
@@ -157,22 +135,15 @@ const LinuxBackend = if (use_linux) struct {
         sqe.prep_statx(fd, name.ptr, 0, linux.STATX_BASIC_STATS, &statx_buf);
         sqe.user_data = token;
 
-        if (self.trace) |trace| trace.logSubmitStat(token, dir_fd, mem.sliceTo(name, 0));
-
         _ = self.ring.submit_and_wait(1) catch |err| {
-            self.sq_mutex.unlock();
-            if (self.trace) |trace| trace.logFallback(.stat, @errorName(err));
             return mapStatSubmitError(err, dir_fd, name);
         };
-        self.sq_mutex.unlock();
 
         const cqe = self.awaitCompletion(token, 0) catch |err| return mapStatSubmitError(err, dir_fd, name);
-        if (self.trace) |trace| trace.logCompletion(.stat, token, cqe.res);
         if (cqe.res < 0) {
             const errno_linux: linux.E = @enumFromInt(@as(u32, @intCast(-cqe.res)));
             const errno_posix: posix.E = @enumFromInt(@intFromEnum(errno_linux));
             if (errno_posix == .BADF) {
-                if (self.trace) |trace| trace.logFallback(.stat, "cqe_badf");
                 return error.FileNotFound;
             }
             return mapStatError(errno_posix);
@@ -224,8 +195,6 @@ const LinuxBackend = if (use_linux) struct {
         buffer: []linux.io_uring_cqe,
         wait_nr: u32,
     ) !usize {
-        self.cq_mutex.lock();
-        defer self.cq_mutex.unlock();
         const got = try self.ring.copy_cqes(buffer, wait_nr);
         return @as(usize, @intCast(got));
     }
@@ -236,34 +205,24 @@ const LinuxBackend = if (use_linux) struct {
         token: u64,
         wait_nr: u32,
     ) !?linux.io_uring_cqe {
+        _ = wait_nr;
         var result: ?linux.io_uring_cqe = null;
-        var other_count: usize = 0;
 
-        self.pending_mutex.lock();
         for (cqes) |cqe| {
             if (cqe.user_data == token) {
                 result = cqe;
             } else {
                 self.pending.putAssumeCapacity(cqe.user_data, cqe);
-                other_count += 1;
             }
         }
-        self.pending_mutex.unlock();
-
-        if (self.trace) |trace| trace.logDrain(token, wait_nr, cqes.len, result != null, other_count);
 
         return result;
     }
 
     fn takeCachedCompletion(self: *LinuxBackend, token: u64) ?linux.io_uring_cqe {
-        self.pending_mutex.lock();
         const entry = self.pending.fetchRemove(token);
-        self.pending_mutex.unlock();
 
-        if (entry) |hit| {
-            if (self.trace) |trace| trace.logCacheHit(token, hit.value.res);
-            return hit.value;
-        }
+        if (entry) |hit| return hit.value;
         return null;
     }
 
