@@ -202,15 +202,15 @@ fn writeFullPath(
     index: usize,
     writer: *std.Io.Writer,
 ) !void {
-    const basenameidx = self.directories.slice().items(.basename)[index];
-    const parent = self.directories.slice().items(.parent)[index];
+    const slices = self.directories.slice();
+    const basenameidx = slices.items(.basename)[index];
+    const parent = slices.items(.parent)[index];
 
     if (index != 0) {
         try self.writeFullPath(@intCast(parent), writer);
         try writer.writeByte('/');
     }
-    try writer.writeSliceSwap(
-        u8,
+    try writer.writeAll(
         std.mem.sliceTo(self.namedata.items[basenameidx..], 0),
     );
 }
