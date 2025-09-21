@@ -7,7 +7,7 @@ pub const DirectoryNode = struct {
     parent: u32,
     basename: u32,
     fd: std.posix.fd_t = invalid_fd,
-    fdrefcount: AtomicU16,
+    fdrefcount: AtomicU16 = .init(0),
     total_size: u64 = 0,
     total_files: usize = 0,
     total_dirs: usize = 1,
@@ -20,29 +20,6 @@ pub const LargeFile = struct {
     size: u64,
 };
 
-pub const DirectoryStore = std.MultiArrayList(DirectoryNode);
-pub const LargeFileStore = std.MultiArrayList(LargeFile);
-
-pub const Stats = struct {
-    directories_started: AtomicUsize = AtomicUsize.init(0),
-    directories_completed: AtomicUsize = AtomicUsize.init(0),
-    directories_scheduled: AtomicUsize = AtomicUsize.init(0),
-    directories_discovered: AtomicUsize = AtomicUsize.init(0),
-    files_discovered: AtomicUsize = AtomicUsize.init(0),
-    symlinks_discovered: AtomicUsize = AtomicUsize.init(0),
-    other_discovered: AtomicUsize = AtomicUsize.init(0),
-    scanner_batches: AtomicUsize = AtomicUsize.init(0),
-    scanner_entries: AtomicUsize = AtomicUsize.init(0),
-    scanner_max_batch: AtomicUsize = AtomicUsize.init(0),
-    scanner_errors: AtomicUsize = AtomicUsize.init(0),
-    inaccessible_dirs: AtomicUsize = AtomicUsize.init(0),
-    high_watermark: AtomicUsize = AtomicUsize.init(0),
-
-    pub fn init() Stats {
-        return .{};
-    }
-};
-
 pub const AtomicUsize = std.atomic.Value(usize);
 pub const AtomicU16 = std.atomic.Value(u16);
 pub const invalid_fd: std.posix.fd_t = -1;
@@ -50,29 +27,27 @@ pub const invalid_fd: std.posix.fd_t = -1;
 const Context = @This();
 
 allocator: std.mem.Allocator,
-directories: *DirectoryStore,
-pool: *std.Thread.Pool,
-wait_group: *std.Thread.WaitGroup,
-progress_node: std.Progress.Node,
-errprogress: std.Progress.Node,
-skip_hidden: bool,
-directories_mutex: std.Thread.Mutex = .{},
-task_queue: *TaskQueue,
-outstanding: AtomicUsize = AtomicUsize.init(0),
 
-large_files: *LargeFileStore,
-large_file_threshold: u64,
+directories_mutex: std.Thread.Mutex = .{},
+directories: *std.MultiArrayList(DirectoryNode),
 
 namelock: std.Thread.Mutex = .{},
 namedata: *std.ArrayList(u8),
 idxset: *strpool.IndexSet,
-stats: *Stats,
 
-pub fn getNode(self: *Context, index: usize) DirectoryNode {
-    self.directories_mutex.lock();
-    defer self.directories_mutex.unlock();
-    return self.directories.get(index);
-}
+large_files: *std.MultiArrayList(LargeFile),
+
+task_queue: *TaskQueue,
+outstanding: AtomicUsize = AtomicUsize.init(0),
+
+pool: *std.Thread.Pool,
+wait_group: *std.Thread.WaitGroup,
+
+progress_node: std.Progress.Node,
+errprogress: std.Progress.Node,
+
+skip_hidden: bool,
+large_file_threshold: u64,
 
 pub fn internPath(self: *Context, path: []const u8) !u32 {
     self.namelock.lock();
@@ -103,15 +78,9 @@ pub fn markInaccessible(self: *Context, index: usize) void {
     }
     ref_ptr.store(0, .release);
     slices.items(.inaccessible)[index] = true;
-    slices.items(.total_size)[index] = 0;
-    slices.items(.total_files)[index] = 0;
-    slices.items(.total_dirs)[index] = 1;
 }
 
-pub fn addRoot(self: *Context, path: []const u8, dir: ?std.fs.Dir, inaccessible: bool) !usize {
-    var dir_copy = dir;
-    errdefer if (dir_copy) |*d| d.close();
-
+pub fn addRoot(self: *Context, path: []const u8, dir: std.fs.Dir) !usize {
     const name_copy = try self.internPath(path);
 
     self.directories_mutex.lock();
@@ -119,13 +88,14 @@ pub fn addRoot(self: *Context, path: []const u8, dir: ?std.fs.Dir, inaccessible:
 
     const index = try self.directories.addOne(self.allocator);
     var slices = self.directories.slice();
+
     slices.items(.parent)[index] = 0;
     slices.items(.basename)[index] = name_copy;
-    slices.items(.fd)[index] = if (dir_copy) |d| d.fd else invalid_fd;
+    slices.items(.fd)[index] = dir.fd;
     slices.items(.total_size)[index] = 0;
     slices.items(.total_files)[index] = 0;
     slices.items(.total_dirs)[index] = 1;
-    slices.items(.inaccessible)[index] = inaccessible;
+    slices.items(.inaccessible)[index] = false;
     slices.items(.fdrefcount)[index] = AtomicU16.init(0);
 
     return index;

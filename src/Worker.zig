@@ -120,9 +120,6 @@ fn extractName(self: *Worker, idx: u32) [:0]const u8 {
 
 /// Process a single directory, scanning its contents and scheduling subdirectories
 fn processDirectory(self: *Worker, index: usize) !usize {
-    _ = self.ctx.stats.directories_started.fetchAdd(1, .monotonic);
-    defer _ = self.ctx.stats.directories_completed.fetchAdd(1, .monotonic);
-
     const dir_fd = try self.openDirectory(index);
     if (dir_fd == Context.invalid_fd) return 0; // Directory was inaccessible
 
@@ -138,34 +135,25 @@ fn processDirectory(self: *Worker, index: usize) !usize {
 // ===== Directory Opening =====
 
 fn openDirectory(self: *Worker, index: usize) !std.posix.fd_t {
-    // const prevname = self.marquee.getName();
-    // self.marquee.setName("prep");
-    // defer self.marquee.setName(&prevname);
-
-    const node = self.ctx.getNode(index);
-    const basename = self.extractName(node.basename);
+    const basename = self.extractName(
+        self.ctx.directories.slice().items(.basename)[index],
+    );
 
     if (index != 0) {
-        return try self.openChildDirectory(index, node, basename);
+        return try self.openChildDirectory(index, basename);
     } else {
-        return try self.openRootDirectory(index, node, basename);
+        return try self.openRootDirectory(index, basename);
     }
 }
 
 fn openChildDirectory(
     self: *Worker,
     index: usize,
-    node: Context.DirectoryNode,
     basename: [:0]const u8,
 ) !std.posix.fd_t {
-    //    const prevname = self.marquee.getName();
-    //    self.marquee.setName("opendir");
-    //    defer self.marquee.setName(&prevname);
-    const parent_index: usize = @intCast(node.parent);
-    const parent = self.ctx.getNode(parent_index);
-
-    // Try to open the subdirectory using parent's fd
-    const opened = wtfs.openSubdirectory(parent.fd, basename);
+    const parent_index = self.ctx.directories.items(.parent)[index];
+    const parent = self.ctx.directories.items(.fd)[parent_index];
+    const opened = wtfs.openSubdirectory(parent, basename);
 
     // We've successfully used the parent fd for openat(), release our reference
     self.ctx.releaseParentFdAfterOpen(parent_index);
@@ -181,17 +169,16 @@ fn openChildDirectory(
 fn openRootDirectory(
     self: *Worker,
     index: usize,
-    node: Context.DirectoryNode,
     basename: [:0]const u8,
 ) !std.posix.fd_t {
-    const opened = std.posix.openat(node.fd, basename, .{
+    const fd = self.ctx.directories.items(.fd)[index];
+    const opened = std.posix.openat(fd, basename, .{
         .NONBLOCK = true,
         .DIRECTORY = true,
         .NOFOLLOW = true,
     }, 0) catch |err| switch (err) {
         error.PermissionDenied, error.AccessDenied => {
             self.progress.completeOne();
-            _ = self.ctx.stats.inaccessible_dirs.fetchAdd(1, .monotonic);
             self.ctx.markInaccessible(index);
             return Context.invalid_fd;
         },
@@ -201,11 +188,6 @@ fn openRootDirectory(
             return err;
         },
     };
-
-    // Close old fd if present
-    if (node.fd != Context.invalid_fd) {
-        std.posix.close(node.fd);
-    }
 
     self.ctx.setDirectoryFd(index, opened);
     return opened;
@@ -324,8 +306,6 @@ fn processBatch(
 
     self.ctx.directories_mutex.unlock();
     lock_released = true;
-
-    self.updateStatistics(batch_entries, &batch_metrics);
 }
 
 fn processEntry(
@@ -387,20 +367,7 @@ pub fn scheduleDirectory(self: *Worker, index: usize) !void {
     _ = self.ctx.outstanding.fetchAdd(1, .acq_rel);
     errdefer _ = self.ctx.outstanding.fetchSub(1, .acq_rel);
     try self.ctx.task_queue.push(self.allocator, index);
-    _ = self.ctx.stats.directories_scheduled.fetchAdd(1, .monotonic);
 }
-
-fn updateStatistics(self: *Worker, batch_entries: usize, batch_metrics: *const ScanMetrics) void {
-    _ = self.ctx.stats.scanner_batches.fetchAdd(1, .monotonic);
-    _ = self.ctx.stats.scanner_entries.fetchAdd(batch_entries, .monotonic);
-    _ = self.ctx.stats.directories_discovered.fetchAdd(batch_metrics.batch_dirs, .monotonic);
-    _ = self.ctx.stats.files_discovered.fetchAdd(batch_metrics.batch_files, .monotonic);
-    _ = self.ctx.stats.symlinks_discovered.fetchAdd(batch_metrics.batch_symlinks, .monotonic);
-    _ = self.ctx.stats.other_discovered.fetchAdd(batch_metrics.batch_other, .monotonic);
-    _ = self.ctx.stats.scanner_max_batch.fetchMax(batch_entries, .acq_rel);
-}
-
-// ===== Error Handling =====
 
 fn handleOpenError(
     self: *Worker,
@@ -409,7 +376,6 @@ fn handleOpenError(
 ) !std.posix.fd_t {
     switch (err) {
         error.PermissionDenied, error.AccessDenied => {
-            _ = self.ctx.stats.inaccessible_dirs.fetchAdd(1, .monotonic);
             self.ctx.markInaccessible(index);
             return Context.invalid_fd;
         },
@@ -426,12 +392,10 @@ fn handleScanError(
     index: usize,
     err: anyerror,
 ) !void {
-    _ = self.ctx.stats.scanner_errors.fetchAdd(1, .monotonic);
     self.errprogress.completeOne();
 
     if (err == error.DeadLock) {
         self.errprogress.setName("dataless file");
-        _ = self.ctx.stats.inaccessible_dirs.fetchAdd(1, .monotonic);
         self.ctx.markInaccessible(index);
         return;
     } else {

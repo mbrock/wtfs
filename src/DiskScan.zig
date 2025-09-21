@@ -6,17 +6,43 @@ const strpool = @import("wtfs").strpool;
 const TaskQueue = @import("TaskQueue.zig");
 const Context = @import("Context.zig");
 const Worker = @import("Worker.zig");
+const Reporter = @import("Report.zig");
 
 const Self = @This();
 
-// ===== Types =====
+/// Memory allocator for all dynamic allocations during the scan
+allocator: std.mem.Allocator,
 
-const SummaryEntry = struct {
+/// Whether to skip hidden files and directories (starting with '.')
+skip_hidden: bool = true,
+
+/// Root directory path to scan
+root: []const u8 = ".",
+
+/// Multi-array storage for all discovered directory nodes and their metadata
+directories: std.MultiArrayList(Context.DirectoryNode) = .empty,
+
+/// Pool of null-terminated directory names referenced by basename indices
+namedata: std.ArrayList(u8) = .empty,
+
+/// Set tracking unique name indices to avoid duplicates in the name pool
+idxset: strpool.IndexSet = .empty,
+
+/// Root progress node for tracking scan progress and reporting to the user
+progress_root: std.Progress.Node = undefined,
+
+/// Threshold in bytes for recording large files
+large_file_threshold: u64 = default_large_file_threshold,
+
+/// Collection of large files discovered during the scan
+large_files: std.MultiArrayList(Context.LargeFile) = .empty,
+
+pub const SummaryEntry = struct {
     index: usize,
     path: []u8,
 };
 
-const FileSummaryEntry = struct {
+pub const FileSummaryEntry = struct {
     size: u64,
     path: []u8,
 };
@@ -56,14 +82,13 @@ const RootOpenResult = struct {
     inaccessible: bool,
 };
 
-const DirectoryTotals = packed struct {
+pub const DirectoryTotals = packed struct {
     directories: u64,
     files: u64,
     bytes: u64,
 };
 
-const ScanResults = struct {
-    stats: *const Context.Stats,
+pub const ScanResults = struct {
     elapsed_ns: u64,
     totals: DirectoryTotals,
 };
@@ -71,38 +96,6 @@ const ScanResults = struct {
 var stdout_buffer: [4096]u8 = undefined;
 var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
 const stdout = &stdout_writer.interface;
-
-// ===== Instance Fields =====
-
-/// Memory allocator for all dynamic allocations during the scan
-allocator: std.mem.Allocator,
-
-/// Whether to skip hidden files and directories (starting with '.')
-skip_hidden: bool = true,
-
-/// Root directory path to scan
-root: []const u8 = ".",
-
-/// Multi-array storage for all discovered directory nodes and their metadata
-directories: Context.DirectoryStore = .empty,
-
-/// Pool of null-terminated directory names referenced by basename indices
-namedata: std.ArrayList(u8) = .empty,
-
-/// Set tracking unique name indices to avoid duplicates in the name pool
-idxset: strpool.IndexSet = .empty,
-
-/// Root progress node for tracking scan progress and reporting to the user
-progress_root: std.Progress.Node = undefined,
-
-/// Atomic statistics counters shared by all worker threads during scanning
-stats: Context.Stats = Context.Stats.init(),
-
-/// Threshold in bytes for recording large files
-large_file_threshold: u64 = default_large_file_threshold,
-
-/// Collection of large files discovered during the scan
-large_files: Context.LargeFileStore = .empty,
 
 pub const BinaryFormatVersion: u16 = 1;
 
@@ -114,8 +107,6 @@ pub const RunOptions = struct {
 };
 
 pub const default_large_file_threshold: u64 = 100 * 1024 * 1024;
-
-// ===== Platform Configuration =====
 
 const PlatformConfig = struct {
     fn preventICloudDownload() void {
@@ -130,8 +121,6 @@ const PlatformConfig = struct {
         }
     }
 };
-
-// ===== Scanning Infrastructure =====
 
 fn createScanContext(
     self: *Self,
@@ -151,7 +140,6 @@ fn createScanContext(
         .progress_node = queue_progress.*,
         .errprogress = self.progress_root.start("errors", 0),
         .skip_hidden = self.skip_hidden,
-        .stats = &self.stats, // Pass pointer to stats
         .large_files = &self.large_files,
         .large_file_threshold = self.large_file_threshold,
     };
@@ -160,22 +148,17 @@ fn createScanContext(
 fn initializeRootDirectory(self: *Self, ctx: *Context) !void {
     self.progress_root.setEstimatedTotalItems(1);
 
-    const root_result = try self.openRootDirectory(ctx);
-    const root_index = try ctx.addRoot(".", root_result.dir, root_result.inaccessible);
+    var rootdir = try std.fs.cwd().openDir(self.root, .{ .iterate = true });
+    errdefer rootdir.close();
 
-    if (root_result.inaccessible) {
-        ctx.markInaccessible(root_index);
-        self.progress_root.completeOne();
-        ctx.task_queue.close();
-    } else {
-        _ = ctx.outstanding.fetchAdd(1, .acq_rel);
-        errdefer _ = ctx.outstanding.fetchSub(1, .acq_rel);
-        try ctx.task_queue.push(self.allocator, root_index);
-        _ = ctx.stats.directories_scheduled.fetchAdd(1, .monotonic);
-    }
+    const rootidx = try ctx.addRoot(".", rootdir);
+
+    _ = ctx.outstanding.fetchAdd(1, .acq_rel);
+    errdefer _ = ctx.outstanding.fetchSub(1, .acq_rel);
+
+    try ctx.task_queue.push(self.allocator, rootidx);
 }
 
-// Main gathering phase
 fn gatherPhase(self: *Self) !void {
     PlatformConfig.preventICloudDownload();
 
@@ -212,26 +195,8 @@ fn gatherPhase(self: *Self) !void {
     }
 
     defer wait_group.wait();
-    // Stats are now stored directly in self.stats, no need to return
 }
 
-// ===== Directory Operations =====
-
-fn openRootDirectory(self: *Self, ctx: *Context) !RootOpenResult {
-    const dir_result = std.fs.cwd().openDir(
-        self.root,
-        .{ .iterate = true },
-    ) catch |err| switch (err) {
-        error.PermissionDenied, error.AccessDenied => {
-            _ = ctx.stats.inaccessible_dirs.fetchAdd(1, .monotonic);
-            return .{ .dir = null, .inaccessible = true };
-        },
-        else => return err,
-    };
-    return .{ .dir = dir_result, .inaccessible = false };
-}
-
-// ===== Path Management =====
 fn writeFullPath(
     self: *Self,
     index: usize,
@@ -275,10 +240,14 @@ fn buildFilePath(self: *Self, directory_index: usize, basename_index: u32) ![]u8
     return try writer.toOwnedSlice();
 }
 
-fn directoryName(self: *Self, index: usize) []const u8 {
-    const slices = self.directories.slice();
+pub fn directoryName(
+    directories: *const std.MultiArrayList(Context.DirectoryNode),
+    namedata: *const std.ArrayList(u8),
+    index: usize,
+) []const u8 {
+    const slices = directories.slice();
     const base_index = slices.items(.basename)[index];
-    return std.mem.sliceTo(self.namedata.items[base_index..], 0);
+    return std.mem.sliceTo(namedata.items[base_index..], 0);
 }
 
 test "path helpers use shared directory data" {
@@ -522,7 +491,7 @@ const SummaryBuilder = struct {
     }
 
     const EntrySorter = struct {
-        directories: *Context.DirectoryStore,
+        directories: *std.MultiArrayList(Context.DirectoryNode),
 
         fn bySize(self: @This(), lhs: SummaryEntry, rhs: SummaryEntry) bool {
             const sizes = self.directories.items(.total_size);
@@ -548,394 +517,6 @@ const SummaryBuilder = struct {
     }
 };
 
-// ===== Output Formatting =====
-
-const Reporter = struct {
-    fn printHeader(self: *Self, results: ScanResults) !void {
-        try stdout.print("{s}: {d} dirs, {d} files, {Bi: <.1} total\n\n", .{
-            self.root,
-            results.totals.directories,
-            results.totals.files,
-            results.totals.bytes,
-        });
-    }
-
-    fn printStatistics(results: ScanResults) !void {
-        const stats = results.stats;
-        const elapsed_ns = results.elapsed_ns;
-
-        const inaccessible = stats.inaccessible_dirs.load(.acquire);
-        if (inaccessible > 0) {
-            try stdout.print("  Inaccessible directories: {d}\n", .{inaccessible});
-        }
-
-        const metrics = extractMetrics(stats.*, elapsed_ns);
-
-        try stdout.print("  Duration: {d:.2}s  ({d:.1} dirs/s)\n", .{
-            metrics.elapsed_s,
-            metrics.dirs_per_sec,
-        });
-
-        try printQueueMetrics(metrics);
-        try printBatchMetrics(metrics);
-        try printEntryMetrics(metrics);
-
-        if (metrics.scanner_errors > 0) {
-            try stdout.print("  Scanner errors: {d}\n", .{metrics.scanner_errors});
-        }
-        try stdout.print("\n", .{});
-    }
-
-    const Metrics = struct {
-        elapsed_s: f64,
-        dirs_per_sec: f64,
-        avg_batch_entries: f64,
-        dirs_started: u64,
-        dirs_completed: u64,
-        dirs_scheduled: u64,
-        dirs_discovered: u64,
-        files_discovered: u64,
-        symlinks_discovered: u64,
-        other_discovered: u64,
-        batches: u64,
-        batch_entries: u64,
-        max_batch: u64,
-        scanner_errors: u64,
-        queue_high: u64,
-    };
-
-    fn extractMetrics(stats: Context.Stats, elapsed_ns: u64) Metrics {
-        const dirs_completed = stats.directories_completed.load(.acquire);
-        const batches = stats.scanner_batches.load(.acquire);
-        const batch_entries = stats.scanner_entries.load(.acquire);
-
-        const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
-
-        return .{
-            .elapsed_s = elapsed_s,
-            .dirs_per_sec = if (elapsed_ns == 0) 0.0 else @as(f64, @floatFromInt(dirs_completed)) / elapsed_s,
-            .avg_batch_entries = if (batches == 0) 0.0 else @as(f64, @floatFromInt(batch_entries)) / @as(f64, @floatFromInt(batches)),
-            .dirs_started = stats.directories_started.load(.acquire),
-            .dirs_completed = dirs_completed,
-            .dirs_scheduled = stats.directories_scheduled.load(.acquire),
-            .dirs_discovered = stats.directories_discovered.load(.acquire),
-            .files_discovered = stats.files_discovered.load(.acquire),
-            .symlinks_discovered = stats.symlinks_discovered.load(.acquire),
-            .other_discovered = stats.other_discovered.load(.acquire),
-            .batches = batches,
-            .batch_entries = batch_entries,
-            .max_batch = stats.scanner_max_batch.load(.acquire),
-            .scanner_errors = stats.scanner_errors.load(.acquire),
-            .queue_high = stats.high_watermark.load(.acquire),
-        };
-    }
-
-    fn printQueueMetrics(metrics: Metrics) !void {
-        try stdout.print(
-            "  Queue peak: {d} tasks\n  Scheduled dirs: {d}  discovered: {d}  started/completed: {d}/{d}\n",
-            .{ metrics.queue_high, metrics.dirs_scheduled, metrics.dirs_discovered, metrics.dirs_started, metrics.dirs_completed },
-        );
-    }
-
-    fn printBatchMetrics(metrics: Metrics) !void {
-        try stdout.print(
-            "  Batches: {d}  avg entries/batch: {d:.1}  max: {d}\n",
-            .{ metrics.batches, metrics.avg_batch_entries, metrics.max_batch },
-        );
-    }
-
-    fn printEntryMetrics(metrics: Metrics) !void {
-        try stdout.print(
-            "  Entries seen: files {d}, symlinks {d}, other {d}\n",
-            .{ metrics.files_discovered, metrics.symlinks_discovered, metrics.other_discovered },
-        );
-    }
-
-    fn printTopLevelDirectories(
-        self: *Self,
-        totals: DirectoryTotals,
-        entries: []const SummaryEntry,
-    ) !void {
-        if (entries.len == 0) return;
-
-        try stdout.print(
-            "Top-level directories by total size:\n\n",
-            .{},
-        );
-        try stdout.print(
-            "  Size         Share   Files      Dirs\n",
-            .{},
-        );
-
-        const limit = @min(entries.len, 10);
-        for (entries[0..limit]) |entry| {
-            try printTopLevelEntry(self, totals, entry);
-        }
-    }
-
-    fn printHeaviestDirectories(
-        self: *Self,
-        totals: DirectoryTotals,
-        entries: []const SummaryEntry,
-    ) !void {
-        if (entries.len == 0) return;
-
-        try stdout.print("Heaviest directories in tree:\n\n", .{});
-        try stdout.print("  Size         Share   Files      Dirs\n", .{});
-
-        const ChildMap = std.AutoHashMap(usize, std.ArrayList(usize));
-        var child_map = ChildMap.init(self.allocator);
-        defer {
-            var iter = child_map.iterator();
-            while (iter.next()) |entry| {
-                entry.value_ptr.*.deinit(self.allocator);
-            }
-            child_map.deinit();
-        }
-
-        var node_set = std.AutoHashMap(usize, void).init(self.allocator);
-        defer node_set.deinit();
-
-        const slices = self.directories.slice();
-
-        for (entries) |entry| {
-            var current = entry.index;
-            while (true) {
-                try node_set.put(current, {});
-                if (current == 0) break;
-
-                const parent_index: usize = @intCast(slices.items(.parent)[current]);
-                try node_set.put(parent_index, {});
-
-                const gop = try child_map.getOrPut(parent_index);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = std.ArrayList(usize){};
-                }
-                const children_ptr = gop.value_ptr;
-                if (std.mem.indexOfScalar(usize, children_ptr.items, current) == null) {
-                    try children_ptr.append(self.allocator, current);
-                }
-
-                if (parent_index == 0) {
-                    current = 0;
-                    break;
-                }
-                current = parent_index;
-            }
-        }
-
-        try node_set.put(0, {});
-
-        var sort_iter = child_map.iterator();
-        while (sort_iter.next()) |entry| {
-            const children_ptr = entry.value_ptr;
-            const SortCtx = struct {
-                directories: *Context.DirectoryStore,
-
-                fn bySize(ctx: @This(), lhs: usize, rhs: usize) bool {
-                    const dir_slices = ctx.directories.slice();
-                    const sizes = dir_slices.items(.total_size);
-                    const lhs_size = sizes[lhs];
-                    const rhs_size = sizes[rhs];
-                    if (lhs_size != rhs_size) return lhs_size > rhs_size;
-                    return lhs < rhs;
-                }
-            };
-
-            if (children_ptr.items.len > 1) {
-                std.sort.heap(
-                    usize,
-                    children_ptr.items,
-                    SortCtx{ .directories = &self.directories },
-                    SortCtx.bySize,
-                );
-            }
-        }
-
-        try printHeaviestNode(self, &child_map, &node_set, totals, 0, 0, true);
-        try stdout.print("\n", .{});
-    }
-
-    fn printHeaviestNode(
-        self: *Self,
-        child_map: *std.AutoHashMap(usize, std.ArrayList(usize)),
-        node_set: *std.AutoHashMap(usize, void),
-        totals: DirectoryTotals,
-        index: usize,
-        depth: usize,
-        include_self: bool,
-    ) !void {
-        if (!node_set.contains(index)) return;
-
-        if (include_self) {
-            try printHeaviestLine(self, totals, index, depth);
-        }
-
-        if (child_map.getPtr(index)) |children| {
-            for (children.items) |child_index| {
-                try printHeaviestNode(self, child_map, node_set, totals, child_index, depth + 1, true);
-            }
-        }
-    }
-
-    fn printHeaviestLine(self: *Self, totals: DirectoryTotals, index: usize, depth: usize) !void {
-        const slices = self.directories.slice();
-        const inaccessible = slices.items(.inaccessible)[index];
-        const size = slices.items(.total_size)[index];
-        const files = slices.items(.total_files)[index];
-        const dirs_total = slices.items(.total_dirs)[index];
-        const dir_count = if (dirs_total == 0) 0 else dirs_total - 1;
-
-        var size_buf: [32]u8 = undefined;
-        const size_str = try formatBytes(size_buf[0..], size);
-
-        var share_buf: [16]u8 = undefined;
-        const share_str = try formatPercent(share_buf[0..], size, totals.bytes);
-
-        var files_buf: [32]u8 = undefined;
-        const files_str = try formatCount(files_buf[0..], files);
-
-        var dirs_buf: [32]u8 = undefined;
-        const dirs_str = try formatCount(dirs_buf[0..], dir_count);
-
-        var indent_buf: [64]u8 = undefined;
-        const indent_len = @min(depth * 2, indent_buf.len);
-        for (indent_buf[0..indent_len]) |*ch| ch.* = ' ';
-        const indent = indent_buf[0..indent_len];
-
-        const name = if (index == 0) "." else directoryName(self, index);
-        const status_suffix = if (inaccessible) "  (partial)" else "";
-
-        try stdout.print(
-            "  {s:>11}  {s:>6}  files {s:>9}  dirs {s:>8}\n",
-            .{ size_str, share_str, files_str, dirs_str },
-        );
-        try stdout.print("      {s}{s}{s}\n\n", .{ indent, name, status_suffix });
-    }
-
-    fn printTopLevelEntry(
-        self: *Self,
-        totals: DirectoryTotals,
-        entry: SummaryEntry,
-    ) !void {
-        const slices = self.directories.slice();
-        const inaccessible = slices.items(.inaccessible)[entry.index];
-        const size = slices.items(.total_size)[entry.index];
-        const files = slices.items(.total_files)[entry.index];
-        const dirs_total = slices.items(.total_dirs)[entry.index];
-        const dir_count = if (dirs_total == 0) 0 else dirs_total - 1;
-
-        var size_buf: [32]u8 = undefined;
-        const size_str = try formatBytes(size_buf[0..], size);
-
-        var share_buf: [16]u8 = undefined;
-        const share_str = try formatPercent(share_buf[0..], size, totals.bytes);
-
-        var files_buf: [32]u8 = undefined;
-        const files_str = try formatCount(files_buf[0..], files);
-
-        var dirs_buf: [32]u8 = undefined;
-        const dirs_str = try formatCount(dirs_buf[0..], dir_count);
-        const status_suffix = if (inaccessible) "  (partial)" else "";
-
-        try stdout.print(
-            "  {s:>11}  {s:>6}  files {s:>9}  dirs {s:>8}\n",
-            .{ size_str, share_str, files_str, dirs_str },
-        );
-        try stdout.print("      {s}{s}\n\n", .{ entry.path, status_suffix });
-    }
-
-    fn printLargeFiles(
-        self: *Self,
-        totals: DirectoryTotals,
-        entries: []const FileSummaryEntry,
-        threshold: u64,
-    ) !void {
-        _ = self;
-        if (entries.len == 0) return;
-
-        var threshold_buf: [32]u8 = undefined;
-        const threshold_str = try formatBytes(threshold_buf[0..], threshold);
-
-        try stdout.print("Largest files (>= {s})\n\n", .{threshold_str});
-
-        for (entries) |entry| {
-            var size_buf: [32]u8 = undefined;
-            const size_str = try formatBytes(size_buf[0..], entry.size);
-
-            var share_buf: [16]u8 = undefined;
-            const share_str = try formatPercent(share_buf[0..], entry.size, totals.bytes);
-
-            try stdout.print("  {s:>11}  {s:>6}\n", .{ size_str, share_str });
-            try stdout.print("      {s}\n\n", .{entry.path});
-        }
-    }
-
-    fn formatPercent(buf: []u8, value: u64, total: u64) ![]const u8 {
-        if (total == 0) {
-            return try std.fmt.bufPrint(buf, "0.0%", .{});
-        }
-
-        const percent = @min(
-            100.0,
-            (@as(f64, @floatFromInt(value)) / @as(f64, @floatFromInt(total))) * 100.0,
-        );
-        return try std.fmt.bufPrint(buf, "{d:>5.1}%", .{percent});
-    }
-
-    fn formatBytes(buf: []u8, bytes: u64) ![]const u8 {
-        const Unit = struct {
-            threshold: u64,
-            suffix: []const u8,
-        };
-
-        const units = [_]Unit{
-            .{ .threshold = 1024 * 1024 * 1024 * 1024, .suffix = "TiB" },
-            .{ .threshold = 1024 * 1024 * 1024, .suffix = "GiB" },
-            .{ .threshold = 1024 * 1024, .suffix = "MiB" },
-            .{ .threshold = 1024, .suffix = "KiB" },
-        };
-
-        for (units) |unit| {
-            if (bytes >= unit.threshold) {
-                const value = @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(unit.threshold));
-                return try std.fmt.bufPrint(buf, "{d:>7.1} {s}", .{ value, unit.suffix });
-            }
-        }
-
-        return try std.fmt.bufPrint(buf, "{d} B", .{bytes});
-    }
-
-    fn formatCount(buf: []u8, value: usize) ![]const u8 {
-        const cast_value = std.math.cast(u64, value) orelse std.math.maxInt(u64);
-        const Unit = struct {
-            threshold: u64,
-            suffix: []const u8,
-        };
-
-        const units = [_]Unit{
-            .{ .threshold = 1_000_000_000_000, .suffix = "T" },
-            .{ .threshold = 1_000_000_000, .suffix = "B" },
-            .{ .threshold = 1_000_000, .suffix = "M" },
-            .{ .threshold = 1_000, .suffix = "K" },
-        };
-
-        for (units) |unit| {
-            if (cast_value >= unit.threshold) {
-                const scaled = @as(f64, @floatFromInt(cast_value)) / @as(f64, @floatFromInt(unit.threshold));
-                const decimals: u8 = if (scaled >= 100.0) 0 else if (scaled >= 10.0) 1 else 2;
-                return switch (decimals) {
-                    0 => try std.fmt.bufPrint(buf, "{d:.0}{s}", .{ scaled, unit.suffix }),
-                    1 => try std.fmt.bufPrint(buf, "{d:.1}{s}", .{ scaled, unit.suffix }),
-                    else => try std.fmt.bufPrint(buf, "{d:.2}{s}", .{ scaled, unit.suffix }),
-                };
-            }
-        }
-
-        return try std.fmt.bufPrint(buf, "{d}", .{cast_value});
-    }
-};
-
 // ===== Main Entry Point =====
 
 fn performScan(self: *Self) !ScanResults {
@@ -949,7 +530,6 @@ fn performScan(self: *Self) !ScanResults {
     const totals = StatsAggregator.extractTotals(self);
 
     return .{
-        .stats = &self.stats,
         .elapsed_ns = elapsed_ns,
         .totals = totals,
     };
@@ -973,11 +553,27 @@ fn generateSummary(self: *Self) !Summary {
 }
 
 fn reportResults(self: *Self, results: ScanResults, summary: Summary) !void {
-    try Reporter.printHeader(self, results);
-    try Reporter.printStatistics(results);
-    try Reporter.printTopLevelDirectories(self, results.totals, summary.top_level.items);
-    try Reporter.printHeaviestDirectories(self, results.totals, summary.heaviest.items);
-    try Reporter.printLargeFiles(self, results.totals, summary.large_files.items, self.large_file_threshold);
+    try Reporter.printHeader(stdout, self.root, results);
+    try Reporter.printTopLevelDirectories(
+        &self.directories,
+        stdout,
+        results.totals,
+        summary.top_level.items,
+    );
+    try Reporter.printHeaviestDirectories(
+        self.allocator,
+        stdout,
+        &self.directories,
+        &self.namedata,
+        results.totals,
+        summary.heaviest.items,
+    );
+    try Reporter.printLargeFiles(
+        stdout,
+        results.totals,
+        summary.large_files.items,
+        self.large_file_threshold,
+    );
     try stdout.flush();
 }
 
