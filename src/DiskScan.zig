@@ -338,6 +338,68 @@ test "path helpers use shared directory data" {
     try std.testing.expectEqualSlices(u8, &expected_names, disk_scan.namedata.items);
 }
 
+test "threaded disk scan can repeatedly scan populated directory trees" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.target.os.tag == .macos) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const top_dir_count: usize = 5;
+    const sub_dir_count: usize = 5;
+    const files_per_subdir: usize = 5;
+
+    for (0..top_dir_count) |top_index| {
+        var dir_buf: [32]u8 = undefined;
+        const dir_name = try std.fmt.bufPrint(&dir_buf, "dir{d}", .{top_index});
+        try tmp.dir.makePath(dir_name);
+
+        for (0..sub_dir_count) |sub_index| {
+            var sub_buf: [64]u8 = undefined;
+            const sub_name = try std.fmt.bufPrint(&sub_buf, "{s}/sub{d}", .{ dir_name, sub_index });
+            try tmp.dir.makePath(sub_name);
+
+            for (0..files_per_subdir) |file_index| {
+                var file_buf: [96]u8 = undefined;
+                const file_path = try std.fmt.bufPrint(&file_buf, "{s}/file{d}.txt", .{ sub_name, file_index });
+
+                var contents_buf: [32]u8 = undefined;
+                const contents = try std.fmt.bufPrint(&contents_buf, "data-{d}-{d}-{d}", .{ top_index, sub_index, file_index });
+
+                try tmp.dir.writeFile(.{ .sub_path = file_path, .data = contents });
+            }
+        }
+    }
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    const expected_files = top_dir_count * sub_dir_count * files_per_subdir;
+    const expected_directories = 1 + top_dir_count + (top_dir_count * sub_dir_count);
+
+    for (0..100) |_| {
+        var disk_scan = Self{ .allocator = allocator, .root = root_path };
+        defer {
+            disk_scan.directories.deinit(allocator);
+            disk_scan.namedata.deinit(allocator);
+            disk_scan.idxset.deinit(allocator);
+            disk_scan.large_files.deinit(allocator);
+        }
+
+        disk_scan.progress_root = std.Progress.Node.none;
+        const results = try disk_scan.performScan();
+
+        const slices = disk_scan.directories.slice();
+        try std.testing.expectEqual(expected_files, slices.items(.total_files)[0]);
+        try std.testing.expectEqual(expected_directories, slices.items(.total_dirs)[0]);
+        try std.testing.expectEqual(@as(u64, expected_directories), results.totals.directories);
+        try std.testing.expectEqual(@as(u64, expected_files), results.totals.files);
+    }
+}
+
 // ===== Statistics Processing =====
 
 const StatsAggregator = struct {
