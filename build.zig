@@ -24,6 +24,8 @@ pub fn build(b: *std.Build) !void {
     });
     b.installArtifact(exe);
 
+    const run_step = b.step("run", "Run the app");
+
     const test_step = b.step("test", "Run tests");
     inline for (extra_targets) |query| {
         const resolved = b.resolveTargetQuery(query);
@@ -38,6 +40,11 @@ pub fn build(b: *std.Build) !void {
             .name = "wtfs",
             .root_module = cross_module,
         });
+
+        const run_cross_step = b.addRunArtifact(cross_exe);
+        if (resolved.result.os.tag == b.resolveTargetQuery(.{}).result.os.tag) {
+            run_step.dependOn(&run_cross_step.step);
+        }
 
         const triple = try query.zigTriple(b.allocator);
         const install = b.addInstallArtifact(cross_exe, .{
@@ -56,6 +63,4 @@ pub fn build(b: *std.Build) !void {
         const xtest_step = b.step(stepname, stepname);
         xtest_step.dependOn(&run_tests.step);
     }
-
-    _ = b.step("run", "Run the app");
 }
