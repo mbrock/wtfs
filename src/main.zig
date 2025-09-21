@@ -3,6 +3,7 @@ comptime {
     _ = @import("DiskScan.zig");
     _ = @import("DirScanner.zig");
     _ = @import("SysDispatcher.zig");
+    _ = @import("SegmentedMultiArray.zig");
 }
 
 const std = @import("std");
