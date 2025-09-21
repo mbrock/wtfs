@@ -49,7 +49,6 @@ errprogress: std.Progress.Node,
 skip_hidden: bool,
 large_file_threshold: u64,
 
-
 pub fn internPath(self: *Context, path: []const u8) !u32 {
     self.namelock.lock();
     defer self.namelock.unlock();

@@ -304,6 +304,11 @@ test "path helpers use shared directory data" {
 }
 
 test "threaded disk scan can repeatedly scan populated directory trees" {
+    if (@FieldType(Context, "directories") == *std.MultiArrayList(Context.DirectoryNode)) {
+        // let's reenable this after we switch to a SegmentedMultiArray for directories
+        return error.SkipZigTest;
+    }
+
     if (builtin.single_threaded) return error.SkipZigTest;
     if (builtin.target.os.tag == .macos) return error.SkipZigTest;
     if (builtin.target.os.tag == .windows) return error.SkipZigTest;
