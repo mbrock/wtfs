@@ -16,31 +16,9 @@ pub const Config = struct {
     entries: ?u16 = null,
 };
 
-const Backend = switch (builtin.target.os.tag) {
+pub const Backend = switch (builtin.target.os.tag) {
     .linux => LinuxBackend,
     else => SyncBackend,
-};
-
-pub const Dispatcher = struct {
-    backend: Backend,
-
-    pub fn init(config: Config) !Dispatcher {
-        return Dispatcher{
-            .backend = try Backend.init(config),
-        };
-    }
-
-    pub fn deinit(self: *Dispatcher) void {
-        self.backend.deinit();
-    }
-
-    pub fn openDirectory(self: *Dispatcher, parent_fd: posix.fd_t, name: [:0]const u8) posix.OpenError!posix.fd_t {
-        return self.backend.openDirectory(parent_fd, name);
-    }
-
-    pub fn statAt(self: *Dispatcher, dir_fd: posix.fd_t, name: [:0]const u8) posix.FStatAtError!posix.Stat {
-        return self.backend.statAt(dir_fd, name);
-    }
 };
 
 const SyncBackend = struct {
@@ -74,18 +52,17 @@ const LinuxBackend = if (use_linux) struct {
     pending: AutoHashMap(u64, linux.io_uring_cqe),
     next_user_data: AtomicU64,
 
-    pub fn init(config: Config) !LinuxBackend {
+    pub fn init(self: *LinuxBackend, config: Config) !void {
         const entries = config.entries orelse 128;
-        var backend = LinuxBackend{
-            .ring = try linux.IoUring.init(entries, 0),
-            .allocator = config.allocator,
-            .pending = AutoHashMap(u64, linux.io_uring_cqe).init(config.allocator),
-            .next_user_data = AtomicU64.init(1),
-        };
-        errdefer backend.ring.deinit();
 
-        try backend.pending.ensureTotalCapacity(entries);
-        return backend;
+        self.ring = try linux.IoUring.init(entries, 0);
+        self.allocator = config.allocator;
+        self.pending = AutoHashMap(u64, linux.io_uring_cqe).init(config.allocator);
+        self.next_user_data = AtomicU64.init(1);
+
+        errdefer self.ring.deinit();
+
+        try self.pending.ensureTotalCapacity(entries);
     }
 
     pub fn deinit(self: *LinuxBackend) void {

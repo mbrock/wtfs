@@ -60,8 +60,8 @@ pub fn internPath(self: *Context, path: []const u8) !u32 {
 }
 
 pub fn setTotals(self: *Context, index: usize, size: u64, files: usize) void {
-    // self.directories_mutex.lock();
-    // defer self.directories_mutex.unlock();
+    self.directories_mutex.lock();
+    defer self.directories_mutex.unlock();
     self.directories.ptr(.total_size, index).* = size;
     self.directories.ptr(.total_files, index).* = files;
     self.directories.ptr(.total_dirs, index).* = 1;
@@ -114,6 +114,8 @@ pub fn setDirectoryFd(self: *Context, index: usize, fd: std.posix.fd_t) void {
 /// Increment reference count to keep a parent directory fd open (thread-safe)
 /// Call when scheduling a child directory that will need openat() from this parent
 pub fn retainParentFd(self: *Context, parent_index: usize) void {
+    self.directories_mutex.lock();
+    defer self.directories_mutex.unlock();
     self.retainParentFdLocked(parent_index);
 }
 
@@ -157,6 +159,8 @@ pub fn releaseParentFd(self: *Context, parent_index: usize) void {
         const fd_ptr = self.directories.ptr(.fd, parent_index);
         const fd = fd_ptr.*;
         if (fd != invalid_fd) {
+            self.directories_mutex.lock();
+            defer self.directories_mutex.unlock();
             std.posix.close(fd);
             fd_ptr.* = invalid_fd;
         }
@@ -173,6 +177,8 @@ pub fn releaseParentFdAfterOpen(self: *Context, parent_index: usize) void {
         const fd_ptr = self.directories.ptr(.fd, parent_index);
         const fd = fd_ptr.*;
         if (fd != invalid_fd) {
+            self.directories_mutex.lock();
+            defer self.directories_mutex.unlock();
             std.posix.close(fd);
             fd_ptr.* = invalid_fd;
         }

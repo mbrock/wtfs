@@ -170,7 +170,7 @@ fn gatherPhase(self: *Self) !void {
     var worker_pool: std.Thread.Pool = undefined;
     try worker_pool.init(.{
         .allocator = self.allocator,
-        .stack_size = 16 * 1024 * 1024,
+        .stack_size = 32 * 1024 * 1024,
     });
     defer worker_pool.deinit();
 

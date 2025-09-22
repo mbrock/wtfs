@@ -57,7 +57,7 @@ progress: std.Progress.Node,
 errprogress: std.Progress.Node,
 
 /// Platform syscall dispatcher used for directory opens and metadata
-dispatcher: SysDispatcher.Dispatcher,
+dispatcher: SysDispatcher.Backend,
 
 /// Buffers for various operations
 path_buffer: std.ArrayList(u8),
@@ -93,7 +93,7 @@ pub fn directoryWorker(ctx: *Context) void {
     defer worker.path_buffer.deinit(worker.allocator);
     defer worker.dispatcher.deinit();
 
-    worker.dispatcher = SysDispatcher.Dispatcher.init(.{
+    worker.dispatcher.init(.{
         .allocator = worker.allocator,
         .entries = null,
     }) catch |err| {

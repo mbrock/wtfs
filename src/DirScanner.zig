@@ -240,7 +240,7 @@ const DefaultStatProvider = struct {
 };
 
 pub const DispatcherStatProvider = struct {
-    pub const ContextType = *SysDispatcher.Dispatcher;
+    pub const ContextType = *SysDispatcher.Backend;
 
     pub fn statAt(dispatcher: ContextType, dir_fd: std.posix.fd_t, name: [:0]const u8) posix.FStatAtError!posix.Stat {
         // TODO: Once getdents rides io_uring, we can collapse the remaining
