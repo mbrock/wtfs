@@ -77,7 +77,11 @@ pub const LinuxBackend = if (use_linux) struct {
         self.ring.deinit();
     }
 
-    pub fn openDirectory(self: *LinuxBackend, parent_fd: posix.fd_t, name: [:0]const u8) posix.OpenError!posix.fd_t {
+    pub fn openDirectory(
+        self: *LinuxBackend,
+        parent_fd: posix.fd_t,
+        name: [:0]const u8,
+    ) posix.OpenError!posix.fd_t {
         var sqe = self.tryAcquireSqe() catch |err| {
             return mapOpenSubmitError(err, parent_fd, name);
         };

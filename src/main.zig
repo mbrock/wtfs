@@ -195,13 +195,9 @@ fn dumpStructLayouts() !void {
     const stdout = &stdout_writer.interface;
     defer stdout.flush() catch {};
 
-    try dumpStruct(stdout, "SysDispatcher.Config", SysDispatcher.Config);
-    try dumpStruct(stdout, "SysDispatcher.StatRequest", SysDispatcher.StatRequest);
-    try dumpStruct(stdout, "SysDispatcher.LinuxBackend", SysDispatcher.LinuxBackend);
+    try dumpStruct(stdout, "Context", @import("Context.zig"));
     try dumpStruct(stdout, "Worker", WorkerMod.Worker);
     try dumpStruct(stdout, "Worker.Scanner", WorkerMod.Scanner);
-    try dumpStruct(stdout, "Context", @import("Context.zig"));
-
     if (builtin.target.os.tag == .linux) {
         const entries_type = @FieldType(WorkerMod.Scanner, "entries");
         const entries_info = @typeInfo(entries_type);
@@ -212,6 +208,10 @@ fn dumpStructLayouts() !void {
             else => {},
         }
     }
+    try dumpStruct(stdout, "SysDispatcher.Config", SysDispatcher.Config);
+    try dumpStruct(stdout, "SysDispatcher.StatRequest", SysDispatcher.StatRequest);
+    try dumpStruct(stdout, "SysDispatcher.LinuxBackend", SysDispatcher.LinuxBackend);
+    try dumpStruct(stdout, "fs.Dir.Iterator", std.fs.Dir.Iterator);
 }
 
 fn dumpStruct(writer: *Writer, comptime name: []const u8, comptime T: type) !void {

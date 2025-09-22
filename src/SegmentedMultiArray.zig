@@ -74,6 +74,8 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         shelf_count: std.atomic.Value(usize) = .init(0),
         grow_token: std.atomic.Value(u8) = .init(0), // 0 = free, 1 = owned
 
+        pub const empty: Self = .{};
+
         /// Releases all allocated shelves using `alloc` and leaves `self` undefined.
         /// Existing field pointers become invalid once this returns.
         pub fn deinit(self: *Self, alloc: Allocator) void {
