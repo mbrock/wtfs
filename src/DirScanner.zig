@@ -241,11 +241,36 @@ const DefaultStatProvider = struct {
 
 pub const DispatcherStatProvider = struct {
     pub const ContextType = *SysDispatcher.Backend;
+    pub const StatRequest = SysDispatcher.StatRequest;
 
     pub fn statAt(dispatcher: ContextType, dir_fd: std.posix.fd_t, name: [:0]const u8) posix.FStatAtError!posix.Stat {
         // TODO: Once getdents rides io_uring, we can collapse the remaining
         // synchronous pieces that still live in Worker.refill.
         return dispatcher.statAt(dir_fd, name);
+    }
+
+    pub fn queueStat(
+        dispatcher: ContextType,
+        dir_fd: std.posix.fd_t,
+        name: [:0]const u8,
+        request: *StatRequest,
+    ) posix.FStatAtError!void {
+        if (comptime builtin.target.os.tag != .linux) {
+            @compileError("queueStat is only available on Linux targets");
+        }
+        return dispatcher.queueStat(dir_fd, name, request);
+    }
+
+    pub fn awaitStat(
+        dispatcher: ContextType,
+        request: *StatRequest,
+        dir_fd: std.posix.fd_t,
+        name: [:0]const u8,
+    ) posix.FStatAtError!posix.Stat {
+        if (comptime builtin.target.os.tag != .linux) {
+            @compileError("awaitStat is only available on Linux targets");
+        }
+        return dispatcher.awaitStat(request, dir_fd, name);
     }
 };
 
@@ -256,6 +281,8 @@ pub fn DirScanner(mask: AttrGroupMask) type {
 pub fn DirScannerWithProvider(mask: AttrGroupMask, comptime Provider: type) type {
     if (builtin.target.os.tag == .macos) {
         return MacOSDirScanner(mask, Provider);
+    } else if (builtin.target.os.tag == .linux and @hasDecl(Provider, "queueStat")) {
+        return LinuxDirScanner(mask, Provider);
     } else {
         return PosixDirScanner(mask, Provider);
     }
@@ -409,6 +436,220 @@ fn MacOSDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
                 VLNK => .symlink,
                 else => .other,
             };
+        }
+    };
+}
+
+fn LinuxDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
+    const BatchSize = 64;
+    const needs_dir_stat = comptime mask.dir.linkcount or mask.dir.allocsize or
+        mask.dir.ioblocksize or mask.dir.datalength;
+    const needs_file_stat = comptime mask.file.linkcount or mask.file.totalsize or
+        mask.file.allocsize;
+
+    return struct {
+        pub const Payload = PayloadFor(mask);
+        pub const Entry = EntryFor(mask);
+        const EntryDetails = @FieldType(Entry, "details");
+        const DirPayload = @FieldType(EntryDetails, "dir");
+        const FilePayload = @FieldType(EntryDetails, "file");
+        const stat_has_nlink = @hasField(posix.Stat, "nlink");
+        const stat_has_blocks = @hasField(posix.Stat, "blocks");
+        const stat_has_blksize = @hasField(posix.Stat, "blksize");
+
+        const BatchEntry = struct {
+            name_offset: u32 = 0,
+            name_len: u32 = 0,
+            kind: Kind = .other,
+            stat_req: Provider.StatRequest = .{},
+            stat: posix.Stat = undefined,
+            stat_ready: bool = false,
+            queued: bool = false,
+        };
+
+        dir: std.fs.Dir,
+        iterator: std.fs.Dir.Iterator,
+        buf: []u8,
+        provider_ctx: Provider.ContextType,
+        entries: [BatchSize]BatchEntry = undefined,
+        batch_count: usize = 0,
+        batch_index: usize = 0,
+        buf_used: usize = 0,
+
+        pub fn init(fd: std.posix.fd_t, buf: []u8, provider_ctx: Provider.ContextType) @This() {
+            var scanner = @This(){
+                .dir = .{ .fd = fd },
+                .iterator = undefined,
+                .buf = buf,
+                .provider_ctx = provider_ctx,
+                .entries = undefined,
+                .batch_count = 0,
+                .batch_index = 0,
+                .buf_used = 0,
+            };
+            scanner.iterator = scanner.dir.iterateAssumeFirstIteration();
+            return scanner;
+        }
+
+        fn resetBatch(self: *@This()) void {
+            self.batch_count = 0;
+            self.batch_index = 0;
+            self.buf_used = 0;
+        }
+
+        fn nameSlice(self: *@This(), entry: *const BatchEntry) [:0]const u8 {
+            const start: usize = @intCast(entry.name_offset);
+            const len: usize = @intCast(entry.name_len);
+            return self.buf[start .. start + len :0];
+        }
+
+        pub fn fill(self: *@This()) !bool {
+            if (self.batch_index < self.batch_count) return true;
+
+            self.resetBatch();
+
+            while (self.batch_count < BatchSize) {
+                const dir_entry = (try self.iterator.next()) orelse break;
+                const raw_name = dir_entry.name;
+                const required = raw_name.len + 1;
+
+                if (required > self.buf.len) {
+                    return error.BufferTooSmall;
+                }
+
+                if (self.buf_used + required > self.buf.len) {
+                    if (self.batch_count == 0) return error.BufferTooSmall;
+                    break;
+                }
+
+                var dest = self.buf[self.buf_used .. self.buf_used + required];
+                std.mem.copyForwards(u8, dest[0..raw_name.len], raw_name);
+                dest[raw_name.len] = 0;
+                const name_offset = self.buf_used;
+                self.buf_used += required;
+                const name_z = dest[0..raw_name.len :0];
+
+                const entry_kind: Kind = switch (dir_entry.kind) {
+                    .directory => .dir,
+                    .file => .file,
+                    .sym_link => .symlink,
+                    else => .other,
+                };
+
+                var entry = &self.entries[self.batch_count];
+                entry.* = .{
+                    .name_offset = @intCast(name_offset),
+                    .name_len = @intCast(raw_name.len),
+                    .kind = entry_kind,
+                    .stat_req = .{},
+                    .stat = undefined,
+                    .stat_ready = false,
+                    .queued = false,
+                };
+
+                const needs_stat = switch (entry_kind) {
+                    .dir => needs_dir_stat,
+                    .file => needs_file_stat,
+                    else => false,
+                };
+
+                if (needs_stat) {
+                    try Provider.queueStat(self.provider_ctx, self.dir.fd, name_z, &entry.stat_req);
+                    entry.queued = true;
+                }
+
+                self.batch_count += 1;
+            }
+
+            if (self.batch_count == 0) return false;
+
+            for (self.entries[0..self.batch_count]) |*entry| {
+                if (!entry.queued) continue;
+                const name_z = self.nameSlice(entry);
+                entry.stat = try Provider.awaitStat(self.provider_ctx, &entry.stat_req, self.dir.fd, name_z);
+                entry.stat_ready = true;
+            }
+
+            return true;
+        }
+
+        pub fn next(self: *@This()) !?Entry {
+            if (self.batch_index >= self.batch_count) return null;
+            defer self.batch_index += 1;
+            return self.makeEntry(&self.entries[self.batch_index]);
+        }
+
+        fn makeEntry(self: *@This(), entry: *const BatchEntry) Entry {
+            var result: Entry = undefined;
+            const name_z = self.nameSlice(entry);
+
+            if (comptime mask.common.name) result.name = name_z;
+            if (comptime mask.common.objtype) result.kind = entry.kind;
+            if (comptime mask.common.fsid) result.fsid = .{ .id0 = 0, .id1 = 0 };
+            if (comptime mask.common.objid) result.objid = 0;
+
+            result.details = switch (entry.kind) {
+                .dir => blk: {
+                    var payload: DirPayload = std.mem.zeroes(DirPayload);
+                    if (needs_dir_stat and entry.stat_ready) {
+                        const stat = entry.stat;
+                        if (comptime mask.dir.linkcount) {
+                            if (stat_has_nlink) {
+                                payload.linkcount = @intCast(stat.nlink);
+                            }
+                        }
+                        if (comptime mask.dir.allocsize) {
+                            if (stat_has_blocks) {
+                                const blocks: u64 = @intCast(stat.blocks);
+                                payload.allocsize = blocks * 512;
+                            } else {
+                                payload.allocsize = 0;
+                            }
+                        }
+                        if (comptime mask.dir.ioblocksize) {
+                            if (stat_has_blksize) {
+                                payload.ioblocksize = @intCast(stat.blksize);
+                            } else {
+                                payload.ioblocksize = 0;
+                            }
+                        }
+                        if (comptime mask.dir.datalength) {
+                            payload.datalength = @intCast(stat.size);
+                        }
+                    }
+                    if (comptime mask.dir.entrycount) payload.entrycount = 0;
+                    if (comptime mask.dir.mountstatus) payload.mountstatus = 0;
+                    break :blk .{ .dir = payload };
+                },
+                .file => blk: {
+                    var payload: FilePayload = std.mem.zeroes(FilePayload);
+                    if (needs_file_stat and entry.stat_ready) {
+                        const stat = entry.stat;
+                        if (comptime mask.file.linkcount) {
+                            if (stat_has_nlink) {
+                                payload.linkcount = @intCast(stat.nlink);
+                            } else {
+                                payload.linkcount = 0;
+                            }
+                        }
+                        if (comptime mask.file.totalsize) {
+                            payload.totalsize = @intCast(stat.size);
+                        }
+                        if (comptime mask.file.allocsize) {
+                            if (stat_has_blocks) {
+                                const blocks: u64 = @intCast(stat.blocks);
+                                payload.allocsize = blocks * 512;
+                            } else {
+                                payload.allocsize = @intCast(stat.size);
+                            }
+                        }
+                    }
+                    break :blk .{ .file = payload };
+                },
+                .symlink, .other => .{ .other = {} },
+            };
+
+            return result;
         }
     };
 }

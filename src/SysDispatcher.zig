@@ -16,6 +16,12 @@ pub const Config = struct {
     entries: ?u16 = null,
 };
 
+pub const StatRequest = if (use_linux) struct {
+    token: u64 = 0,
+    statx_result: linux.Statx = undefined,
+    fallback: ?posix.Stat = null,
+} else struct {};
+
 pub const Backend = switch (builtin.target.os.tag) {
     .linux => LinuxBackend,
     else => SyncBackend,
@@ -51,6 +57,7 @@ const LinuxBackend = if (use_linux) struct {
     allocator: std.mem.Allocator,
     pending: AutoHashMap(u64, linux.io_uring_cqe) = .empty,
     next_user_data: AtomicU64,
+    pending_submit: u32 = 0,
 
     pub fn init(self: *LinuxBackend, config: Config) !void {
         const entries = config.entries orelse 128;
@@ -71,17 +78,15 @@ const LinuxBackend = if (use_linux) struct {
     }
 
     pub fn openDirectory(self: *LinuxBackend, parent_fd: posix.fd_t, name: [:0]const u8) posix.OpenError!posix.fd_t {
-        var sqe = self.ring.get_sqe() catch |err| {
-            return switch (err) {
-                error.SubmissionQueueFull => posix.openat(parent_fd, name, SyncBackend.directoryFlags(), 0),
-            };
+        var sqe = self.tryAcquireSqe() catch |err| {
+            return mapOpenSubmitError(err, parent_fd, name);
         };
         const token = self.reserveToken();
         const dir_fd: linux.fd_t = @intCast(parent_fd);
         sqe.prep_openat(dir_fd, name.ptr, directoryLinuxFlags(), 0);
         sqe.user_data = token;
 
-        _ = self.ring.submit_and_wait(1) catch |err| {
+        self.submitQueued() catch |err| {
             return mapOpenSubmitError(err, parent_fd, name);
         };
 
@@ -99,24 +104,85 @@ const LinuxBackend = if (use_linux) struct {
     }
 
     pub fn statAt(self: *LinuxBackend, dir_fd: posix.fd_t, name: [:0]const u8) posix.FStatAtError!posix.Stat {
-        var statx_buf = std.mem.zeroes(linux.Statx);
+        var request = StatRequest{};
+        try self.queueStat(dir_fd, name, &request);
 
-        var sqe = self.ring.get_sqe() catch |err| {
-            return switch (err) {
-                error.SubmissionQueueFull => posix.fstatat(dir_fd, name, 0),
-            };
-        };
-
-        const token = self.reserveToken();
-        const fd: linux.fd_t = @intCast(dir_fd);
-        sqe.prep_statx(fd, name.ptr, 0, linux.STATX_BASIC_STATS, &statx_buf);
-        sqe.user_data = token;
-
-        _ = self.ring.submit_and_wait(1) catch |err| {
+        self.submitQueued() catch |err| {
             return mapStatSubmitError(err, dir_fd, name);
         };
 
-        const cqe = self.awaitCompletion(token, 0) catch |err| return mapStatSubmitError(err, dir_fd, name);
+        return self.awaitStat(&request, dir_fd, name);
+    }
+
+    fn reserveToken(self: *LinuxBackend) u64 {
+        return self.next_user_data.fetchAdd(1, .acq_rel);
+    }
+
+    fn tryAcquireSqe(self: *LinuxBackend) !*linux.io_uring_sqe {
+        const sqe = self.ring.get_sqe() catch |err| {
+            return err;
+        };
+        self.pending_submit += 1;
+        return sqe;
+    }
+
+    pub fn submitQueued(self: *LinuxBackend) !void {
+        if (self.pending_submit == 0) return;
+        _ = try self.ring.submit();
+        self.pending_submit = 0;
+    }
+
+    pub fn queueStat(
+        self: *LinuxBackend,
+        dir_fd: posix.fd_t,
+        name: [:0]const u8,
+        request: *StatRequest,
+    ) posix.FStatAtError!void {
+        request.fallback = null;
+
+        const sqe = self.tryAcquireSqe() catch |err| switch (err) {
+            error.SubmissionQueueFull => blk: {
+                self.submitQueued() catch {};
+                break :blk (self.tryAcquireSqe() catch |retry_err| switch (retry_err) {
+                    error.SubmissionQueueFull => null,
+                });
+            },
+        };
+
+        if (sqe) |sqe_ptr| {
+            request.statx_result = std.mem.zeroes(linux.Statx);
+            const token = self.reserveToken();
+            request.token = token;
+            const fd: linux.fd_t = @intCast(dir_fd);
+            sqe_ptr.prep_statx(fd, name.ptr, 0, linux.STATX_BASIC_STATS, &request.statx_result);
+            sqe_ptr.user_data = token;
+            return;
+        }
+
+        const stat = posix.fstatat(dir_fd, name, 0);
+        request.token = 0;
+        request.fallback = stat catch |err| return err;
+    }
+
+    pub fn awaitStat(
+        self: *LinuxBackend,
+        request: *StatRequest,
+        dir_fd: posix.fd_t,
+        name: [:0]const u8,
+    ) posix.FStatAtError!posix.Stat {
+        if (request.fallback) |stat| {
+            request.fallback = null;
+            return stat;
+        }
+
+        self.submitQueued() catch |err| {
+            return mapStatSubmitError(err, dir_fd, name);
+        };
+
+        const cqe = self.awaitCompletion(request.token, 0) catch |err| {
+            return mapStatSubmitError(err, dir_fd, name);
+        };
+
         if (cqe.res < 0) {
             const errno_linux: linux.E = @enumFromInt(@as(u32, @intCast(-cqe.res)));
             const errno_posix: posix.E = @enumFromInt(@intFromEnum(errno_linux));
@@ -126,11 +192,7 @@ const LinuxBackend = if (use_linux) struct {
             return mapStatError(errno_posix);
         }
 
-        return convertStatx(statx_buf);
-    }
-
-    fn reserveToken(self: *LinuxBackend) u64 {
-        return self.next_user_data.fetchAdd(1, .acq_rel);
+        return convertStatx(request.statx_result);
     }
 
     fn awaitCompletion(self: *LinuxBackend, token: u64, wait_hint: u32) !linux.io_uring_cqe {
