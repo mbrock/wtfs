@@ -295,6 +295,11 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
             return .{ .parent = self };
         }
 
+        pub fn slices(self: *Self) SliceView {
+            const len = self.len.load(.acquire);
+            return .{ .parent = self, .len = len };
+        }
+
         /// Compact into a contiguous std.MultiArrayList(T).
         /// Copies all rows into a contiguous `std.MultiArrayList(T)`.
         /// Each shelf is copied in order; callers own the returned list and must `deinit` it.
@@ -332,6 +337,56 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         }
 
         // ----------------- Segmented field view -----------------
+
+        pub const SliceView = struct {
+            parent: *Self,
+            len: usize,
+            data: [fields.len][MAX_SHELVES][]u8,
+
+            pub fn init(self: *Self) @This() {
+                inline for (0..fields.len) |f| {
+                    for (0..Self.shelfIndex(self.len - 1) + 1) |s| {
+                        const entry = self.parent.shelves[f][s];
+                        if (entry.addr == 0 or @sizeOf(FieldTypeI(f)) == 0) {
+                            self.data[f][s] = &.{};
+                        } else {
+                            const rows = Self.shelfSizeByIndex(@intCast(s));
+                            const base: [*]FieldTypeI(f) = @as([*]FieldTypeI(f), @ptrFromInt(entry.addr));
+                            self.data[f][s] = base[0..rows];
+                        }
+                    }
+                }
+            }
+
+            /// Returns the number of logical elements visible to the view.
+            pub fn lenItems(self: @This()) usize {
+                return self.len;
+            }
+
+            /// Returns the segmented array as a slice of slices, one per shelf.
+            pub fn shelves(self: @This(), comptime field: Field) [][]FieldType(field) {
+                const FT = FieldType(field);
+                if (@sizeOf(FT) == 0) {
+                    return &.{};
+                }
+
+                var shelfslices: [MAX_SHELVES][]FT = undefined;
+                for (0..Self.shelfIndex(self.len - 1)) |i| {
+                    var entries: [fields.len]ShelfEntry = undefined;
+                    inline for (0..fields.len) |fi| {
+                        entries[fi] = self.parent.shelves[fi][i];
+                    }
+                    if (entries[0].addr == 0) {
+                        shelfslices[i] = &.{};
+                    } else {
+                        const rows = Self.shelfSizeByIndex(@intCast(i));
+                        const base: [*]T = @as([*]T, @ptrFromInt(entries[0].addr));
+                        shelfslices[i] = base[0..rows];
+                    }
+                }
+                return shelfslices[0 .. Self.shelfIndex(self.len - 1) + 1];
+            }
+        };
 
         /// Typed segmented field view used by `itemsSeg`.
         pub fn SegView(comptime field: Field) type {

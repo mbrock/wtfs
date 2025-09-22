@@ -153,7 +153,7 @@ fn processDirectory(self: *Worker, index: usize) !usize {
 
 fn openDirectory(self: *Worker, index: usize) !std.posix.fd_t {
     const basename = self.extractName(
-        self.ctx.directories.slice().items(.basename)[index],
+        self.ctx.directories.ptr(.basename, index).*,
     );
 
     if (index != 0) {
@@ -168,8 +168,8 @@ fn openChildDirectory(
     index: usize,
     basename: [:0]const u8,
 ) !std.posix.fd_t {
-    const parent_index = self.ctx.directories.items(.parent)[index];
-    const parent = self.ctx.directories.items(.fd)[parent_index];
+    const parent_index: usize = @intCast(self.ctx.directories.ptr(.parent, index).*);
+    const parent = self.ctx.directories.ptr(.fd, parent_index).*;
     const opened = self.dispatcher.openDirectory(parent, basename);
 
     // We've successfully used the parent fd for openat(), release our reference
@@ -188,7 +188,7 @@ fn openRootDirectory(
     index: usize,
     basename: [:0]const u8,
 ) !std.posix.fd_t {
-    const fd = self.ctx.directories.items(.fd)[index];
+    const fd = self.ctx.directories.ptr(.fd, index).*;
     const opened = self.dispatcher.openDirectory(fd, basename) catch |err| switch (err) {
         error.PermissionDenied, error.AccessDenied => {
             self.progress.completeOne();
@@ -233,7 +233,10 @@ fn scanDirectory(
             // Non-macOS: the scanner may be backed by an async dispatcher. We
             // still refill synchronously for now, but once getdents runs on the
             // ring this loop should continue to work unchanged.
-            if (!(try scanner.fill())) break;
+            const maybe_entry = scanner.next() catch |err| {
+                return self.handleScanError(index, err);
+            };
+            if (maybe_entry == null) break;
             node.increaseEstimatedTotalItems(1);
         }
 
@@ -308,9 +311,8 @@ fn processBatch(
     while (true) {
         const entrynode = node.start("entry", 0);
 
-        const maybe_entry = scanner.next() catch |err| {
-            return self.handleScanError(index, err);
-        };
+        const maybe_entry = scanner.next() catch |err|
+            self.handleScanError(index, err);
 
         const entry = maybe_entry orelse {
             entrynode.end();
@@ -365,15 +367,14 @@ pub fn addChild(self: *Worker, parent_index: usize, name: []const u8) !usize {
     self.ctx.directories_mutex.lock();
     defer self.ctx.directories_mutex.unlock();
     const index = try self.ctx.directories.addOne(self.allocator);
-    var slices = self.ctx.directories.slice();
-    slices.items(.parent)[index] = @intCast(parent_index);
-    slices.items(.basename)[index] = name_copy;
-    slices.items(.fd)[index] = Context.invalid_fd;
-    slices.items(.total_size)[index] = 0;
-    slices.items(.total_files)[index] = 0;
-    slices.items(.total_dirs)[index] = 1;
-    slices.items(.inaccessible)[index] = false;
-    slices.items(.fdrefcount)[index] = .init(0);
+    self.ctx.directories.ptr(.parent, index).* = @intCast(parent_index);
+    self.ctx.directories.ptr(.basename, index).* = name_copy;
+    self.ctx.directories.ptr(.fd, index).* = Context.invalid_fd;
+    self.ctx.directories.ptr(.total_size, index).* = 0;
+    self.ctx.directories.ptr(.total_files, index).* = 0;
+    self.ctx.directories.ptr(.total_dirs, index).* = 1;
+    self.ctx.directories.ptr(.inaccessible, index).* = false;
+    self.ctx.directories.ptr(.fdrefcount, index).* = Context.AtomicU16.init(0);
 
     return index;
 }

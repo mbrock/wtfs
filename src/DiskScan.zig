@@ -19,8 +19,8 @@ skip_hidden: bool = true,
 /// Root directory path to scan
 root: []const u8 = ".",
 
-/// Multi-array storage for all discovered directory nodes and their metadata
-directories: std.MultiArrayList(Context.DirectoryNode) = .empty,
+/// Segmented storage for all discovered directory nodes and their metadata
+directories: Context.DirectoryTable = .{},
 
 /// Pool of null-terminated directory names referenced by basename indices
 namedata: std.ArrayList(u8) = .empty,
@@ -96,8 +96,6 @@ pub const ScanResults = struct {
 var stdout_buffer: [4096]u8 = undefined;
 var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
 const stdout = &stdout_writer.interface;
-
-pub const BinaryFormatVersion: u16 = 1;
 
 pub const RunOptions = struct {
     /// When true, generate the human readable summary and print it to stdout.
@@ -204,17 +202,14 @@ fn writeFullPath(
     index: usize,
     writer: *std.Io.Writer,
 ) !void {
-    const slices = self.directories.slice();
-    const basenameidx = slices.items(.basename)[index];
-    const parent = slices.items(.parent)[index];
+    const basename_off: usize = @intCast(self.directories.ptr(.basename, index).*);
+    const parent_index = self.directories.ptr(.parent, index).*;
 
     if (index != 0) {
-        try self.writeFullPath(@intCast(parent), writer);
+        try self.writeFullPath(@intCast(parent_index), writer);
         try writer.writeByte('/');
     }
-    try writer.writeAll(
-        std.mem.sliceTo(self.namedata.items[basenameidx..], 0),
-    );
+    try writer.writeAll(std.mem.sliceTo(self.namedata.items[basename_off..], 0));
 }
 
 fn buildPath(self: *Self, index: usize) ![]u8 {
@@ -243,12 +238,11 @@ fn buildFilePath(self: *Self, directory_index: usize, basename_index: u32) ![]u8
 }
 
 pub fn directoryName(
-    directories: *const std.MultiArrayList(Context.DirectoryNode),
+    directories: *Context.DirectoryTable,
     namedata: *const std.ArrayList(u8),
     index: usize,
 ) []const u8 {
-    const slices = directories.slice();
-    const base_index = slices.items(.basename)[index];
+    const base_index: usize = @intCast(directories.ptr(.basename, index).*);
     return std.mem.sliceTo(namedata.items[base_index..], 0);
 }
 
@@ -269,14 +263,12 @@ test "path helpers use shared directory data" {
     try disk_scan.namedata.append(allocator, 0);
 
     const root_index = try disk_scan.directories.addOne(allocator);
-    var slices = disk_scan.directories.slice();
-    slices.items(.parent)[root_index] = 0;
-    slices.items(.basename)[root_index] = @intCast(root_name_offset);
+    disk_scan.directories.ptr(.parent, root_index).* = 0;
+    disk_scan.directories.ptr(.basename, root_index).* = @intCast(root_name_offset);
 
     const child_index = try disk_scan.directories.addOne(allocator);
-    slices = disk_scan.directories.slice();
-    slices.items(.parent)[child_index] = @intCast(root_index);
-    slices.items(.basename)[child_index] = @intCast(child_name_offset);
+    disk_scan.directories.ptr(.parent, child_index).* = @intCast(root_index);
+    disk_scan.directories.ptr(.basename, child_index).* = @intCast(child_name_offset);
 
     try std.testing.expectEqualStrings("root", directoryName(&disk_scan.directories, &disk_scan.namedata, root_index));
     try std.testing.expectEqualStrings("child", directoryName(&disk_scan.directories, &disk_scan.namedata, child_index));
@@ -304,11 +296,6 @@ test "path helpers use shared directory data" {
 }
 
 test "threaded disk scan can repeatedly scan populated directory trees" {
-    if (@FieldType(Context, "directories") == *std.MultiArrayList(Context.DirectoryNode)) {
-        // let's reenable this after we switch to a SegmentedMultiArray for directories
-        return error.SkipZigTest;
-    }
-
     if (builtin.single_threaded) return error.SkipZigTest;
     if (builtin.target.os.tag == .macos) return error.SkipZigTest;
     if (builtin.target.os.tag == .windows) return error.SkipZigTest;
@@ -350,7 +337,7 @@ test "threaded disk scan can repeatedly scan populated directory trees" {
     const expected_files = top_dir_count * sub_dir_count * files_per_subdir;
     const expected_directories = 1 + top_dir_count + (top_dir_count * sub_dir_count);
 
-    for (0..10) |_| {
+    for (0..100) |_| {
         var disk_scan = Self{ .allocator = allocator, .root = root_path };
         defer {
             disk_scan.directories.deinit(allocator);
@@ -360,11 +347,11 @@ test "threaded disk scan can repeatedly scan populated directory trees" {
         }
 
         disk_scan.progress_root = std.Progress.Node.none;
+
         const results = try disk_scan.performScan();
 
-        const slices = disk_scan.directories.slice();
-        try std.testing.expectEqual(expected_files, slices.items(.total_files)[0]);
-        try std.testing.expectEqual(expected_directories, slices.items(.total_dirs)[0]);
+        try std.testing.expectEqual(expected_files, disk_scan.directories.ptr(.total_files, 0).*);
+        try std.testing.expectEqual(expected_directories, disk_scan.directories.ptr(.total_dirs, 0).*);
         try std.testing.expectEqual(@as(u64, expected_directories), results.totals.directories);
         try std.testing.expectEqual(@as(u64, expected_files), results.totals.files);
     }
@@ -374,26 +361,25 @@ test "threaded disk scan can repeatedly scan populated directory trees" {
 
 const StatsAggregator = struct {
     fn aggregateUp(self: *Self) void {
-        var slices = self.directories.slice();
-        var idx = self.directories.len;
+        const len_snapshot = self.directories.len.load(.acquire);
+        var idx = len_snapshot;
         while (idx > 0) {
             idx -= 1;
             if (idx != 0) {
-                const parent_index: usize = @intCast(slices.items(.parent)[idx]);
-                slices.items(.total_size)[parent_index] += slices.items(.total_size)[idx];
-                slices.items(.total_files)[parent_index] += slices.items(.total_files)[idx];
-                slices.items(.total_dirs)[parent_index] += slices.items(.total_dirs)[idx];
+                const parent_index: usize = @intCast(self.directories.ptr(.parent, idx).*);
+                self.directories.ptr(.total_size, parent_index).* += self.directories.ptr(.total_size, idx).*;
+                self.directories.ptr(.total_files, parent_index).* += self.directories.ptr(.total_files, idx).*;
+                self.directories.ptr(.total_dirs, parent_index).* += self.directories.ptr(.total_dirs, idx).*;
             }
             self.progress_root.completeOne();
         }
     }
 
     fn extractTotals(self: *Self) DirectoryTotals {
-        const slices = self.directories.slice();
         return .{
-            .directories = slices.items(.total_dirs)[0],
-            .files = slices.items(.total_files)[0],
-            .bytes = slices.items(.total_size)[0],
+            .directories = @intCast(self.directories.ptr(.total_dirs, 0).*),
+            .files = @intCast(self.directories.ptr(.total_files, 0).*),
+            .bytes = self.directories.ptr(.total_size, 0).*,
         };
     }
 };
@@ -405,15 +391,16 @@ const SummaryBuilder = struct {
         var entries = std.ArrayList(SummaryEntry){};
         errdefer Summary.freeEntryList(self.allocator, &entries);
         self.progress_root.setName("Building paths");
-        self.progress_root.setEstimatedTotalItems(self.directories.len);
+        const len_snapshot = self.directories.len.load(.acquire);
+        self.progress_root.setEstimatedTotalItems(len_snapshot);
 
         var idx: usize = 0;
-        while (idx < self.directories.len) : (idx += 1) {
+        while (idx < len_snapshot) : (idx += 1) {
             defer self.progress_root.completeOne();
 
             if (idx == 0) continue;
 
-            const parent = self.directories.slice().items(.parent)[idx];
+            const parent = self.directories.ptr(.parent, idx).*;
             if (parent == 0) {
                 const path = try buildPath(self, idx);
                 entries.append(self.allocator, .{
@@ -435,14 +422,13 @@ const SummaryBuilder = struct {
         var top_indexes = std.ArrayList(usize){};
         defer top_indexes.deinit(self.allocator);
 
-        const slices = self.directories.slice();
-        const sizes = slices.items(.total_size);
+        const len_snapshot = self.directories.len.load(.acquire);
 
         var idx: usize = 1; // Skip root
-        while (idx < self.directories.len) : (idx += 1) {
-            const size = sizes[idx];
+        while (idx < len_snapshot) : (idx += 1) {
+            const size = self.directories.ptr(.total_size, idx).*;
             if (size == 0) continue;
-            try SummaryBuilder.insertTopIndex(self, &top_indexes, idx, max_entries, sizes);
+            try SummaryBuilder.insertTopIndex(self, &top_indexes, idx, max_entries, size);
         }
 
         var entries = std.ArrayList(SummaryEntry){};
@@ -498,15 +484,14 @@ const SummaryBuilder = struct {
         list: *std.ArrayList(usize),
         index: usize,
         max_entries: usize,
-        sizes: []const u64,
+        size: u64,
     ) !void {
-        const size = sizes[index];
         if (size == 0) return;
 
         if (list.items.len < max_entries) {
             try list.append(self.allocator, index);
             var pos = list.items.len - 1;
-            while (pos > 0 and size > sizes[list.items[pos - 1]]) {
+            while (pos > 0 and size > self.directories.ptr(.total_size, list.items[pos - 1]).*) {
                 list.items[pos] = list.items[pos - 1];
                 pos -= 1;
             }
@@ -515,11 +500,11 @@ const SummaryBuilder = struct {
         }
 
         const smallest_index = list.items[max_entries - 1];
-        if (size <= sizes[smallest_index]) return;
+        if (size <= self.directories.ptr(.total_size, smallest_index).*) return;
 
         list.items[max_entries - 1] = index;
         var pos: usize = max_entries - 1;
-        while (pos > 0 and size > sizes[list.items[pos - 1]]) {
+        while (pos > 0 and size > self.directories.ptr(.total_size, list.items[pos - 1]).*) {
             list.items[pos] = list.items[pos - 1];
             pos -= 1;
         }
@@ -560,12 +545,11 @@ const SummaryBuilder = struct {
     }
 
     const EntrySorter = struct {
-        directories: *std.MultiArrayList(Context.DirectoryNode),
+        directories: *Context.DirectoryTable,
 
         fn bySize(self: @This(), lhs: SummaryEntry, rhs: SummaryEntry) bool {
-            const sizes = self.directories.items(.total_size);
-            const lhs_size = sizes[lhs.index];
-            const rhs_size = sizes[rhs.index];
+            const lhs_size = self.directories.ptr(.total_size, lhs.index).*;
+            const rhs_size = self.directories.ptr(.total_size, rhs.index).*;
 
             if (lhs_size != rhs_size) {
                 return lhs_size > rhs_size;
@@ -698,13 +682,6 @@ pub fn writeBinaryResults(
     writer: *std.Io.Writer,
 ) !void {
     const magic = "wtfsdumpv0.0   \n";
-
-    const dir_slices = self.directories.slice();
-    const parents = dir_slices.items(.parent);
-    const basenames = dir_slices.items(.basename);
-    const total_sizes = dir_slices.items(.total_size);
-    const total_files = dir_slices.items(.total_files);
-    const total_dirs = dir_slices.items(.total_dirs);
     const large_slices = self.large_files.slice();
     const large_dirs = large_slices.items(.directory_index);
     const large_names = large_slices.items(.basename);
@@ -713,11 +690,45 @@ pub fn writeBinaryResults(
     try writer.writeAll(magic);
     try writer.writeStruct(results.totals, .little);
     try writer.writeAll(self.namedata.items);
-    try writer.writeSliceEndian(u32, parents, .little);
-    try writer.writeSliceEndian(u32, basenames, .little);
-    try writer.writeSliceEndian(u64, total_sizes, .little);
-    try writer.writeSliceEndian(u64, total_files, .little);
-    try writer.writeSliceEndian(u64, total_dirs, .little);
+
+    // const len_snapshot = self.directories.len.load(.acquire);
+    // const snapshot = self.directories.slices();
+
+    // var buf32: [4]u8 = undefined;
+    // var buf64: [8]u8 = undefined;
+
+    // var idx: usize = 0;
+    // while (idx < len_snapshot) : (idx += 1) {
+    //     std.mem.writeIntLittle(u32, buf32[0..], self.directories.ptr(.parent, idx).*);
+    //     try writer.writeAll(buf32[0..]);
+    // }
+
+    // idx = 0;
+    // while (idx < len_snapshot) : (idx += 1) {
+    //     std.mem.writeIntLittle(u32, buf32[0..], self.directories.ptr(.basename, idx).*);
+    //     try writer.writeAll(buf32[0..]);
+    // }
+
+    // idx = 0;
+    // while (idx < len_snapshot) : (idx += 1) {
+    //     std.mem.writeIntLittle(u64, buf64[0..], self.directories.ptr(.total_size, idx).*);
+    //     try writer.writeAll(buf64[0..]);
+    // }
+
+    // idx = 0;
+    // while (idx < len_snapshot) : (idx += 1) {
+    //     const value: u64 = @intCast(self.directories.ptr(.total_files, idx).*);
+    //     std.mem.writeIntLittle(u64, buf64[0..], value);
+    //     try writer.writeAll(buf64[0..]);
+    // }
+
+    // idx = 0;
+    // while (idx < len_snapshot) : (idx += 1) {
+    //     const value: u64 = @intCast(self.directories.ptr(.total_dirs, idx).*);
+    //     std.mem.writeIntLittle(u64, buf64[0..], value);
+    //     try writer.writeAll(buf64[0..]);
+    // }
+
     try writer.writeSliceEndian(usize, large_dirs, .little);
     try writer.writeSliceEndian(u32, large_names, .little);
     try writer.writeSliceEndian(u64, large_sizes, .little);

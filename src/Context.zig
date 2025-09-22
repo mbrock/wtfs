@@ -2,6 +2,7 @@ const std = @import("std");
 
 const strpool = @import("pool.zig");
 const TaskQueue = @import("TaskQueue.zig");
+const SegmentedMultiArray = @import("SegmentedMultiArray.zig").SegmentedMultiArray;
 
 pub const DirectoryNode = struct {
     parent: u32,
@@ -20,6 +21,8 @@ pub const LargeFile = struct {
     size: u64,
 };
 
+pub const DirectoryTable = SegmentedMultiArray(DirectoryNode, 1024);
+
 pub const AtomicUsize = std.atomic.Value(usize);
 pub const AtomicU16 = std.atomic.Value(u16);
 pub const invalid_fd: std.posix.fd_t = -1;
@@ -29,7 +32,7 @@ const Context = @This();
 allocator: std.mem.Allocator,
 
 directories_mutex: std.Thread.Mutex = .{},
-directories: *std.MultiArrayList(DirectoryNode),
+directories: *DirectoryTable,
 
 namelock: std.Thread.Mutex = .{},
 namedata: *std.ArrayList(u8),
@@ -57,27 +60,24 @@ pub fn internPath(self: *Context, path: []const u8) !u32 {
 }
 
 pub fn setTotals(self: *Context, index: usize, size: u64, files: usize) void {
-    self.directories_mutex.lock();
-    defer self.directories_mutex.unlock();
-    var slices = self.directories.slice();
-    slices.items(.total_size)[index] = size;
-    slices.items(.total_files)[index] = files;
-    slices.items(.total_dirs)[index] = 1;
+    // self.directories_mutex.lock();
+    // defer self.directories_mutex.unlock();
+    self.directories.ptr(.total_size, index).* = size;
+    self.directories.ptr(.total_files, index).* = files;
+    self.directories.ptr(.total_dirs, index).* = 1;
 }
 
 pub fn markInaccessible(self: *Context, index: usize) void {
     self.directories_mutex.lock();
     defer self.directories_mutex.unlock();
-    var slices = self.directories.slice();
-    const fdrefs = slices.items(.fdrefcount);
-    const ref_ptr = &fdrefs[index];
-    const current_fd = slices.items(.fd)[index];
+    const fd_ptr = self.directories.ptr(.fd, index);
+    const current_fd = fd_ptr.*;
     if (current_fd != invalid_fd) {
         std.posix.close(current_fd);
-        slices.items(.fd)[index] = invalid_fd;
+        fd_ptr.* = invalid_fd;
     }
-    ref_ptr.store(0, .release);
-    slices.items(.inaccessible)[index] = true;
+    self.directories.ptr(.fdrefcount, index).store(0, .release);
+    self.directories.ptr(.inaccessible, index).* = true;
 }
 
 pub fn addRoot(self: *Context, path: []const u8, dir: std.fs.Dir) !usize {
@@ -87,16 +87,14 @@ pub fn addRoot(self: *Context, path: []const u8, dir: std.fs.Dir) !usize {
     defer self.directories_mutex.unlock();
 
     const index = try self.directories.addOne(self.allocator);
-    var slices = self.directories.slice();
-
-    slices.items(.parent)[index] = 0;
-    slices.items(.basename)[index] = name_copy;
-    slices.items(.fd)[index] = dir.fd;
-    slices.items(.total_size)[index] = 0;
-    slices.items(.total_files)[index] = 0;
-    slices.items(.total_dirs)[index] = 1;
-    slices.items(.inaccessible)[index] = false;
-    slices.items(.fdrefcount)[index] = AtomicU16.init(0);
+    self.directories.ptr(.parent, index).* = 0;
+    self.directories.ptr(.basename, index).* = name_copy;
+    self.directories.ptr(.fd, index).* = dir.fd;
+    self.directories.ptr(.total_size, index).* = 0;
+    self.directories.ptr(.total_files, index).* = 0;
+    self.directories.ptr(.total_dirs, index).* = 1;
+    self.directories.ptr(.inaccessible, index).* = false;
+    self.directories.ptr(.fdrefcount, index).* = AtomicU16.init(0);
 
     return index;
 }
@@ -110,25 +108,17 @@ pub fn addRoot(self: *Context, path: []const u8, dir: std.fs.Dir) !usize {
 
 /// Store the opened file descriptor for a directory (thread-safe)
 pub fn setDirectoryFd(self: *Context, index: usize, fd: std.posix.fd_t) void {
-    self.directories_mutex.lock();
-    defer self.directories_mutex.unlock();
-    var slices = self.directories.slice();
-    slices.items(.fd)[index] = fd;
+    self.directories.ptr(.fd, index).* = fd;
 }
 
 /// Increment reference count to keep a parent directory fd open (thread-safe)
 /// Call when scheduling a child directory that will need openat() from this parent
 pub fn retainParentFd(self: *Context, parent_index: usize) void {
-    self.directories_mutex.lock();
-    defer self.directories_mutex.unlock();
     self.retainParentFdLocked(parent_index);
 }
 
-/// Increment reference count when already holding the directories_mutex
-/// Used from batch processing where we hold the lock for performance
 pub fn retainParentFdLocked(self: *Context, parent_index: usize) void {
-    var slices = self.directories.slice();
-    _ = slices.items(.fdrefcount)[parent_index].fetchAdd(1, .acq_rel);
+    _ = self.directories.ptr(.fdrefcount, parent_index).fetchAdd(1, .acq_rel);
 }
 
 pub fn recordLargeFileLocked(
@@ -160,18 +150,15 @@ pub fn recordLargeFile(
 /// Decrement reference count and close fd if no longer needed (thread-safe)
 /// Call after opening a child directory or when done scanning
 pub fn releaseParentFd(self: *Context, parent_index: usize) void {
-    self.directories_mutex.lock();
-    defer self.directories_mutex.unlock();
-
-    var slices = self.directories.slice();
-    const prev_count = slices.items(.fdrefcount)[parent_index].fetchSub(1, .acq_rel);
+    const prev_count = self.directories.ptr(.fdrefcount, parent_index).fetchSub(1, .acq_rel);
 
     // If this was the last child needing this parent fd, close it
     if (prev_count == 1) {
-        const fd = slices.items(.fd)[parent_index];
+        const fd_ptr = self.directories.ptr(.fd, parent_index);
+        const fd = fd_ptr.*;
         if (fd != invalid_fd) {
             std.posix.close(fd);
-            slices.items(.fd)[parent_index] = invalid_fd;
+            fd_ptr.* = invalid_fd;
         }
     }
 }
@@ -179,18 +166,15 @@ pub fn releaseParentFd(self: *Context, parent_index: usize) void {
 /// Release parent fd after successfully opening a child directory from it
 /// Uses stricter memory ordering to ensure parent-child operations are properly sequenced
 pub fn releaseParentFdAfterOpen(self: *Context, parent_index: usize) void {
-    self.directories_mutex.lock();
-    defer self.directories_mutex.unlock();
-
-    var slices = self.directories.slice();
-    const prev_count = slices.items(.fdrefcount)[parent_index].fetchSub(1, .seq_cst);
+    const prev_count = self.directories.ptr(.fdrefcount, parent_index).fetchSub(1, .seq_cst);
 
     // If this was the last child needing this parent fd, close it
     if (prev_count == 1) {
-        const fd = slices.items(.fd)[parent_index];
+        const fd_ptr = self.directories.ptr(.fd, parent_index);
+        const fd = fd_ptr.*;
         if (fd != invalid_fd) {
             std.posix.close(fd);
-            slices.items(.fd)[parent_index] = invalid_fd;
+            fd_ptr.* = invalid_fd;
         }
     }
 }

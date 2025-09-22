@@ -27,14 +27,14 @@ pub fn printHeader(stdout: *Writer, root: []const u8, results: ScanResults) !voi
 }
 
 pub const ReportData = struct {
-    directories: *const std.MultiArrayList(Context.DirectoryNode),
+    directories: *Context.DirectoryTable,
     namedata: *const std.ArrayList(u8),
     idxset: *const strpool.IndexSet,
     large_files: *const std.MultiArrayList(Context.LargeFile),
     totals: DirectoryTotals,
 
     pub fn init(
-        directories: *const std.MultiArrayList(Context.DirectoryNode),
+        directories: *Context.DirectoryTable,
         namedata: *const std.ArrayList(u8),
         idxset: *const strpool.IndexSet,
         large_files: *const std.MultiArrayList(Context.LargeFile),
@@ -79,20 +79,15 @@ pub fn buildTopLevelSummary(
     const count = @min(entries.len, limit);
     try summary.rows.ensureTotalCapacityPrecise(allocator, count);
 
-    const slices = data.directories.slice();
-    const total_sizes = slices.items(.total_size);
-    const total_files = slices.items(.total_files);
-    const total_dirs = slices.items(.total_dirs);
-
     for (entries[0..count]) |entry| {
         const index = entry.index;
-        const dir_total = total_dirs[index];
+        const dir_total = data.directories.ptr(.total_dirs, index).*;
         const dir_count = if (dir_total == 0) 0 else dir_total - 1;
 
         summary.rows.appendAssumeCapacity(.{
             .path = entry.path,
-            .size = total_sizes[index],
-            .files = total_files[index],
+            .size = data.directories.ptr(.total_size, index).*,
+            .files = data.directories.ptr(.total_files, index).*,
             .dirs = dir_count,
         });
     }
@@ -190,15 +185,13 @@ pub fn buildHeaviestSummary(
     var node_set = std.AutoHashMap(usize, void).init(allocator);
     defer node_set.deinit();
 
-    const slices = data.directories.slice();
-
     for (entries) |entry| {
         var current = entry.index;
         while (true) {
             try node_set.put(current, {});
             if (current == 0) break;
 
-            const parent_index: usize = @intCast(slices.items(.parent)[current]);
+            const parent_index: usize = @intCast(data.directories.ptr(.parent, current).*);
             try node_set.put(parent_index, {});
 
             const gop = try child_map.getOrPut(parent_index);
@@ -221,13 +214,11 @@ pub fn buildHeaviestSummary(
     try node_set.put(0, {});
 
     const SortCtx = struct {
-        directories: *const std.MultiArrayList(Context.DirectoryNode),
+        directories: *Context.DirectoryTable,
 
         fn bySize(ctx: @This(), lhs: usize, rhs: usize) bool {
-            const dir_slices = ctx.directories.slice();
-            const sizes = dir_slices.items(.total_size);
-            const lhs_size = sizes[lhs];
-            const rhs_size = sizes[rhs];
+            const lhs_size = ctx.directories.ptr(.total_size, lhs).*;
+            const rhs_size = ctx.directories.ptr(.total_size, rhs).*;
             if (lhs_size != rhs_size) return lhs_size > rhs_size;
             return lhs < rhs;
         }
@@ -281,18 +272,16 @@ pub fn printHeaviestDirectories(stdout: *Writer, data: ReportData, summary: Heav
     try table.writeHeader(&[_][]const u8{ "Directory", "Size", "Share" });
     try table.writeSeparator("─");
 
-    const slices = data.directories.slice();
-    const sizes = slices.items(.total_size);
-
     for (summary.rows.items) |row| {
         var label_buf: [128]u8 = undefined;
         const label = formatDirectoryLabel(label_buf[0..label_width], data, row.index, row.depth, label_width);
 
         var size_buf: [32]u8 = undefined;
-        const size_str = try formatBytes(size_buf[0..], sizes[row.index]);
+        const size = data.directories.ptr(.total_size, row.index).*;
+        const size_str = try formatBytes(size_buf[0..], size);
 
         var share_buf: [16]u8 = undefined;
-        const share_str = try formatPercent(share_buf[0..], sizes[row.index], data.totals.bytes);
+        const share_str = try formatPercent(share_buf[0..], size, data.totals.bytes);
 
         try table.writeRow(&[_][]const u8{ label, size_str, share_str });
     }
