@@ -8,6 +8,10 @@ comptime {
 
 const std = @import("std");
 const DiskScan = @import("DiskScan.zig");
+const SysDispatcher = @import("SysDispatcher.zig");
+const WorkerMod = @import("Worker.zig");
+const Writer = std.Io.Writer;
+const builtin = @import("builtin");
 const ascii = std.ascii;
 
 var stderr_buffer: [4096]u8 = undefined;
@@ -34,6 +38,7 @@ pub fn main() !void {
     var root_arg: ?[]const u8 = null;
     var large_file_threshold = DiskScan.default_large_file_threshold;
     var binary_output: ?[]const u8 = null;
+    var dump_structs = false;
 
     const threshold_prefix = "--large-file-threshold=";
     const binary_prefix = "--binary-output=";
@@ -87,11 +92,20 @@ pub fn main() !void {
             try printUsage(exe_name);
             return;
         }
+        if (std.mem.eql(u8, arg, "--dump-structs")) {
+            dump_structs = true;
+            continue;
+        }
         if (root_arg != null) {
             try printUsage(exe_name);
             return;
         }
         root_arg = arg;
+    }
+
+    if (dump_structs) {
+        try dumpStructLayouts();
+        return;
     }
 
     const root = root_arg orelse ".";
@@ -164,8 +178,66 @@ fn parseSize(value: []const u8) !u64 {
 
 fn printUsage(exe_name: []const u8) !void {
     try stderr.print(
-        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [dir]\n",
+        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [--dump-structs] [dir]\n",
         .{exe_name},
     );
     try stderr.print("       SIZE accepts optional K/M/G/T suffix (base 1024)\n", .{});
+}
+
+fn dumpStructLayouts() !void {
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    defer stdout.flush() catch {};
+
+    try dumpStruct(stdout, "SysDispatcher.Config", SysDispatcher.Config);
+    try dumpStruct(stdout, "SysDispatcher.StatRequest", SysDispatcher.StatRequest);
+    try dumpStruct(stdout, "SysDispatcher.LinuxBackend", SysDispatcher.LinuxBackend);
+    try dumpStruct(stdout, "Worker", WorkerMod.Worker);
+
+    if (builtin.target.os.tag == .linux) {
+        const entries_type = @FieldType(WorkerMod.Scanner, "entries");
+        const entries_info = @typeInfo(entries_type);
+        switch (entries_info) {
+            .array => |array_info| {
+                try dumpStruct(stdout, "Worker.Scanner.BatchEntry", array_info.child);
+            },
+            else => {},
+        }
+    }
+}
+
+fn dumpStruct(writer: *Writer, comptime name: []const u8, comptime T: type) !void {
+    const info = @typeInfo(T);
+    switch (info) {
+        .@"struct" => |struct_info| {
+            try writer.print(
+                "{s}: size {d} bytes ({d} bits), align {d} bytes\n",
+                .{
+                    name,
+                    @as(usize, @sizeOf(T)),
+                    @as(usize, @bitSizeOf(T)),
+                    @as(usize, @alignOf(T)),
+                },
+            );
+
+            inline for (struct_info.fields) |field| {
+                try writer.print(
+                    "  .{s}: {s} | offset {d} bits | size {d} bits | align {d} bytes\n",
+                    .{
+                        field.name,
+                        @typeName(field.type),
+                        @as(usize, @offsetOf(T, field.name) * 8),
+                        @as(usize, @bitSizeOf(field.type)),
+                        @as(usize, @alignOf(field.type)),
+                    },
+                );
+            }
+
+            try writer.writeByte('\n');
+        },
+        else => {
+            try writer.print("{s}: not a struct (type {s})\n\n", .{ name, @typeName(T) });
+        },
+    }
 }

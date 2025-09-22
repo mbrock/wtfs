@@ -566,8 +566,18 @@ fn LinuxDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
             for (self.entries[0..self.batch_count]) |*entry| {
                 if (!entry.queued) continue;
                 const name_z = self.nameSlice(entry);
-                entry.stat = try Provider.awaitStat(self.provider_ctx, &entry.stat_req, self.dir.fd, name_z);
+                const stat = Provider.awaitStat(self.provider_ctx, &entry.stat_req, self.dir.fd, name_z) catch |err| {
+                    switch (err) {
+                        else => {}
+                    }
+                    // Ignore per-entry stat failures; siblings still use their data.
+                    entry.queued = false;
+                    entry.stat_ready = false;
+                    continue;
+                };
+                entry.stat = stat;
                 entry.stat_ready = true;
+                entry.queued = false;
             }
 
             return true;

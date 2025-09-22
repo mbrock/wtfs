@@ -5,14 +5,14 @@ const Context = @import("Context.zig");
 const dirscan = @import("DirScanner.zig");
 const SysDispatcher = @import("SysDispatcher.zig");
 
-const Worker = @This();
+pub const Worker = @This();
 
 // ===== Configuration =====
 
 /// Scanner configured to read names, object types, and file sizes.
 /// On Linux the provider points at the dispatcher so statx can run via
 /// io_uring, otherwise it collapses to the POSIX defaults.
-const Scanner = dirscan.DirScannerWithProvider(.{
+pub const Scanner = dirscan.DirScannerWithProvider(.{
     .common = .{
         .name = true,
         .objtype = true,

@@ -52,7 +52,7 @@ const SyncBackend = struct {
     }
 };
 
-const LinuxBackend = if (use_linux) struct {
+pub const LinuxBackend = if (use_linux) struct {
     ring: linux.IoUring = undefined,
     allocator: std.mem.Allocator,
     pending: AutoHashMap(u64, linux.io_uring_cqe) = .empty,
