@@ -1,7 +1,9 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) !void {
-    const target = b.standardTargetOptions(.{});
+    const target = b.standardTargetOptions(.{ .default_target = .{
+        .abi = .musl,
+    } });
     const optimize = b.standardOptimizeOption(.{});
 
     const root_module = b.createModule(.{
@@ -9,8 +11,8 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .valgrind = true,
-        //      .sanitize_thread = true,
+        //        .sanitize_c = .full,
+        //        .sanitize_thread = true,
         //        .stack_check = true,
     });
 

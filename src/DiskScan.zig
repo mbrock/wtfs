@@ -640,8 +640,7 @@ fn runWithOptions(self: *Self, options: RunOptions) !void {
     // Initialize progress tracking
     var progress = std.Progress.start(.{
         .root_name = "wtfs",
-        .refresh_rate_ns = 40 * std.time.ns_per_ms,
-        .disable_printing = true,
+        .refresh_rate_ns = 80 * std.time.ns_per_ms,
     });
     errdefer progress.end();
     self.progress_root = progress;

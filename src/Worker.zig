@@ -216,7 +216,12 @@ fn scanDirectory(
     dir_fd: std.posix.fd_t,
     metrics: *ScanMetrics,
 ) !void {
-    var scanner = Scanner.init(dir_fd, &self.scan_buffer, &self.dispatcher);
+    // Iterate using a duplicate so the context can safely close the original fd.
+    const iter_fd = posix.dup(dir_fd) catch |err| {
+        return self.handleScanError(index, err);
+    };
+    var scanner = Scanner.init(iter_fd, &self.scan_buffer, &self.dispatcher);
+    defer scanner.dir.close();
 
     self.ctx.retainParentFd(index);
     defer self.ctx.releaseParentFd(index);
@@ -253,19 +258,18 @@ fn processBatch(
 
     while (true) {
         const entrynode = node.start("entry", 0);
+        defer entrynode.end();
 
         const maybe_entry = scanner.next() catch |err| {
             return self.handleScanError(index, err);
         };
 
         const entry = maybe_entry orelse {
-            entrynode.end();
             break;
         };
         batch_entries += 1;
 
         try self.processEntry(index, entry, metrics, &batch_metrics);
-        entrynode.end();
     }
 }
 
