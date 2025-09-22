@@ -20,7 +20,6 @@ pub fn build(b: *std.Build) !void {
         .name = "wtfs",
         .root_module = root_module,
         .use_llvm = true,
-        .use_lld = true,
     });
     b.installArtifact(exe);
 
