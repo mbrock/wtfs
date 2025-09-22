@@ -10,9 +10,14 @@ const std = @import("std");
 const DiskScan = @import("DiskScan.zig");
 const SysDispatcher = @import("SysDispatcher.zig");
 const WorkerMod = @import("Worker.zig");
+const Tabular = @import("TabWriter.zig");
 const Writer = std.Io.Writer;
 const builtin = @import("builtin");
 const ascii = std.ascii;
+const Report = @import("Report.zig");
+
+const TabWriter = Tabular.TabWriter;
+const Column = Tabular.Column;
 
 var stderr_buffer: [4096]u8 = undefined;
 var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
@@ -190,20 +195,19 @@ fn dumpStructLayouts() !void {
     const stdout = &stdout_writer.interface;
     defer stdout.flush() catch {};
 
-    try stdout.print("\nStruct Layout Information\n", .{});
-    try stdout.print("=" ** 80 ++ "\n\n", .{});
-
     try dumpStruct(stdout, "SysDispatcher.Config", SysDispatcher.Config);
     try dumpStruct(stdout, "SysDispatcher.StatRequest", SysDispatcher.StatRequest);
     try dumpStruct(stdout, "SysDispatcher.LinuxBackend", SysDispatcher.LinuxBackend);
     try dumpStruct(stdout, "Worker", WorkerMod.Worker);
+    try dumpStruct(stdout, "Worker.Scanner", WorkerMod.Scanner);
+    try dumpStruct(stdout, "Context", @import("Context.zig"));
 
     if (builtin.target.os.tag == .linux) {
         const entries_type = @FieldType(WorkerMod.Scanner, "entries");
         const entries_info = @typeInfo(entries_type);
         switch (entries_info) {
             .array => |array_info| {
-                try dumpStruct(stdout, "Worker.Scanner.BatchEntry", array_info.child);
+                try dumpStruct(stdout, "Scanner.BatchEntry", array_info.child);
             },
             else => {},
         }
@@ -215,14 +219,23 @@ fn dumpStruct(writer: *Writer, comptime name: []const u8, comptime T: type) !voi
 
     switch (info) {
         .@"struct" => |struct_info| {
-            try writer.print("\n{s}\n", .{name});
-            try writer.print("{d}B ({d}b), align {d}\n\n", .{
+            try writer.print("{s: <20} ", .{name});
+            try writer.print("{d} bytes, aligned to {d}\n\n", .{
                 @as(usize, @sizeOf(T)),
-                @as(usize, @bitSizeOf(T)),
                 @as(usize, @alignOf(T)),
             });
 
             if (struct_info.fields.len > 0) {
+                const Row = struct {
+                    field: []const u8,
+                    type_name: []const u8,
+                    size: usize,
+                };
+
+                const capacity = struct_info.fields.len * 2 + 1;
+                var rows: [capacity]Row = undefined;
+                var row_count: usize = 0;
+
                 var expected_offset: usize = 0;
 
                 inline for (struct_info.fields) |field| {
@@ -230,48 +243,95 @@ fn dumpStruct(writer: *Writer, comptime name: []const u8, comptime T: type) !voi
                     const field_size = @sizeOf(field.type);
                     const field_align = @alignOf(field.type);
 
-                    // Check for padding before this field
                     const aligned_offset = std.mem.alignForward(usize, expected_offset, field_align);
                     const padding = aligned_offset - expected_offset;
 
                     if (padding > 0) {
-                        var pad_buf: [16]u8 = undefined;
-                        const pad_str = try @import("Report.zig").formatBytes(&pad_buf, padding);
-                        try writer.print("{s:<15} {s:>7}  (padding)\n", .{ "", pad_str });
+                        rows[row_count] = .{
+                            .field = "",
+                            .type_name = "",
+                            .size = padding,
+                        };
+                        row_count += 1;
                     }
 
-                    // Truncate type names that are too long
                     const type_name = @typeName(field.type);
-                    const max_type_len = 25;
+                    const max_type_len = 32;
                     const display_type = if (type_name.len > max_type_len)
-                        type_name[0..max_type_len - 2] ++ ".."
+                        type_name[0 .. max_type_len - 2] ++ ".."
                     else
                         type_name;
 
-                    var size_buf: [16]u8 = undefined;
-                    const size_str = try @import("Report.zig").formatBytes(&size_buf, field_size);
-
-                    try writer.print(".{s:<15} {s:>7}  {s}\n", .{
-                        field.name,
-                        size_str,
-                        display_type,
-                    });
+                    rows[row_count] = .{
+                        .field = "." ++ field.name,
+                        .type_name = display_type,
+                        .size = field_size,
+                    };
+                    row_count += 1;
 
                     expected_offset = field_offset + field_size;
                 }
 
-                // Check for trailing padding
                 const struct_size = @sizeOf(T);
                 const trailing_padding = struct_size - expected_offset;
-
                 if (trailing_padding > 0) {
-                    var pad_buf: [16]u8 = undefined;
-                    const pad_str = try @import("Report.zig").formatBytes(&pad_buf, trailing_padding);
-                    try writer.print("{s:<15} {s:>7}  (trailing padding)\n", .{ "", pad_str });
+                    rows[row_count] = .{
+                        .field = "",
+                        .type_name = "",
+                        .size = trailing_padding,
+                    };
+                    row_count += 1;
                 }
-            }
 
-            try writer.writeByte('\n');
+                var field_width: usize = "Field".len;
+                var size_width: usize = "Size".len;
+                var type_width: usize = "Type".len;
+
+                var i: usize = 0;
+                while (i < row_count) : (i += 1) {
+                    const row = rows[i];
+
+                    if (row.field.len > field_width) field_width = row.field.len;
+                    if (row.type_name.len > type_width) type_width = row.type_name.len;
+
+                    var size_buf: [32]u8 = undefined;
+                    const size_value: u64 = @intCast(row.size);
+                    const size_str = try Report.formatBytes(size_buf[0..], size_value);
+                    if (size_str.len > size_width) size_width = size_str.len;
+                }
+
+                var columns = [_]Column{
+                    Column{ .width = field_width },
+                    Column{ .width = type_width },
+                    Column{ .width = size_width, .alignment = .right },
+                };
+
+                var table = TabWriter.initWithOptions(writer, columns[0..], .{
+                    .style = .box,
+                });
+                try table.writeHeader(&[_][]const u8{ "Field", "Type", "Size" });
+                try table.writeSeparator("-");
+
+                i = 0;
+                while (i < row_count) : (i += 1) {
+                    const row = rows[i];
+                    var size_buf: [32]u8 = undefined;
+                    const size_value: u64 = @intCast(row.size);
+                    const size_str = try Report.formatBytes(size_buf[0..], size_value);
+
+                    try table.writeRow(&[_][]const u8{
+                        row.field,
+                        row.type_name,
+                        size_str,
+                    });
+                }
+
+                try table.finish();
+
+                try writer.writeByte('\n');
+            } else {
+                try writer.writeByte('\n');
+            }
         },
         else => {
             try writer.print("{s}: not a struct\n\n", .{name});

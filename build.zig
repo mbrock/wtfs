@@ -28,6 +28,11 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    const structs_cmd = b.addRunArtifact(exe);
+    structs_cmd.addArgs(&.{"--dump-structs"});
+    const structs_step = b.step("structs", "Dump struct layouts");
+    structs_step.dependOn(&structs_cmd.step);
+
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
