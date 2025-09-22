@@ -409,7 +409,7 @@ fn formatPercent(buf: []u8, value: u64, total: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "{d:.1}%", .{percent});
 }
 
-fn formatBytes(buf: []u8, bytes: u64) ![]const u8 {
+pub fn formatBytes(buf: []u8, bytes: u64) ![]const u8 {
     const Unit = struct {
         threshold: u64,
         suffix: []const u8,
