@@ -568,9 +568,12 @@ fn PosixDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
             return true;
         }
 
-        /// Retrieve the next entry from the current batch (one entry per
-        /// fill on non-macOS platforms).
+        /// Retrieve the next entry, fetching from the iterator when needed.
         pub fn next(self: *@This()) !?Entry {
+            if (self.pending_entry == null) {
+                self.pending_entry = try self.fetchNext();
+            }
+
             const entry = self.pending_entry orelse return null;
             self.pending_entry = null;
             return entry;
@@ -609,7 +612,6 @@ test "POSIX DirScanner iterates entries with requested metadata" {
     var saw_file = false;
     var saw_dir = false;
     while (true) {
-        if (!(try scanner.fill())) break;
         const entry = (try scanner.next()) orelse break;
 
         if (std.mem.eql(u8, entry.name, "file.txt")) {

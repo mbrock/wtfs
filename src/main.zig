@@ -17,7 +17,10 @@ pub fn main() !void {
     const gpa = std.heap.c_allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const allocator = arena.allocator();
+    var thread_safe_arena = std.heap.ThreadSafeAllocator{
+        .child_allocator = arena.allocator(),
+    };
+    const allocator = thread_safe_arena.allocator();
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);

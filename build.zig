@@ -9,11 +9,16 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .valgrind = true,
+        //      .sanitize_thread = true,
+        //        .stack_check = true,
     });
 
     const exe = b.addExecutable(.{
         .name = "wtfs",
         .root_module = root_module,
+        .use_llvm = true,
+        .use_lld = true,
     });
     b.installArtifact(exe);
 

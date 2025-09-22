@@ -82,16 +82,17 @@ pub fn directoryWorker(ctx: *Context) void {
         .progress = ctx.progress_node,
         .errprogress = ctx.errprogress,
         .dispatcher = undefined,
-        .path_buffer = std.ArrayList(u8){},
+        .path_buffer = std.ArrayList(u8).empty,
         .progress_buffer = undefined,
         .progress_writer = undefined,
         .namebuf = undefined,
         .scan_buffer = undefined,
-        .timer = std.time.Timer.start() catch unreachable,
+        .timer = std.time.Timer.start() catch |e| {
+            std.debug.panic("timer start failed {t}", .{e});
+        },
         .items_processed = 0,
     };
     defer worker.path_buffer.deinit(worker.allocator);
-    defer worker.dispatcher.deinit();
 
     worker.dispatcher.init(.{
         .allocator = worker.allocator,
@@ -100,6 +101,7 @@ pub fn directoryWorker(ctx: *Context) void {
         std.debug.panic("worker dispatcher init failed: {s}", .{@errorName(err)});
     };
 
+    defer worker.dispatcher.deinit();
     worker.progress_writer = std.Io.Writer.fixed(&worker.progress_buffer);
 
     while (worker.ctx.task_queue.pop()) |index| {
@@ -223,78 +225,19 @@ fn scanDirectory(
     defer node.end();
 
     while (true) {
+        const has_entry = scanner.fill() catch |err| {
+            return self.handleScanError(index, err);
+        };
+        if (!has_entry) break;
+
         if (comptime builtin.target.os.tag == .macos) {
-            if (scanner.n == 0) self.refill(&scanner, node) catch |err| {
-                return self.handleScanError(index, err);
-            };
-            if (scanner.n == 0) break;
+            node.completeOne();
             node.increaseEstimatedTotalItems(scanner.n);
         } else {
-            // Non-macOS: the scanner may be backed by an async dispatcher. We
-            // still refill synchronously for now, but once getdents runs on the
-            // ring this loop should continue to work unchanged.
-            const maybe_entry = scanner.next() catch |err| {
-                return self.handleScanError(index, err);
-            };
-            if (maybe_entry == null) break;
             node.increaseEstimatedTotalItems(1);
         }
 
         try self.processBatch(index, &scanner, metrics, node);
-    }
-}
-
-/// Fetch a new batch of entries from the kernel
-fn refill(self: *Worker, scanner: *Scanner, node: std.Progress.Node) !void {
-    if (comptime builtin.target.os.tag != .macos) {
-        return;
-    }
-
-    const opts_mask = dirscan.FsOptMask{
-        .nofollow = true,
-        .report_fullsize = true,
-        .pack_invalid_attrs = true,
-    };
-
-    var al = dirscan.AttrList{
-        .bitmapcount = dirscan.ATTR_BIT_MAP_COUNT,
-        .reserved = 0,
-        .attrs = Scanner.Mask,
-    };
-
-    var i: usize = 1;
-
-    while (true) {
-        self.progress_writer = std.Io.Writer.fixed(&self.progress_buffer);
-        self.progress_writer.print("fill #{d:<4} {d}K", .{ i, scanner.buf.len / 1024 }) catch unreachable;
-        self.progress_writer = undefined;
-
-        const n = dirscan.getattrlistbulk(scanner.fd, &al, scanner.buf.ptr, scanner.buf.len, opts_mask);
-        node.completeOne();
-
-        i += 1;
-
-        if (n < 0) {
-            switch (std.posix.errno(n)) {
-                .INTR, .AGAIN => {},
-                .NOENT => unreachable,
-                .NOTDIR => return error.NotDir,
-                .BADF => return error.BadFileDescriptor,
-                .ACCES => return error.PermissionDenied,
-                .FAULT => return error.BadAddress,
-                .RANGE => return error.BufferTooSmall,
-                .INVAL => return error.InvalidArgument,
-                .IO => return error.ReadFailed,
-                .TIMEDOUT => return error.TimedOut,
-                .DEADLK => return error.DeadLock, // iCloud dataless file
-                else => |e| std.debug.panic("unexpected errno {t}", .{e}),
-            }
-        }
-
-        scanner.n = @abs(n);
-        scanner.reader = std.io.Reader.fixed(scanner.buf);
-
-        return;
     }
 }
 
@@ -311,8 +254,9 @@ fn processBatch(
     while (true) {
         const entrynode = node.start("entry", 0);
 
-        const maybe_entry = scanner.next() catch |err|
-            self.handleScanError(index, err);
+        const maybe_entry = scanner.next() catch |err| {
+            return self.handleScanError(index, err);
+        };
 
         const entry = maybe_entry orelse {
             entrynode.end();
@@ -412,6 +356,14 @@ fn handleScanError(
 
     if (err == error.DeadLock) {
         self.errprogress.setName("dataless file");
+        self.ctx.markInaccessible(index);
+        return;
+    } else if (err == error.PermissionDenied or err == error.AccessDenied) {
+        self.errprogress.setName("permission denied");
+        self.ctx.markInaccessible(index);
+        return;
+    } else if (err == error.FileNotFound) {
+        self.errprogress.setName("file not found");
         self.ctx.markInaccessible(index);
         return;
     } else {

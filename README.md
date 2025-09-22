@@ -83,6 +83,10 @@ while (true) {
 }
 ```
 
+On non-macOS targets `next()` will fetch entries on demand, so the outer
+`fill()` loop is optional. macOS callers must keep the `fill()` call because it
+performs the underlying `getattrlistbulk` syscall.
+
 ### Compile-Time Type Generation
 
 The key feature is that the `EntryFor(mask)` function generates a struct at compile time with only the fields you've requested:

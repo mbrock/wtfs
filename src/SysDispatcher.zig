@@ -8,7 +8,7 @@ const posix = std.posix;
 
 const use_linux = builtin.target.os.tag == .linux;
 const linux = std.os.linux;
-const AutoHashMap = std.AutoHashMap;
+const AutoHashMap = std.AutoHashMapUnmanaged;
 const AtomicU64 = std.atomic.Value(u64);
 
 pub const Config = struct {
@@ -47,9 +47,9 @@ const SyncBackend = struct {
 };
 
 const LinuxBackend = if (use_linux) struct {
-    ring: linux.IoUring,
+    ring: linux.IoUring = undefined,
     allocator: std.mem.Allocator,
-    pending: AutoHashMap(u64, linux.io_uring_cqe),
+    pending: AutoHashMap(u64, linux.io_uring_cqe) = .empty,
     next_user_data: AtomicU64,
 
     pub fn init(self: *LinuxBackend, config: Config) !void {
@@ -57,16 +57,16 @@ const LinuxBackend = if (use_linux) struct {
 
         self.ring = try linux.IoUring.init(entries, 0);
         self.allocator = config.allocator;
-        self.pending = AutoHashMap(u64, linux.io_uring_cqe).init(config.allocator);
+        self.pending = .empty;
         self.next_user_data = AtomicU64.init(1);
 
         errdefer self.ring.deinit();
 
-        try self.pending.ensureTotalCapacity(entries);
+        try self.pending.ensureTotalCapacity(config.allocator, entries);
     }
 
     pub fn deinit(self: *LinuxBackend) void {
-        self.pending.deinit();
+        self.pending.deinit(self.allocator);
         self.ring.deinit();
     }
 

@@ -641,6 +641,7 @@ fn runWithOptions(self: *Self, options: RunOptions) !void {
     var progress = std.Progress.start(.{
         .root_name = "wtfs",
         .refresh_rate_ns = 40 * std.time.ns_per_ms,
+        .disable_printing = true,
     });
     errdefer progress.end();
     self.progress_root = progress;
