@@ -185,8 +185,8 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
 
 
             /// Create a Reader that streams this token's data
-            pub fn reader(self: Token, buffer: *const Self) TokenReader {
-                return TokenReader.init(buffer, self);
+            pub fn reader(self: Token, buffer: *const Self, reader_buffer: []u8) TokenReader {
+                return TokenReader.init(buffer, self, reader_buffer);
             }
         };
 
@@ -197,9 +197,9 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             token: Token,
             pos: usize,
 
-            pub fn init(buffer: *const Self, token: Token) TokenReader {
+            pub fn init(buffer: *const Self, token: Token, reader_buffer: []u8) TokenReader {
                 return .{
-                    .reader = .{ .vtable = &vtable, .buffer = &.{}, .seek = 0, .end = 0 },
+                    .reader = .{ .vtable = &vtable, .buffer = reader_buffer, .seek = 0, .end = 0 },
                     .buffer = buffer,
                     .token = token,
                     .pos = 0,
@@ -301,7 +301,8 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             pub fn hash(ctx: TokenContext, token: Token) u64 {
                 var hash_buffer: [256]u8 = undefined;
                 var hashing_writer = std.Io.Writer.Hashing(std.hash.Wyhash).initHasher(std.hash.Wyhash.init(0), &hash_buffer);
-                var token_reader = token.reader(ctx.buffer);
+                var reader_buffer: [256]u8 = undefined;
+                var token_reader = token.reader(ctx.buffer, &reader_buffer);
 
                 // Stream token data directly into hashing writer
                 token_reader.reader.streamExact(&hashing_writer.writer, token.length()) catch |err| switch (err) {
@@ -320,8 +321,10 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                 if (a.length() != b.length()) return false;
                 if (a.length() == 0) return true;
 
-                var reader_a = a.reader(ctx.buffer);
-                var reader_b = b.reader(ctx.buffer);
+                var reader_buffer_a: [256]u8 = undefined;
+                var reader_buffer_b: [256]u8 = undefined;
+                var reader_a = a.reader(ctx.buffer, &reader_buffer_a);
+                var reader_b = b.reader(ctx.buffer, &reader_buffer_b);
 
                 var buf_a: [256]u8 = undefined;
                 var buf_b: [256]u8 = undefined;
@@ -359,7 +362,8 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                 if (key.len != token.length()) return false;
                 if (key.len == 0) return true;
 
-                var token_reader = token.reader(ctx.buffer);
+                var reader_buffer: [256]u8 = undefined;
+                var token_reader = token.reader(ctx.buffer, &reader_buffer);
                 var remaining_key = key;
 
                 while (remaining_key.len > 0) {
@@ -1450,7 +1454,8 @@ test "TokenReader basic functionality" {
     defer buffer.deinit(allocator);
 
     const result = try buffer.append(allocator, "hello");
-    var token_reader = result.token.reader(&buffer);
+    var reader_buffer: [64]u8 = undefined;
+    var token_reader = result.token.reader(&buffer, &reader_buffer);
 
     var dest: [5]u8 = undefined;
     var fixed_writer = std.Io.Writer.fixed(&dest);
@@ -1468,7 +1473,8 @@ test "TokenReader cross-shelf streaming" {
 
     // Add string that spans shelves
     const spanning = try buffer.append(allocator, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
-    var token_reader = spanning.token.reader(&buffer);
+    var reader_buffer: [64]u8 = undefined;
+    var token_reader = spanning.token.reader(&buffer, &reader_buffer);
 
     // Stream to a buffer using the reader interface
     var dest: [26]u8 = undefined;
@@ -1486,7 +1492,8 @@ test "TokenReader respects stream limit parameter" {
     const result = try buffer.append(allocator, "hello world");
     const token = result.token;
 
-    var token_reader = token.reader(&buffer);
+    var reader_buffer: [64]u8 = undefined;
+    var token_reader = token.reader(&buffer, &reader_buffer);
 
     // Test with limited to 5 bytes
     var out_buffer: [20]u8 = undefined;
