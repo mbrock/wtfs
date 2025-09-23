@@ -206,7 +206,7 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                 };
             }
 
-            fn stream(r: *std.Io.Reader, w: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
                 const self: *TokenReader = @fieldParentPtr("reader", r);
 
                 if (self.pos >= self.token.length()) {
@@ -231,8 +231,10 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                     return error.EndOfStream;
                 }
 
+                // Respect the limit parameter - key fix!
                 const slice = shelf[start_loc.offset .. start_loc.offset + available];
-                const wrote = try w.writeVec(&.{slice});
+                const limited_slice = limit.sliceConst(slice);
+                const wrote = try w.writeVec(&.{limited_slice});
                 self.pos += wrote;
                 return wrote;
             }
@@ -1473,6 +1475,35 @@ test "TokenReader cross-shelf streaming" {
     var fixed_writer = std.Io.Writer.fixed(&dest);
     _ = try token_reader.reader.streamExact(&fixed_writer, 26);
     try std.testing.expectEqualStrings("ABCDEFGHIJKLMNOPQRSTUVWXYZ", &dest);
+}
+
+test "TokenReader respects stream limit parameter" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Create a token with "hello world" (11 bytes)
+    const result = try buffer.append(allocator, "hello world");
+    const token = result.token;
+
+    var token_reader = token.reader(&buffer);
+
+    // Test with limited to 5 bytes
+    var out_buffer: [20]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&out_buffer);
+
+    const limited_bytes = try token_reader.reader.stream(&writer, .limited(5));
+    try std.testing.expectEqual(@as(usize, 5), limited_bytes);
+    try std.testing.expectEqualStrings("hello", writer.buffered());
+
+    // Test that position advanced correctly
+    try std.testing.expectEqual(@as(usize, 5), token_reader.pos);
+
+    // Read remaining bytes
+    writer = std.Io.Writer.fixed(&out_buffer);
+    const remaining_bytes = try token_reader.reader.stream(&writer, .unlimited);
+    try std.testing.expectEqual(@as(usize, 6), remaining_bytes);
+    try std.testing.expectEqualStrings(" world", writer.buffered());
 }
 
 test "SegmentedStringBuffer concurrent stress test" {
