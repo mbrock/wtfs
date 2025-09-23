@@ -109,6 +109,8 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
         const LenType = std.meta.Int(.unsigned, LEN_BITS);
         const MAX_STRING_LEN: usize = @as(usize, std.math.maxInt(LenType));
         const TokenBits = LOCATION_BITS + LEN_BITS;
+        const BASE_SHIFT: comptime_int = if (PREALLOC == 0) 0 else std.math.log2_int(usize, PREALLOC);
+        const BASE_UNIT: usize = @as(usize, 1) << BASE_SHIFT;
 
         // TODO: we should use the precise bit-length types in the API
 
@@ -128,6 +130,13 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
         }
 
         const Shelf = []u8;
+
+        inline fn shelfStartBytes(shelf_index: usize) usize {
+            if (shelf_index == 0) return 0;
+            const shift_amt: ShiftInt = @intCast(shelf_index);
+            const prefix_units = (@as(usize, 1) << shift_amt) - 1;
+            return prefix_units << BASE_SHIFT;
+        }
 
         /// Identifies the location of a stored string within the buffer.
         /// The string spans `len` bytes starting at `offset` within `shelf`.
@@ -153,17 +162,9 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             }
 
             pub fn byteOffsetFromStart(self: Token) usize {
-                // TODO: i'm too tired
-                _ = self;
-                return undefined;
-            }
-
-            pub fn end(self: Token) Token {
-                _ = self;
-                return Token{
-                    .location = undefined, // TODO: uhhh...
-                    .len = 0,
-                };
+                const shelf = self.shelfIndex();
+                const offset = self.byteOffset();
+                return shelfStartBytes(shelf) + offset;
             }
 
             fn init(shelf_index: usize, offset: usize, len: usize) Token {
@@ -272,7 +273,7 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             }
 
             const start = try self.reserveRange(alloc, bytes.len);
-            const start_location = locateIndex(start);
+            const start_location = Self.locateIndex(start);
 
             // TODO: we should be able to do this very easily using a mutable
             // variant of the slice view
@@ -283,7 +284,8 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             var shelf_offset = start_location.offset;
 
             while (remaining_len != 0) {
-                std.debug.assert(shelf_index < self.shelf_count.load(.acquire));
+                const shelf_count_now = @as(usize, self.shelf_count.load(.acquire));
+                std.debug.assert(shelf_index < shelf_count_now);
                 const shelf = self.shelves[shelf_index];
                 std.debug.assert(shelf.len != 0);
                 std.debug.assert(shelf_offset < shelf.len);
@@ -311,23 +313,60 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
 
         /// Obtain a stable view for a previously returned token.
         pub fn view(self: *const Self, token: Token) SegmentedView {
-            // TODO: verify with tests
-            // i actually don't see a need for explicit bounds checking
-            // since debug mode will check slices anyway
-            // and we supposedly have a token which is a promise it should be ok
-            const y0 = token.shelfIndex();
-            const x0 = token.byteOffset();
-            const y1 = token.end().shelfIndex();
-            const x1 = token.end().byteOffset();
-            const head = self.shelves[y0][x0..];
-            const tail = self.shelves[y1][0..x1];
-            const body = self.shelves[y0 + 1 .. y1];
+            const start_global = token.byteOffsetFromStart();
+            const start_loc = Self.locateIndex(start_global);
+            const available_shelves = @as(usize, self.shelf_count.load(.acquire));
+            std.debug.assert(start_loc.shelf_index < available_shelves);
 
-            return SegmentedView{
-                .head = head,
-                .body = body,
-                .tail = tail,
-            };
+            const first_shelf = self.shelves[start_loc.shelf_index];
+            std.debug.assert(first_shelf.len != 0);
+            std.debug.assert(start_loc.offset < first_shelf.len);
+
+            const total_len = token.length();
+            const first_available = first_shelf.len - start_loc.offset;
+
+            if (total_len <= first_available) {
+                return SegmentedView{
+                    .head = first_shelf[start_loc.offset .. start_loc.offset + total_len],
+                    .body = SegmentedView.emptyBody(),
+                    .tail = &[_]u8{},
+                };
+            }
+
+            var remaining = total_len - first_available;
+            var shelf_index = start_loc.shelf_index + 1;
+
+            while (true) {
+                std.debug.assert(shelf_index < available_shelves);
+                const shelf = self.shelves[shelf_index];
+                const shelf_len = shelf.len;
+                std.debug.assert(shelf_len != 0);
+
+                if (remaining < shelf_len) {
+                    const body_slice = if (shelf_index > start_loc.shelf_index + 1)
+                        toConstShelfSlices(self.shelves[start_loc.shelf_index + 1 .. shelf_index])
+                    else
+                        SegmentedView.emptyBody();
+
+                    return SegmentedView{
+                        .head = first_shelf[start_loc.offset..],
+                        .body = body_slice,
+                        .tail = shelf[0..remaining],
+                    };
+                }
+
+                if (remaining == shelf_len) {
+                    const body_slice = toConstShelfSlices(self.shelves[start_loc.shelf_index + 1 .. shelf_index + 1]);
+                    return SegmentedView{
+                        .head = first_shelf[start_loc.offset..],
+                        .body = body_slice,
+                        .tail = &[_]u8{},
+                    };
+                }
+
+                remaining -= shelf_len;
+                shelf_index += 1;
+            }
         }
 
         fn reserveRange(
@@ -347,22 +386,14 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
         }
 
         fn locateIndex(index: usize) Location {
-            // TODO: make efficient and correct using "math" and/or "logic"
-            var remaining = index;
-            var shelf_index: usize = 0;
-            inline for (0..MAX_SHELVES) |y| {
-                if (remaining < shelfCapacity(y)) {
-                    return Location{
-                        .shelf_index = shelf_index,
-                        .offset = remaining,
-                    };
-                }
-                remaining -= shelfCapacity(y);
-                shelf_index += 1;
-            }
-            return .{
+            const normalized = (index >> BASE_SHIFT) + 1;
+            const shelf_index = std.math.log2_int(usize, normalized);
+            const shift_amt: ShiftInt = @intCast(shelf_index);
+            const start_units = (@as(usize, 1) << shift_amt) - 1;
+            const start = start_units << BASE_SHIFT;
+            return Location{
                 .shelf_index = shelf_index,
-                .offset = remaining,
+                .offset = index - start,
             };
         }
 
