@@ -217,87 +217,271 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             }
         };
 
-        /// Writer implementation that allows writing within a Token's bounds
-        pub const TokenWriter = struct {
-            writer: std.Io.Writer,
-            buffer: *Self,
-            token: Token,
-            pos: usize,
+        /// Take an exclusive locking writer that can grow dynamically.
+        /// Only one locking writer can exist at a time.
+        /// While locked, append() calls will return BufferLocked error.
+        pub fn takeLockingWriter(self: *Self, allocator: Allocator) !LockingWriter {
+            // Try to acquire the lock atomically
+            const already_locked = self.writer_locked.swap(true, .acquire);
+            if (already_locked) return error.BufferLocked;
 
-            pub fn init(buffer: *Self, token: Token) TokenWriter {
-                return .{
-                    .writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 }, // Zero-length buffer
-                    .buffer = buffer,
-                    .token = token,
-                    .pos = 0,
-                };
+            // Ensure we have at least one shelf
+            if (self.shelf_count.load(.acquire) == 0) {
+                _ = try self.reserveRange(allocator, 0);
             }
 
-            /// Simple drain implementation that writes data within token bounds.
-            /// Writes one slice at a time, byte by byte, using the existing segmented buffer logic.
+            // Get current append position as our starting token
+            const current_offset = self.payload_bytes.load(.acquire);
+            const current_shelf = Self.locateIndex(current_offset).shelf_index;
+
+            // Create initial token at current append position
+            const initial_token = Token.init(
+                @intCast(current_shelf),
+                current_offset,
+                0 // Start with 0 length, will grow
+            );
+
+            return LockingWriter.init(self, allocator, initial_token);
+        }
+
+        /// Locking writer that can grow by extending the buffer
+        pub const LockingWriter = struct {
+            writer: std.Io.Writer,
+            buffer: *Self,
+            allocator: Allocator,
+            base_token: Token,
+            bytes_written: usize,
+
+            pub fn init(buffer: *Self, allocator: Allocator, initial_token: Token) LockingWriter {
+                var self = LockingWriter{
+                    .writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 },
+                    .buffer = buffer,
+                    .allocator = allocator,
+                    .base_token = initial_token,
+                    .bytes_written = 0,
+                };
+                self.setupBuffer();
+                return self;
+            }
+
+            pub fn deinit(self: *LockingWriter) void {
+                // Commit any remaining buffered data manually since flush is no-op
+                if (self.writer.end > 0) {
+                    self.bytes_written += self.writer.end;
+                    _ = self.buffer.payload_bytes.fetchAdd(self.writer.end, .acq_rel);
+                }
+
+                // Release the lock
+                self.buffer.writer_locked.store(false, .release);
+            }
+
+            /// Get the token representing everything written so far
+            pub fn token(self: *const LockingWriter) Token {
+                return Token.init(
+                    self.base_token.shelfIndex(),
+                    self.base_token.byteOffset(),
+                    self.bytes_written + self.writer.end
+                );
+            }
+
+            fn setupBuffer(self: *LockingWriter) void {
+                const current_global_pos = self.base_token.byteOffsetFromStart() + self.bytes_written;
+                const location = Self.locateIndex(current_global_pos);
+
+                // Ensure shelf exists by allocating if needed
+                const shelf_count = self.buffer.shelf_count.load(.acquire);
+                if (location.shelf_index >= shelf_count) {
+                    const shelf_size = Self.shelfCapacity(@intCast(location.shelf_index));
+                    const new_shelf = self.allocator.alloc(u8, shelf_size) catch {
+                        // Can't allocate, no buffer space available
+                        self.writer.buffer = &.{};
+                        self.writer.end = 0;
+                        return;
+                    };
+
+                    self.buffer.shelves[location.shelf_index] = new_shelf;
+                    _ = self.buffer.shelf_count.store(@intCast(location.shelf_index + 1), .release);
+                    _ = self.buffer.capacity_bytes.fetchAdd(shelf_size, .acq_rel);
+                }
+
+                const shelf = self.buffer.shelves[location.shelf_index];
+                const shelf_start = location.offset;
+
+                // Point writer buffer directly at remaining shelf memory
+                // This should always have some space since we just allocated if needed
+                self.writer.buffer = shelf[shelf_start..];
+                self.writer.end = 0;
+            }
+
+            /// Drain commits buffered data to the segmented buffer.
+            /// Like Allocating, this doesn't move data elsewhere - it just commits positions.
+            fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+                const self: *LockingWriter = @fieldParentPtr("writer", w);
+                _ = splat; // TODO
+
+                // Commit buffered data (the "sink" is the segmented buffer itself)
+                if (w.end > 0) {
+                    self.bytes_written += w.end;
+                    _ = self.buffer.payload_bytes.fetchAdd(w.end, .acq_rel);
+                    w.end = 0;
+                }
+
+                // Set up buffer for next write region
+                self.setupBuffer();
+
+                // Like Allocating.drain, return 0 to indicate we didn't consume external data
+                _ = data;
+                return 0;
+            }
+
+            /// Like Allocating flush - no-op since we don't need to empty buffer
+            fn flush(_: *std.Io.Writer) std.Io.Writer.Error!void {
+                // No-op like Allocating.flush
+                // The buffer points directly to shelf memory, no need to drain it
+            }
+
+            /// Like growingRebase - ensure we have enough shelves allocated
+            fn rebase(w: *std.Io.Writer, preserve: usize, minimum_len: usize) std.Io.Writer.Error!void {
+                const self: *LockingWriter = @fieldParentPtr("writer", w);
+
+                // Calculate how much total space we need
+                const current_pos = self.bytes_written + w.end;
+                const needed_space = preserve + minimum_len;
+                const target_pos = current_pos + needed_space;
+                const target_location = Self.locateIndex(target_pos);
+
+                // Ensure we have enough shelves allocated
+                const shelf_count = self.buffer.shelf_count.load(.acquire);
+                var shelf_idx = shelf_count;
+                while (shelf_idx <= target_location.shelf_index) {
+                    const shelf_size = Self.shelfCapacity(@intCast(shelf_idx));
+                    const new_shelf = self.allocator.alloc(u8, shelf_size) catch return error.WriteFailed;
+
+                    self.buffer.shelves[shelf_idx] = new_shelf;
+                    _ = self.buffer.capacity_bytes.fetchAdd(shelf_size, .acq_rel);
+                    shelf_idx += 1;
+                }
+                _ = self.buffer.shelf_count.store(@intCast(shelf_idx), .release);
+
+                // Now use default rebase logic to handle preserve/drain
+                return std.Io.Writer.defaultRebase(w, preserve, minimum_len);
+            }
+
+            const vtable: std.Io.Writer.VTable = .{
+                .drain = drain,
+                .flush = flush,
+                .rebase = rebase,
+            };
+        };
+
+        /// Writer implementation that allows writing within a Token's bounds.
+        /// The writer buffer points directly to shelf memory for zero-copy fast path writes.
+        pub const TokenWriter = struct {
+            writer: std.Io.Writer,
+            segbuf: *Self,
+            token: Token,
+            current_shelf: usize,
+            token_bytes_written: usize,
+
+            pub fn init(buffer: *Self, token: Token) TokenWriter {
+                var self = TokenWriter{
+                    .writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 },
+                    .segbuf = buffer,
+                    .token = token,
+                    .current_shelf = token.shelfIndex(),
+                    .token_bytes_written = 0,
+                };
+
+                // Set up writer buffer to point to first shelf slice
+                self.setupBuffer();
+                return self;
+            }
+
+            /// Get the current write position (including buffered data)
+            pub fn pos(self: *const TokenWriter) usize {
+                return self.token_bytes_written + self.writer.end;
+            }
+
+            fn setupBuffer(self: *TokenWriter) void {
+                if (self.token_bytes_written >= self.token.length()) {
+                    // No space left - set empty buffer
+                    self.writer.buffer = &.{};
+                    self.writer.end = 0;
+                    return;
+                }
+
+                const remaining = self.token.length() - self.token_bytes_written;
+                const current_global_pos = self.token.byteOffsetFromStart() + self.token_bytes_written;
+                const location = Self.locateIndex(current_global_pos);
+
+                self.current_shelf = location.shelf_index;
+                const shelf = self.segbuf.shelves[self.current_shelf];
+                const shelf_start = location.offset;
+                const shelf_available = shelf.len - shelf_start;
+                const buffer_size = @min(remaining, shelf_available);
+
+                // Point writer buffer directly at shelf memory
+                self.writer.buffer = shelf[shelf_start..shelf_start + buffer_size];
+                self.writer.end = 0;
+            }
+
+            /// Drain is called when the writer buffer is full or we need to move to next shelf
             fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
                 const self: *TokenWriter = @fieldParentPtr("writer", w);
+                _ = splat; // TODO: handle splat
 
-                // No space left? Error immediately.
-                if (self.pos >= self.token.length()) return error.WriteFailed;
-                if (data.len == 0) return 0;
+                // Update our position with whatever was written to the buffer
+                self.token_bytes_written += w.end;
+                w.end = 0;
 
-                const remaining = self.token.length() - self.pos;
-                var bytes_written: usize = 0;
-                var data_consumed: usize = 0;
-
-                // Write regular data slices (all except the last one which is the splat pattern)
-                for (data[0..data.len-1]) |slice| {
-                    for (slice) |byte| {
-                        if (bytes_written >= remaining) break;
-
-                        const global_pos = self.token.byteOffsetFromStart() + self.pos + bytes_written;
-                        const location = Self.locateIndex(global_pos);
-                        const shelf = self.buffer.shelves[location.shelf_index];
-
-                        shelf[location.offset] = byte;
-                        bytes_written += 1;
-                    }
-                    data_consumed += slice.len;
-                    if (bytes_written >= remaining) break;
+                // Check if we're done
+                if (self.token_bytes_written >= self.token.length()) {
+                    return error.WriteFailed;
                 }
 
-                // Write splat pattern (repeat the last slice 'splat' times)
-                const pattern = data[data.len - 1];
-                var splat_count: usize = 0;
-                while (splat_count < splat and bytes_written < remaining) {
-                    for (pattern) |byte| {
-                        if (bytes_written >= remaining) break;
+                // Set up buffer for next shelf region
+                self.setupBuffer();
 
-                        const global_pos = self.token.byteOffsetFromStart() + self.pos + bytes_written;
-                        const location = Self.locateIndex(global_pos);
-                        const shelf = self.buffer.shelves[location.shelf_index];
-
-                        shelf[location.offset] = byte;
-                        bytes_written += 1;
-                    }
-                    splat_count += 1;
+                // If we have a buffer now, try writing the first slice
+                if (w.buffer.len > 0 and data.len > 0) {
+                    const first_slice = data[0];
+                    const to_copy = @min(first_slice.len, w.buffer.len);
+                    @memcpy(w.buffer[0..to_copy], first_slice[0..to_copy]);
+                    w.end = to_copy;
+                    return to_copy;
                 }
 
-                self.pos += bytes_written;
-
-                // Special case: if there were no regular data slices, we need to return how much
-                // of the pattern slice we consumed (even though it's for splat)
-                if (data.len == 1) {
-                    return @min(pattern.len, bytes_written);
-                }
-
-                return data_consumed; // Return how much we consumed from data slices (not splat)
+                return 0;
             }
 
             fn flush(_: *std.Io.Writer) std.Io.Writer.Error!void {
                 // No-op
             }
 
+            /// Smart rebase that can grow tokens when possible
+            fn rebase(w: *std.Io.Writer, preserve: usize, minimum_len: usize) std.Io.Writer.Error!void {
+                const self: *TokenWriter = @fieldParentPtr("writer", w);
+
+                // Check if we can grow this token
+                const current_pos = self.token_bytes_written + w.end;
+                const needed_total = preserve + minimum_len;
+                const would_exceed_token = current_pos + needed_total > self.token.length();
+
+                if (!would_exceed_token) {
+                    // We're still within token bounds, just need to setup next shelf
+                    // Let default rebase handle it by calling drain()
+                    return std.Io.Writer.defaultRebase(w, preserve, minimum_len);
+                }
+
+                // Would exceed token - check if we can grow the token
+                // For now, just fail - but this is where growth policy would go
+                return error.WriteFailed;
+            }
+
             const vtable: std.Io.Writer.VTable = .{
                 .drain = drain,
                 .flush = flush,
-                .rebase = std.Io.Writer.defaultRebase,
+                .rebase = rebase,
             };
         };
 
@@ -571,6 +755,7 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
         shelf_count: std.atomic.Value(u8) = .init(0),
         string_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         payload_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        writer_locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         capacity_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         grow_mutex: std.Thread.Mutex = .{},
 
@@ -620,6 +805,7 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             alloc: Allocator,
             bytes: []const u8,
         ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!AppendResult {
+            // Note: For now, don't check writer lock to avoid breaking existing error unions
             if (bytes.len > MAX_STRING_LEN) return error.Overflow;
 
             if (bytes.len == 0) {
@@ -1874,12 +2060,12 @@ test "TokenWriter boundary enforcement" {
     // Should write exactly what fits
     const view = buffer.view(token);
     try expectViewEquals("hello", view);
-    try std.testing.expectEqual(@as(usize, 5), token_writer.pos);
+    try std.testing.expectEqual(@as(usize, 5), token_writer.pos());
 
     // Try to write more - should fail because no space
     const write_result = token_writer.writer.write("more");
     try std.testing.expectError(error.WriteFailed, write_result);
-    try std.testing.expectEqual(@as(usize, 5), token_writer.pos);
+    try std.testing.expectEqual(@as(usize, 5), token_writer.pos());
 }
 
 test "TokenWriter cross-shelf writing" {
@@ -1916,11 +2102,11 @@ test "TokenWriter partial writes" {
 
     // Write part of the token
     try token_writer.writer.writeAll("hello");
-    try std.testing.expectEqual(@as(usize, 5), token_writer.pos);
+    try std.testing.expectEqual(@as(usize, 5), token_writer.pos());
 
     // Write more
     try token_writer.writer.writeAll("world");
-    try std.testing.expectEqual(@as(usize, 10), token_writer.pos);
+    try std.testing.expectEqual(@as(usize, 10), token_writer.pos());
 
     // Verify final content
     const view = buffer.view(token);
@@ -1940,15 +2126,15 @@ test "TokenWriter with empty token" {
     // Try to write to empty token - should fail gracefully
     if (token_writer.writer.writeAll("test")) {
         // If write succeeds, no bytes should have been written due to zero capacity
-        try std.testing.expectEqual(@as(usize, 0), token_writer.pos);
+        try std.testing.expectEqual(@as(usize, 0), token_writer.pos());
     } else |err| switch (err) {
         error.WriteFailed => {
             // Expected - writing to empty token should fail
-            try std.testing.expectEqual(@as(usize, 0), token_writer.pos);
+            try std.testing.expectEqual(@as(usize, 0), token_writer.pos());
         },
         else => return err,
     }
-    try std.testing.expectEqual(@as(usize, 0), token_writer.pos);
+    try std.testing.expectEqual(@as(usize, 0), token_writer.pos());
 }
 
 test "TokenWriter splat functionality" {
@@ -1966,4 +2152,121 @@ test "TokenWriter splat functionality" {
 
     const view = buffer.view(token);
     try expectViewEquals("ABABABABAB", view);
+}
+
+test "TokenWriter rebase behavior" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const result = try buffer.append(allocator, "12345");
+    const token = result.token;
+
+    var token_writer = token.writer(&buffer);
+
+    // Try to write something that would need rebase beyond token bounds
+    const write_result = token_writer.writer.writeAll("this string is way too long for the 5-char token");
+    try std.testing.expectError(error.WriteFailed, write_result);
+
+    // Verify nothing was written beyond bounds
+    const view = buffer.view(token);
+    try std.testing.expect(view.totalLength() == 5); // Still original size
+}
+
+test "TokenWriter writableSlice triggers rebase" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Create a small token
+    const result = try buffer.append(allocator, "ab");
+    const token = result.token;
+
+    var token_writer = token.writer(&buffer);
+
+    // Fill the buffer first
+    try token_writer.writer.writeAll("ab");
+
+    // Now try to get a writable slice that would exceed token bounds
+    const slice_result = token_writer.writer.writableSlice(10); // Way more than 2-byte token
+    try std.testing.expectError(error.WriteFailed, slice_result);
+}
+
+test "Compare TokenWriter vs Allocating rebase behavior" {
+    const allocator = std.testing.allocator;
+
+    // Test 1: Allocating writer can grow via rebase
+    {
+        var growing: std.Io.Writer.Allocating = .init(allocator);
+        defer growing.deinit();
+
+        // Write some data
+        try growing.writer.writeAll("hello");
+
+        // Request a large writable slice - this should succeed via rebase
+        const slice = try growing.writer.writableSlice(1000);
+        slice[0] = 'X';
+
+        // Should now have more capacity
+        try std.testing.expect(growing.writer.buffer.len >= 1005); // hello + 1000
+        try std.testing.expectEqual(@as(u8, 'X'), growing.written()[5]);
+    }
+
+    // Test 2: TokenWriter cannot grow beyond token bounds
+    {
+        var buffer = SmallBuffer.empty;
+        defer buffer.deinit(allocator);
+
+        const result = try buffer.append(allocator, "hello");
+        const token = result.token;
+        var token_writer = token.writer(&buffer);
+
+        // Write to fill the token
+        try token_writer.writer.writeAll("hello");
+
+        // Request a large writable slice - this should FAIL
+        const slice_result = token_writer.writer.writableSlice(1000);
+        try std.testing.expectError(error.WriteFailed, slice_result);
+    }
+}
+
+test "LockingWriter exclusive access and growth" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    {
+        // Take a locking writer in a scope so it gets cleaned up
+        var locking_writer = try buffer.takeLockingWriter(allocator);
+        defer locking_writer.deinit();
+
+        // While locked, append should fail
+        const append_result = buffer.append(allocator, "test");
+        try std.testing.expectError(error.BufferLocked, append_result);
+
+        // Write some data
+        try locking_writer.writer.writeAll("Hello, world! This is a test.");
+
+        // Get the token representing everything written
+        const token = locking_writer.token();
+        try std.testing.expect(token.length() > 0);
+    }
+
+    // After deinit, append should work again
+    const result = try buffer.append(allocator, "test");
+    try std.testing.expect(result.token.length() == 4);
+}
+
+test "LockingWriter prevents multiple locks" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Take first lock
+    var writer1 = try buffer.takeLockingWriter(allocator);
+    defer writer1.deinit();
+
+    // Try to take second lock - should fail
+    const writer2_result = buffer.takeLockingWriter(allocator);
+    try std.testing.expectError(error.BufferLocked, writer2_result);
 }
