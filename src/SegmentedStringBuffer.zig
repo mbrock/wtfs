@@ -227,6 +227,47 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             pub fn iterator(self: Token, buffer: *const Self) Iterator {
                 return Iterator.init(buffer, self);
             }
+
+            /// Create a Reader that streams this token's data
+            pub fn reader(self: Token, buffer: *const Self) TokenReader {
+                return TokenReader.init(buffer, self);
+            }
+        };
+
+        /// Reader implementation that streams data from a Token
+        pub const TokenReader = struct {
+            reader: std.Io.Reader,
+            buffer: *const Self,
+            token: Token,
+            pos: usize,
+
+            pub fn init(buffer: *const Self, token: Token) TokenReader {
+                return .{
+                    .reader = .{ .vtable = &vtable, .buffer = &.{}, .seek = 0, .end = 0 },
+                    .buffer = buffer,
+                    .token = token,
+                    .pos = 0,
+                };
+            }
+
+            fn stream(r: *std.Io.Reader, w: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+                const self: *TokenReader = @fieldParentPtr("reader", r);
+
+                if (self.pos >= self.token.length()) return 0;
+
+                // Simple: just stream one shelf slice at a time
+                const start_global = self.token.byteOffsetFromStart() + self.pos;
+                const start_loc = Self.locateIndex(start_global);
+                const shelf = self.buffer.shelves[start_loc.shelf_index];
+                const available = @min(shelf.len - start_loc.offset, self.token.length() - self.pos);
+                const slice = shelf[start_loc.offset .. start_loc.offset + available];
+
+                const wrote = try w.writeVec(&.{slice});
+                self.pos += wrote;
+                return wrote;
+            }
+
+            const vtable: std.Io.Reader.VTable = .{ .stream = stream };
         };
 
         pub const SegmentedView = struct {
@@ -1450,6 +1491,39 @@ test "Token iterator empty string" {
     var iter = result.token.iterator(&buffer);
 
     try std.testing.expectEqual(@as(?u8, null), iter.next());
+}
+
+test "TokenReader basic functionality" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const result = try buffer.append(allocator, "hello");
+    var token_reader = result.token.reader(&buffer);
+
+    var dest: [5]u8 = undefined;
+    var fixed_writer = std.Io.Writer.fixed(&dest);
+    _ = try token_reader.reader.streamExact(&fixed_writer, 5);
+    try std.testing.expectEqualStrings("hello", &dest);
+}
+
+test "TokenReader cross-shelf streaming" {
+    var buffer = TinyBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Fill first shelf partially
+    _ = try buffer.append(allocator, "0123456789");
+
+    // Add string that spans shelves
+    const spanning = try buffer.append(allocator, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    var token_reader = spanning.token.reader(&buffer);
+
+    // Stream to a buffer using the reader interface
+    var dest: [26]u8 = undefined;
+    var fixed_writer = std.Io.Writer.fixed(&dest);
+    _ = try token_reader.reader.streamExact(&fixed_writer, 26);
+    try std.testing.expectEqualStrings("ABCDEFGHIJKLMNOPQRSTUVWXYZ", &dest);
 }
 
 test "SegmentedStringBuffer concurrent stress test" {
