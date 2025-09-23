@@ -210,6 +210,95 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             pub fn reader(self: Token, buffer: *const Self, reader_buffer: []u8) TokenReader {
                 return TokenReader.init(buffer, self, reader_buffer);
             }
+
+            /// Create a Writer that allows writing within this token's bounds
+            pub fn writer(self: Token, buffer: *Self) TokenWriter {
+                return TokenWriter.init(buffer, self);
+            }
+        };
+
+        /// Writer implementation that allows writing within a Token's bounds
+        pub const TokenWriter = struct {
+            writer: std.Io.Writer,
+            buffer: *Self,
+            token: Token,
+            pos: usize,
+
+            pub fn init(buffer: *Self, token: Token) TokenWriter {
+                return .{
+                    .writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 }, // Zero-length buffer
+                    .buffer = buffer,
+                    .token = token,
+                    .pos = 0,
+                };
+            }
+
+            /// Simple drain implementation that writes data within token bounds.
+            /// Writes one slice at a time, byte by byte, using the existing segmented buffer logic.
+            fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+                const self: *TokenWriter = @fieldParentPtr("writer", w);
+
+                // No space left? Error immediately.
+                if (self.pos >= self.token.length()) return error.WriteFailed;
+                if (data.len == 0) return 0;
+
+                const remaining = self.token.length() - self.pos;
+                var bytes_written: usize = 0;
+                var data_consumed: usize = 0;
+
+                // Write regular data slices (all except the last one which is the splat pattern)
+                for (data[0..data.len-1]) |slice| {
+                    for (slice) |byte| {
+                        if (bytes_written >= remaining) break;
+
+                        const global_pos = self.token.byteOffsetFromStart() + self.pos + bytes_written;
+                        const location = Self.locateIndex(global_pos);
+                        const shelf = self.buffer.shelves[location.shelf_index];
+
+                        shelf[location.offset] = byte;
+                        bytes_written += 1;
+                    }
+                    data_consumed += slice.len;
+                    if (bytes_written >= remaining) break;
+                }
+
+                // Write splat pattern (repeat the last slice 'splat' times)
+                const pattern = data[data.len - 1];
+                var splat_count: usize = 0;
+                while (splat_count < splat and bytes_written < remaining) {
+                    for (pattern) |byte| {
+                        if (bytes_written >= remaining) break;
+
+                        const global_pos = self.token.byteOffsetFromStart() + self.pos + bytes_written;
+                        const location = Self.locateIndex(global_pos);
+                        const shelf = self.buffer.shelves[location.shelf_index];
+
+                        shelf[location.offset] = byte;
+                        bytes_written += 1;
+                    }
+                    splat_count += 1;
+                }
+
+                self.pos += bytes_written;
+
+                // Special case: if there were no regular data slices, we need to return how much
+                // of the pattern slice we consumed (even though it's for splat)
+                if (data.len == 1) {
+                    return @min(pattern.len, bytes_written);
+                }
+
+                return data_consumed; // Return how much we consumed from data slices (not splat)
+            }
+
+            fn flush(_: *std.Io.Writer) std.Io.Writer.Error!void {
+                // No-op
+            }
+
+            const vtable: std.Io.Writer.VTable = .{
+                .drain = drain,
+                .flush = flush,
+                .rebase = std.Io.Writer.defaultRebase,
+            };
         };
 
         /// Reader implementation that streams data from a Token
@@ -321,6 +410,36 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
 
             pub fn empty() SegmentedView {
                 return SegmentedView{
+                    .head = &[_]u8{},
+                    .body = emptyBody(),
+                    .tail = &[_]u8{},
+                };
+            }
+        };
+
+        pub const MutableSegmentedView = struct {
+            head: []u8,
+            body: [][]u8,
+            tail: []u8,
+
+            pub fn bodySlices(self: *const MutableSegmentedView) [][]u8 {
+                return self.body;
+            }
+
+            pub fn totalLength(self: *const MutableSegmentedView) usize {
+                var total: usize = 0;
+                total += self.head.len;
+                for (self.body) |chunk| total += chunk.len;
+                total += self.tail.len;
+                return total;
+            }
+
+            pub inline fn emptyBody() [][]u8 {
+                return &[_][]u8{};
+            }
+
+            pub fn empty() MutableSegmentedView {
+                return MutableSegmentedView{
                     .head = &[_]u8{},
                     .body = emptyBody(),
                     .tail = &[_]u8{},
@@ -612,6 +731,70 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             }
         }
 
+        /// Obtain a mutable view for a previously returned token.
+        /// This allows writing within the token's allocated space.
+        pub fn viewMutable(self: *Self, token: Token) MutableSegmentedView {
+            // Handle empty strings
+            if (token.length() == 0) {
+                return MutableSegmentedView.empty();
+            }
+
+            const start_global = token.byteOffsetFromStart();
+            const start_loc = Self.locateIndex(start_global);
+            const available_shelves = @as(usize, self.shelf_count.load(.acquire));
+            std.debug.assert(start_loc.shelf_index < available_shelves);
+
+            const first_shelf = self.shelves[start_loc.shelf_index];
+            std.debug.assert(first_shelf.len != 0);
+            std.debug.assert(start_loc.offset < first_shelf.len);
+
+            const total_len = token.length();
+            const first_available = first_shelf.len - start_loc.offset;
+
+            if (total_len <= first_available) {
+                return MutableSegmentedView{
+                    .head = first_shelf[start_loc.offset .. start_loc.offset + total_len],
+                    .body = MutableSegmentedView.emptyBody(),
+                    .tail = &[_]u8{},
+                };
+            }
+
+            var remaining = total_len - first_available;
+            var shelf_index = start_loc.shelf_index + 1;
+
+            while (true) {
+                std.debug.assert(shelf_index < available_shelves);
+                const shelf = self.shelves[shelf_index];
+                const shelf_len = shelf.len;
+                std.debug.assert(shelf_len != 0);
+
+                if (remaining < shelf_len) {
+                    const body_slice = if (shelf_index > start_loc.shelf_index + 1)
+                        toMutableShelfSlices(self.shelves[start_loc.shelf_index + 1 .. shelf_index])
+                    else
+                        MutableSegmentedView.emptyBody();
+
+                    return MutableSegmentedView{
+                        .head = first_shelf[start_loc.offset..],
+                        .body = body_slice,
+                        .tail = shelf[0..remaining],
+                    };
+                }
+
+                if (remaining == shelf_len) {
+                    const body_slice = toMutableShelfSlices(self.shelves[start_loc.shelf_index + 1 .. shelf_index + 1]);
+                    return MutableSegmentedView{
+                        .head = first_shelf[start_loc.offset..],
+                        .body = body_slice,
+                        .tail = &[_]u8{},
+                    };
+                }
+
+                remaining -= shelf_len;
+                shelf_index += 1;
+            }
+        }
+
         fn reserveRange(
             self: *Self,
             alloc: Allocator,
@@ -642,6 +825,11 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
 
         fn toConstShelfSlices(slice: []const Shelf) []const []const u8 {
             const ptr = @as([*]const []const u8, @ptrCast(slice.ptr));
+            return ptr[0..slice.len];
+        }
+
+        fn toMutableShelfSlices(slice: []Shelf) [][]u8 {
+            const ptr = @as([*][]u8, @ptrCast(slice.ptr));
             return ptr[0..slice.len];
         }
 
@@ -1647,4 +1835,135 @@ test "SegmentedStringBuffer concurrent stress test" {
         try std.testing.expect(view.totalLength() >= 1);
         try std.testing.expect(view.totalLength() <= max_size);
     }
+}
+
+test "TokenWriter basic functionality" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Create a token with some initial content (11 chars)
+    const result = try buffer.append(allocator, "hello world");
+    const original_token = result.token;
+
+    // Create a writer for this token
+    var token_writer = original_token.writer(&buffer);
+
+    // Write new content over the existing data (11 chars to match)
+    try token_writer.writer.writeAll("goodbye!!*!");
+
+    // Verify the content was changed
+    const view = buffer.view(original_token);
+    try expectViewEquals("goodbye!!*!", view);
+}
+
+test "TokenWriter boundary enforcement" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Create a small token
+    const result = try buffer.append(allocator, "12345");
+    const token = result.token;
+
+    var token_writer = token.writer(&buffer);
+
+    // Write exactly what fits
+    try token_writer.writer.writeAll("hello");
+
+    // Should write exactly what fits
+    const view = buffer.view(token);
+    try expectViewEquals("hello", view);
+    try std.testing.expectEqual(@as(usize, 5), token_writer.pos);
+
+    // Try to write more - should fail because no space
+    const write_result = token_writer.writer.write("more");
+    try std.testing.expectError(error.WriteFailed, write_result);
+    try std.testing.expectEqual(@as(usize, 5), token_writer.pos);
+}
+
+test "TokenWriter cross-shelf writing" {
+    var buffer = TinyBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Fill first shelf partially to ensure next append spans shelves
+    _ = try buffer.append(allocator, "0123456789");
+
+    // Create a token that spans shelves
+    const result = try buffer.append(allocator, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    const spanning_token = result.token;
+
+    var token_writer = spanning_token.writer(&buffer);
+
+    // Write new content across the shelf boundary
+    try token_writer.writer.writeAll("abcdefghijklmnopqrstuvwxyz");
+
+    // Verify the content was written correctly across shelves
+    const view = buffer.view(spanning_token);
+    try expectViewEquals("abcdefghijklmnopqrstuvwxyz", view);
+}
+
+test "TokenWriter partial writes" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const result = try buffer.append(allocator, "1234567890");
+    const token = result.token;
+
+    var token_writer = token.writer(&buffer);
+
+    // Write part of the token
+    try token_writer.writer.writeAll("hello");
+    try std.testing.expectEqual(@as(usize, 5), token_writer.pos);
+
+    // Write more
+    try token_writer.writer.writeAll("world");
+    try std.testing.expectEqual(@as(usize, 10), token_writer.pos);
+
+    // Verify final content
+    const view = buffer.view(token);
+    try expectViewEquals("helloworld", view);
+}
+
+test "TokenWriter with empty token" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const result = try buffer.append(allocator, "");
+    const empty_token = result.token;
+
+    var token_writer = empty_token.writer(&buffer);
+
+    // Try to write to empty token - should fail gracefully
+    if (token_writer.writer.writeAll("test")) {
+        // If write succeeds, no bytes should have been written due to zero capacity
+        try std.testing.expectEqual(@as(usize, 0), token_writer.pos);
+    } else |err| switch (err) {
+        error.WriteFailed => {
+            // Expected - writing to empty token should fail
+            try std.testing.expectEqual(@as(usize, 0), token_writer.pos);
+        },
+        else => return err,
+    }
+    try std.testing.expectEqual(@as(usize, 0), token_writer.pos);
+}
+
+test "TokenWriter splat functionality" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const result = try buffer.append(allocator, "1234567890");
+    const token = result.token;
+
+    var token_writer = token.writer(&buffer);
+
+    // Use splat to write repeated pattern
+    _ = try token_writer.writer.writeSplat(&.{"AB"}, 5); // Should write "ABABABABAB"
+
+    const view = buffer.view(token);
+    try expectViewEquals("ABABABABAB", view);
 }
