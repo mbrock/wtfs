@@ -212,6 +212,151 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                     .tail = &[_]u8{},
                 };
             }
+
+            /// Iterator for walking through the segments of a view
+            pub const Iterator = struct {
+                view: *const SegmentedView,
+                segment_index: usize,
+                current_segment: []const u8,
+
+                pub fn init(seg_view: *const SegmentedView) Iterator {
+                    return .{
+                        .view = seg_view,
+                        .segment_index = 0,
+                        .current_segment = seg_view.head,
+                    };
+                }
+
+                pub fn next(self: *Iterator) ?[]const u8 {
+                    if (self.current_segment.len > 0) {
+                        const segment = self.current_segment;
+                        self.advance();
+                        return segment;
+                    }
+                    return null;
+                }
+
+                fn advance(self: *Iterator) void {
+                    if (self.segment_index == 0) {
+                        // Moving from head to body or tail
+                        if (self.view.body.len > 0) {
+                            self.current_segment = self.view.body[0];
+                            self.segment_index = 1;
+                        } else {
+                            self.current_segment = self.view.tail;
+                            self.segment_index = self.view.body.len + 1;
+                        }
+                    } else if (self.segment_index <= self.view.body.len) {
+                        // In body segments
+                        if (self.segment_index < self.view.body.len) {
+                            self.current_segment = self.view.body[self.segment_index];
+                            self.segment_index += 1;
+                        } else {
+                            self.current_segment = self.view.tail;
+                            self.segment_index += 1;
+                        }
+                    } else {
+                        // Past tail, nothing left
+                        self.current_segment = &[_]u8{};
+                    }
+                }
+            };
+
+            pub fn iterator(self: *const SegmentedView) Iterator {
+                return Iterator.init(self);
+            }
+
+            /// Compare this view with a slice for equality
+            pub fn equalToSlice(self: *const SegmentedView, slice: []const u8) bool {
+                if (self.totalLength() != slice.len) return false;
+                if (slice.len == 0) return true;
+
+                var pos: usize = 0;
+
+                // Compare head
+                if (self.head.len > 0) {
+                    const cmp_len = @min(slice.len, self.head.len);
+                    if (!mem.eql(u8, slice[0..cmp_len], self.head[0..cmp_len])) {
+                        return false;
+                    }
+                    pos += cmp_len;
+                }
+
+                // Compare body segments
+                for (self.body) |segment| {
+                    if (pos >= slice.len) break;
+                    const cmp_len = @min(slice.len - pos, segment.len);
+                    if (!mem.eql(u8, slice[pos .. pos + cmp_len], segment[0..cmp_len])) {
+                        return false;
+                    }
+                    pos += cmp_len;
+                }
+
+                // Compare tail
+                if (pos < slice.len and self.tail.len > 0) {
+                    const cmp_len = slice.len - pos;
+                    if (!mem.eql(u8, slice[pos..], self.tail[0..cmp_len])) {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            /// Compare two views for equality
+            pub fn equalToView(self: *const SegmentedView, other: *const SegmentedView) bool {
+                if (self.totalLength() != other.totalLength()) return false;
+                if (self.totalLength() == 0) return true;
+
+                var iter_a = self.iterator();
+                var iter_b = other.iterator();
+                var seg_a = iter_a.next() orelse return true;
+                var seg_b = iter_b.next() orelse return true;
+                var pos_a: usize = 0;
+                var pos_b: usize = 0;
+
+                const total_len = self.totalLength();
+                while (pos_a < total_len and pos_b < total_len) {
+                    const cmp_len = @min(seg_a.len - pos_a, seg_b.len - pos_b);
+                    if (!mem.eql(u8, seg_a[pos_a .. pos_a + cmp_len], seg_b[pos_b .. pos_b + cmp_len])) {
+                        return false;
+                    }
+
+                    pos_a += cmp_len;
+                    pos_b += cmp_len;
+
+                    if (pos_a >= seg_a.len) {
+                        seg_a = iter_a.next() orelse break;
+                        pos_a = 0;
+                    }
+                    if (pos_b >= seg_b.len) {
+                        seg_b = iter_b.next() orelse break;
+                        pos_b = 0;
+                    }
+                }
+
+                return true;
+            }
+
+            /// Copy the view contents into a destination buffer
+            pub fn copyTo(self: *const SegmentedView, dest: []u8) void {
+                std.debug.assert(dest.len >= self.totalLength());
+                var pos: usize = 0;
+
+                if (self.head.len > 0) {
+                    @memcpy(dest[pos .. pos + self.head.len], self.head);
+                    pos += self.head.len;
+                }
+
+                for (self.body) |segment| {
+                    @memcpy(dest[pos .. pos + segment.len], segment);
+                    pos += segment.len;
+                }
+
+                if (self.tail.len > 0) {
+                    @memcpy(dest[pos .. pos + self.tail.len], self.tail);
+                }
+            }
         };
 
         const Location = struct {
@@ -261,49 +406,7 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                 const view_a = ctx.buffer.view(a);
                 const view_b = ctx.buffer.view(b);
 
-                // Compare the segments
-                var pos_a: usize = 0;
-                var pos_b: usize = 0;
-                var seg_a = view_a.head;
-                var seg_b = view_b.head;
-                var seg_idx_a: usize = 0;
-                var seg_idx_b: usize = 0;
-
-                while (pos_a < a.length() and pos_b < b.length()) {
-                    const remain_a = seg_a.len;
-                    const remain_b = seg_b.len;
-                    const cmp_len = @min(remain_a, remain_b);
-
-                    if (!mem.eql(u8, seg_a[0..cmp_len], seg_b[0..cmp_len])) {
-                        return false;
-                    }
-
-                    pos_a += cmp_len;
-                    pos_b += cmp_len;
-                    seg_a = seg_a[cmp_len..];
-                    seg_b = seg_b[cmp_len..];
-
-                    // Move to next segment if current is exhausted
-                    if (seg_a.len == 0 and pos_a < a.length()) {
-                        if (seg_idx_a < view_a.body.len) {
-                            seg_a = view_a.body[seg_idx_a];
-                            seg_idx_a += 1;
-                        } else {
-                            seg_a = view_a.tail;
-                        }
-                    }
-
-                    if (seg_b.len == 0 and pos_b < b.length()) {
-                        if (seg_idx_b < view_b.body.len) {
-                            seg_b = view_b.body[seg_idx_b];
-                            seg_idx_b += 1;
-                        } else {
-                            seg_b = view_b.tail;
-                        }
-                    }
-                }
-
-                return pos_a == a.length() and pos_b == b.length();
+                return view_a.equalToView(&view_b);
             }
         };
 
@@ -320,34 +423,7 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                 if (key.len == 0) return true;
 
                 const string_view = ctx.buffer.view(token);
-                var pos: usize = 0;
-
-                // Compare against head
-                const head_cmp_len = @min(key.len, string_view.head.len);
-                if (!mem.eql(u8, key[0..head_cmp_len], string_view.head[0..head_cmp_len])) {
-                    return false;
-                }
-                pos += head_cmp_len;
-
-                // Compare against body segments
-                for (string_view.body) |segment| {
-                    if (pos >= key.len) break;
-                    const seg_cmp_len = @min(key.len - pos, segment.len);
-                    if (!mem.eql(u8, key[pos..pos + seg_cmp_len], segment[0..seg_cmp_len])) {
-                        return false;
-                    }
-                    pos += seg_cmp_len;
-                }
-
-                // Compare against tail
-                if (pos < key.len) {
-                    const tail_cmp_len = key.len - pos;
-                    if (!mem.eql(u8, key[pos..], string_view.tail[0..tail_cmp_len])) {
-                        return false;
-                    }
-                }
-
-                return true;
+                return string_view.equalToSlice(key);
             }
         };
 
@@ -739,23 +815,7 @@ const ThreadedBuffer = SegmentedStringBuffer(.streaming);
 
 fn expectViewEquals(expected: []const u8, view: anytype) !void {
     try std.testing.expectEqual(expected.len, view.totalLength());
-    var cursor: usize = 0;
-
-    try std.testing.expect(cursor + view.head.len <= expected.len);
-    try std.testing.expectEqualStrings(expected[cursor .. cursor + view.head.len], view.head);
-    cursor += view.head.len;
-
-    for (view.bodySlices()) |segment| {
-        try std.testing.expect(cursor + segment.len <= expected.len);
-        try std.testing.expectEqualStrings(expected[cursor .. cursor + segment.len], segment);
-        cursor += segment.len;
-    }
-
-    try std.testing.expect(cursor + view.tail.len <= expected.len);
-    try std.testing.expectEqualStrings(expected[cursor .. cursor + view.tail.len], view.tail);
-    cursor += view.tail.len;
-
-    try std.testing.expectEqual(expected.len, cursor);
+    try std.testing.expect(view.equalToSlice(expected));
 }
 
 test "SegmentedStringBuffer concurrent append" {
@@ -1410,6 +1470,84 @@ test "SegmentedStringBuffer deduplication memory efficiency" {
     // Should only have one string in buffer
     try std.testing.expectEqual(@as(usize, 1), buffer.stringCount());
     try std.testing.expectEqual(@as(usize, test_str.len), buffer.payloadBytes());
+}
+
+test "SegmentedView helpers" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Test equalToSlice
+    const str1 = try buffer.append(allocator, "hello world");
+    try std.testing.expect(str1.view.equalToSlice("hello world"));
+    try std.testing.expect(!str1.view.equalToSlice("hello"));
+    try std.testing.expect(!str1.view.equalToSlice("hello world!"));
+
+    // Test equalToView
+    const str2 = try buffer.append(allocator, "hello world");
+    try std.testing.expect(str1.view.equalToView(&str2.view));
+
+    const str3 = try buffer.append(allocator, "different");
+    try std.testing.expect(!str1.view.equalToView(&str3.view));
+
+    // Test copyTo
+    var dest: [11]u8 = undefined;
+    str1.view.copyTo(&dest);
+    try std.testing.expectEqualStrings("hello world", &dest);
+
+    // Test iterator
+    const long_str = try buffer.append(allocator, "ABC");
+    var iter = long_str.view.iterator();
+
+    const seg1 = iter.next();
+    try std.testing.expect(seg1 != null);
+    try std.testing.expectEqualStrings("ABC", seg1.?);
+
+    const seg2 = iter.next();
+    try std.testing.expect(seg2 == null);
+}
+
+test "SegmentedView cross-shelf operations" {
+    var buffer = TinyBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Fill first shelf partially
+    _ = try buffer.append(allocator, "0123456789");
+
+    // Add string that spans shelves
+    const spanning = try buffer.append(allocator, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+
+    // Test equalToSlice with spanning string
+    try std.testing.expect(spanning.view.equalToSlice("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+
+    // Test copyTo with spanning string
+    var dest: [26]u8 = undefined;
+    spanning.view.copyTo(&dest);
+    try std.testing.expectEqualStrings("ABCDEFGHIJKLMNOPQRSTUVWXYZ", &dest);
+
+    // Test iterator with spanning string
+    var iter = spanning.view.iterator();
+    var total_len: usize = 0;
+    while (iter.next()) |segment| {
+        total_len += segment.len;
+    }
+    try std.testing.expectEqual(@as(usize, 26), total_len);
+}
+
+test "SegmentedView empty string operations" {
+    const empty_view = SmallBuffer.SegmentedView.empty();
+
+    // Test empty view comparisons
+    try std.testing.expect(empty_view.equalToSlice(""));
+    try std.testing.expect(!empty_view.equalToSlice("a"));
+
+    const another_empty = SmallBuffer.SegmentedView.empty();
+    try std.testing.expect(empty_view.equalToView(&another_empty));
+
+    // Test empty iterator
+    var iter = empty_view.iterator();
+    try std.testing.expect(iter.next() == null);
 }
 
 test "SegmentedStringBuffer concurrent stress test" {
