@@ -64,9 +64,10 @@ pub const SegmentedStringBufferConfig = struct {
 
 /// Segmented, append-only string storage backed by geometrically sized shelves.
 /// Designed for heavy concurrent append workloads without relocating existing data.
-/// Every appended string is NUL-terminated and stays within a single shelf so
-/// callers can form stable `[:0]const u8` views without additional allocation or
-/// copying. `config` selects both the growth policy and packed token layout.
+/// Appended bytes may span multiple shelves; callers obtain segmented views that
+/// reference each shelf slice without additional allocation, inserting sentinels
+/// themselves if desired. `config` selects both the growth policy and packed token
+/// layout.
 pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type {
     const PREALLOC = config.prealloc;
     const SHELF_BITS = config.shelf_bits;
@@ -97,17 +98,27 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
         const MAX_SHELVES = (@as(usize, 1) << SHELF_BITS);
         const Word = std.meta.Int(.unsigned, @bitSizeOf(usize));
         const ShiftInt = std.math.Log2Int(Word);
+
         const ShelfType = std.meta.Int(.unsigned, SHELF_BITS);
         const OffsetType = std.meta.Int(.unsigned, OFFSET_BITS);
-        const LenType = OffsetType;
+        const LocationType = std.meta.Int(.unsigned, SHELF_BITS + OFFSET_BITS);
         const MAX_SHELF_CAPACITY: usize = (@as(usize, 1) << OFFSET_BITS);
         const MAX_OFFSET: usize = MAX_SHELF_CAPACITY - 1;
-        const MAX_STRING_LEN: usize = MAX_OFFSET;
-        const TokenBits = SHELF_BITS + OFFSET_BITS + OFFSET_BITS;
+        const LOCATION_BITS = SHELF_BITS + OFFSET_BITS;
+        const LEN_BITS = SHELF_BITS + OFFSET_BITS;
+        const LenType = std.meta.Int(.unsigned, LEN_BITS);
+        const MAX_STRING_LEN: usize = @as(usize, std.math.maxInt(LenType));
+        const TokenBits = LOCATION_BITS + LEN_BITS;
+
+        // TODO: we should use the precise bit-length types in the API
+
+        // TODO: verify that the PREALLOC param correctly multiplies the max capacity
+
         comptime {
-            if (TokenBits > 127)
-                @compileError("Token bit width exceeds 127 bits");
+            if (TokenBits > 128)
+                @compileError("Token bit width exceeds 128 bits");
         }
+
         const TokenStorage = std.meta.Int(.unsigned, TokenBits);
 
         comptime {
@@ -116,27 +127,43 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             }
         }
 
-        const Shelf = struct {
-            addr: ?[*]u8 = null,
-        };
+        const Shelf = []u8;
 
         /// Identifies the location of a stored string within the buffer.
         /// The string spans `len` bytes starting at `offset` within `shelf`.
+        const OFFSET_MASK: LocationType = (@as(LocationType, 1) << OFFSET_BITS) - 1;
         pub const Token = packed struct(TokenStorage) {
-            shelf: ShelfType,
-            offset: OffsetType,
+            location: LocationType,
             len: LenType,
 
             pub fn shelfIndex(self: Token) usize {
-                return @intCast(self.shelf);
+                return @intCast(self.location >> OFFSET_BITS);
             }
 
             pub fn byteOffset(self: Token) usize {
-                return @intCast(self.offset);
+                return @intCast(self.location & OFFSET_MASK);
             }
 
             pub fn length(self: Token) usize {
                 return @intCast(self.len);
+            }
+
+            pub fn packedLocation(self: Token) usize {
+                return @intCast(self.location);
+            }
+
+            pub fn byteOffsetFromStart(self: Token) usize {
+                // TODO: i'm too tired
+                _ = self;
+                return undefined;
+            }
+
+            pub fn end(self: Token) Token {
+                _ = self;
+                return Token{
+                    .location = undefined, // TODO: uhhh...
+                    .len = 0,
+                };
             }
 
             fn init(shelf_index: usize, offset: usize, len: usize) Token {
@@ -144,25 +171,57 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                 std.debug.assert(offset <= MAX_OFFSET);
                 std.debug.assert(len <= MAX_STRING_LEN);
 
+                const packed_shelf = (@as(LocationType, @intCast(shelf_index)) << OFFSET_BITS);
+                const packed_offset = @as(LocationType, @intCast(offset));
+                const location: LocationType = packed_shelf | packed_offset;
+
                 return Token{
-                    .shelf = @intCast(shelf_index),
-                    .offset = @intCast(offset),
+                    .location = location,
                     .len = @intCast(len),
                 };
             }
         };
 
-        /// Result returned from `append`, exposing both the storage token and the
-        /// freshly written `[:0]const u8` view.
-        pub const AppendResult = struct {
-            token: Token,
-            view: [:0]const u8,
+        pub const SegmentedView = struct {
+            head: []const u8,
+            body: []const []const u8,
+            tail: []const u8,
+
+            pub fn bodySlices(self: *const SegmentedView) []const []const u8 {
+                return self.body;
+            }
+
+            pub fn totalLength(self: *const SegmentedView) usize {
+                var total: usize = 0;
+                total += self.head.len;
+                for (self.body) |chunk| total += chunk.len;
+                total += self.tail.len;
+                return total;
+            }
+
+            pub inline fn emptyBody() []const []const u8 {
+                return &[_][]const u8{};
+            }
+
+            pub fn empty() SegmentedView {
+                return SegmentedView{
+                    .head = &[_]u8{},
+                    .body = emptyBody(),
+                    .tail = &[_]u8{},
+                };
+            }
         };
 
-        const Claim = struct {
-            base: [*]u8,
+        const Location = struct {
             shelf_index: usize,
             offset: usize,
+        };
+
+        /// Result returned from `append`, exposing both the storage token and the
+        /// freshly written view.
+        pub const AppendResult = struct {
+            token: Token,
+            view: SegmentedView,
         };
 
         /// Aggregate debugging stats across the currently allocated shelves.
@@ -175,11 +234,10 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
         };
 
         shelves: [MAX_SHELVES]Shelf = mem.zeroes([MAX_SHELVES]Shelf),
-        shelf_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        shelf_count: std.atomic.Value(u8) = .init(0),
         string_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         payload_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         capacity_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-        last_remaining: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
         grow_mutex: std.Thread.Mutex = .{},
 
         pub const empty: Self = .{};
@@ -190,103 +248,127 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             // shelves that were published before teardown.
             const shelf_count = self.shelf_count.load(.acquire);
             for (0..shelf_count) |s| {
-                const entry = self.shelves[s];
-                const base = entry.addr orelse continue;
-                const capacity = shelfCapacity(s) orelse continue;
-                alloc.free(base[0..capacity]);
-                self.shelves[s].addr = null;
+                const shelf = self.shelves[s];
+                if (shelf.len == 0) continue;
+                alloc.free(shelf);
+                self.shelves[s] = mem.zeroes(Shelf);
             }
             self.* = undefined;
         }
 
-        fn claimLastShelf(self: *Self, need: usize) ?Claim {
-            while (true) {
-                const count_before = self.shelf_count.load(.acquire);
-                if (count_before == 0) return null;
-
-                const shelf_index = count_before - 1;
-                const entry_ptr = &self.shelves[shelf_index];
-                const base_opt = entry_ptr.addr;
-                if (base_opt == null) {
-                    std.atomic.spinLoopHint();
-                    continue;
-                }
-
-                const cap = shelfCapacity(shelf_index) orelse return null;
-                const remaining_before = self.last_remaining.load(.acquire);
-                if (remaining_before < need) return null;
-
-                const new_remaining = remaining_before - need;
-                if (self.last_remaining.cmpxchgWeak(remaining_before, new_remaining, .acq_rel, .acquire) != null) {
-                    std.atomic.spinLoopHint();
-                    continue;
-                }
-
-                const count_after = self.shelf_count.load(.acquire);
-                if (count_after != count_before) {
-                    _ = self.last_remaining.fetchAdd(need, .acq_rel);
-                    continue;
-                }
-
-                if (remaining_before > cap) {
-                    _ = self.last_remaining.fetchAdd(need, .acq_rel);
-                    continue;
-                }
-
-                const offset = cap - remaining_before;
-                std.debug.assert(offset + need <= cap);
-                return Claim{
-                    .base = base_opt.?,
-                    .shelf_index = shelf_index,
-                    .offset = offset,
-                };
-            }
-        }
-
-        /// Append `bytes` as a new, NUL-terminated string and return its location.
+        /// Append `bytes` as a new string and return its location.
         pub fn append(
             self: *Self,
             alloc: Allocator,
             bytes: []const u8,
         ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!AppendResult {
-            const need_total = try std.math.add(usize, bytes.len, 1);
-            if (need_total > MAX_SHELF_CAPACITY) return error.Overflow;
+            if (bytes.len > MAX_STRING_LEN) return error.Overflow;
 
-            while (true) {
-                try self.ensureShelfFor(alloc, need_total);
-                const claim = self.claimLastShelf(need_total) orelse continue;
-
-                const start = claim.base + claim.offset;
-                const dest = start[0..bytes.len];
-                @memcpy(dest, bytes);
-                start[bytes.len] = 0;
-
-                // acq_rel keeps the counters coherent for readers while
-                // avoiding unnecessary fences on load-only observers.
+            if (bytes.len == 0) {
+                _ = try self.reserveRange(alloc, 0);
                 _ = self.string_count.fetchAdd(1, .acq_rel);
-                _ = self.payload_bytes.fetchAdd(bytes.len, .acq_rel);
+                const token = Token.init(0, 0, 0);
+                return AppendResult{ .token = token, .view = SegmentedView.empty() };
+            }
 
-                const token = Token.init(claim.shelf_index, claim.offset, bytes.len);
-                const slice_view: [:0]const u8 = start[0..bytes.len :0];
-                return AppendResult{ .token = token, .view = slice_view };
+            const start = try self.reserveRange(alloc, bytes.len);
+            const start_location = locateIndex(start);
+
+            // TODO: we should be able to do this very easily using a mutable
+            // variant of the slice view
+
+            var remaining_len = bytes.len;
+            var written: usize = 0;
+            var shelf_index = start_location.shelf_index;
+            var shelf_offset = start_location.offset;
+
+            while (remaining_len != 0) {
+                std.debug.assert(shelf_index < self.shelf_count.load(.acquire));
+                const shelf = self.shelves[shelf_index];
+                std.debug.assert(shelf.len != 0);
+                std.debug.assert(shelf_offset < shelf.len);
+                const available = shelf.len - shelf_offset;
+                std.debug.assert(available > 0);
+                const take = if (remaining_len < available) remaining_len else available;
+                const src = bytes[written .. written + take];
+                const dest = shelf[shelf_offset .. shelf_offset + take];
+                @memcpy(dest, src);
+
+                remaining_len -= take;
+                written += take;
+                shelf_index += 1;
+                shelf_offset = 0;
+            }
+
+            // acq_rel keeps the counters coherent for readers while avoiding
+            // unnecessary fences on load-only observers.
+            _ = self.string_count.fetchAdd(1, .acq_rel);
+
+            const token = Token.init(start_location.shelf_index, start_location.offset, bytes.len);
+            const seg_view = self.view(token);
+            return AppendResult{ .token = token, .view = seg_view };
+        }
+
+        /// Obtain a stable view for a previously returned token.
+        pub fn view(self: *const Self, token: Token) SegmentedView {
+            // TODO: verify with tests
+            // i actually don't see a need for explicit bounds checking
+            // since debug mode will check slices anyway
+            // and we supposedly have a token which is a promise it should be ok
+            const y0 = token.shelfIndex();
+            const x0 = token.byteOffset();
+            const y1 = token.end().shelfIndex();
+            const x1 = token.end().byteOffset();
+            const head = self.shelves[y0][x0..];
+            const tail = self.shelves[y1][0..x1];
+            const body = self.shelves[y0 + 1 .. y1];
+
+            return SegmentedView{
+                .head = head,
+                .body = body,
+                .tail = tail,
+            };
+        }
+
+        fn reserveRange(
+            self: *Self,
+            alloc: Allocator,
+            len: usize,
+        ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!usize {
+            while (true) {
+                const current = self.payload_bytes.load(.acquire);
+                const end = std.math.add(usize, current, len) catch return error.Overflow;
+                try self.ensureCapacityFor(alloc, end);
+                if (self.payload_bytes.cmpxchgWeak(current, end, .acq_rel, .acquire) == null) {
+                    return current;
+                }
+                std.atomic.spinLoopHint();
             }
         }
 
-        /// Obtain a stable `[:0]const u8` view for a previously returned token.
-        pub fn view(self: *const Self, token: Token) [:0]const u8 {
-            // Acquire pairs with the release that publishes a new shelf.
-            const shelf_index = token.shelfIndex();
-            const offset = token.byteOffset();
-            const len = token.length();
-            std.debug.assert(shelf_index < self.shelf_count.load(.acquire));
-            const entry = self.shelves[shelf_index];
-            const base_ptr = entry.addr orelse unreachable;
-            const cap = shelfCapacity(shelf_index) orelse unreachable;
-            std.debug.assert(len <= cap);
-            std.debug.assert(offset <= cap);
-            std.debug.assert(offset + len <= cap);
-            const base: [*]const u8 = base_ptr;
-            return base[offset .. offset + len :0];
+        fn locateIndex(index: usize) Location {
+            // TODO: make efficient and correct using "math" and/or "logic"
+            var remaining = index;
+            var shelf_index: usize = 0;
+            inline for (0..MAX_SHELVES) |y| {
+                if (remaining < shelfCapacity(y)) {
+                    return Location{
+                        .shelf_index = shelf_index,
+                        .offset = remaining,
+                    };
+                }
+                remaining -= shelfCapacity(y);
+                shelf_index += 1;
+            }
+            return .{
+                .shelf_index = shelf_index,
+                .offset = remaining,
+            };
+        }
+
+        fn toConstShelfSlices(slice: []const Shelf) []const []const u8 {
+            const ptr = @as([*]const []const u8, @ptrCast(slice.ptr));
+            return ptr[0..slice.len];
         }
 
         pub fn stringCount(self: *const Self) usize {
@@ -297,11 +379,10 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             return self.payload_bytes.load(.acquire);
         }
 
-        /// Returns the total number of bytes occupied in shelves, including NUL sentinels.
+        /// Returns the total number of bytes occupied in shelves by appended payload.
         pub fn occupiedBytes(self: *const Self) usize {
             const payload = self.payload_bytes.load(.acquire);
-            const strings = self.string_count.load(.acquire);
-            return std.math.add(usize, payload, strings) catch std.math.maxInt(usize);
+            return payload;
         }
 
         pub fn capacityBytes(self: *const Self) usize {
@@ -326,97 +407,74 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             };
         }
 
-        fn ensureShelfFor(
+        fn ensureCapacityFor(
             self: *Self,
             alloc: Allocator,
-            need: usize,
+            required: usize,
         ) (Allocator.Error || error{ShelfLimitReached})!void {
-            std.debug.assert(need <= MAX_SHELF_CAPACITY);
             while (true) {
-                const count = self.shelf_count.load(.acquire);
-                if (count > 0) {
-                    _ = shelfCapacity(count - 1) orelse return error.ShelfLimitReached;
-                    if (self.shelves[count - 1].addr != null) {
-                        const remaining = self.last_remaining.load(.acquire);
-                        if (remaining >= need) {
-                            return;
-                        }
-                    }
-                }
-                try self.growForNeed(alloc, need);
+                const capacity = self.capacity_bytes.load(.acquire);
+                if (capacity >= required) return;
+                try self.growForCapacity(alloc, required);
             }
         }
 
-        fn growForNeed(
+        fn growForCapacity(
             self: *Self,
             alloc: Allocator,
-            need: usize,
+            required: usize,
         ) (Allocator.Error || error{ShelfLimitReached})!void {
-            std.debug.assert(need <= MAX_SHELF_CAPACITY);
             self.grow_mutex.lock();
             defer self.grow_mutex.unlock();
 
-            const count = self.shelf_count.load(.acquire);
-            if (count > 0) {
-                _ = shelfCapacity(count - 1) orelse return error.ShelfLimitReached;
-                if (self.shelves[count - 1].addr != null) {
-                    const remaining = self.last_remaining.load(.acquire);
-                    if (remaining >= need) {
-                        return;
-                    }
-                }
-            }
+            const capacity = self.capacity_bytes.load(.acquire);
+            if (capacity >= required) return;
 
-            try self.growOneShelf(alloc, need);
+            try self.growOneShelf(alloc);
         }
 
         fn growOneShelf(
             self: *Self,
             alloc: Allocator,
-            need: usize,
         ) (Allocator.Error || error{ShelfLimitReached})!void {
-            _ = need; // recorded for debugging; growth order never skips a shelf even if it cannot satisfy this request.
             // Monotonic load is enough: the growth mutex serialises new shelves.
             const index = self.shelf_count.load(.monotonic);
             if (index >= MAX_SHELVES) {
                 return error.ShelfLimitReached;
             }
 
-            const capacity = shelfCapacity(index) orelse return error.ShelfLimitReached;
+            const capacity = shelfCapacity(std.math.cast(ShelfType, index) orelse undefined);
 
             const buf = try alloc.alloc(u8, capacity);
             errdefer alloc.free(buf);
 
             const entry_ptr = &self.shelves[index];
-            std.debug.assert(entry_ptr.addr == null);
-            entry_ptr.addr = buf.ptr;
-            // Publish the fresh remaining capacity before the shelf becomes visible.
-            self.last_remaining.store(capacity, .release);
-
-            _ = self.capacity_bytes.fetchAdd(capacity, .acq_rel);
+            std.debug.assert(entry_ptr.len == 0);
+            entry_ptr.* = buf;
+            _ = self.capacity_bytes.fetchAdd(buf.len, .acq_rel);
             // Release pairs with acquires on appenders so they can observe the new shelf.
             self.shelf_count.store(index + 1, .release);
         }
 
-        pub inline fn shelfCapacity(index: usize) ?usize {
-            if (index >= MAX_SHELVES) return null;
+        pub inline fn shelfCapacity(index: ShelfType) usize {
+            if (index >= MAX_SHELVES) return 0;
             if (PREALLOC == 0) {
-                if (index >= @bitSizeOf(usize)) return null;
+                if (index >= @bitSizeOf(usize)) return 0;
                 const shift: ShiftInt = @intCast(index);
                 const max_word: Word = std.math.maxInt(Word);
                 const limit = max_word >> shift;
-                if (@as(Word, 1) > limit) return null;
+                if (@as(Word, 1) > limit) return 0;
                 const capacity_word = (@as(Word, 1) << shift);
-                if (capacity_word > @as(Word, MAX_SHELF_CAPACITY)) return null;
+                if (capacity_word > @as(Word, MAX_SHELF_CAPACITY)) return 0;
                 return @as(usize, capacity_word);
             } else {
-                if (index >= @bitSizeOf(usize)) return null;
+                if (index >= @bitSizeOf(usize)) return 0;
                 const shift: ShiftInt = @intCast(index);
                 const max_word: Word = std.math.maxInt(Word);
                 const limit = max_word >> shift;
-                if (@as(Word, PREALLOC) > limit) return null;
+                if (@as(Word, PREALLOC) > limit) return 0;
                 const capacity_word = (@as(Word, PREALLOC) << shift);
-                if (capacity_word > @as(Word, MAX_SHELF_CAPACITY)) return null;
+                if (capacity_word > @as(Word, MAX_SHELF_CAPACITY)) return 0;
                 return @as(usize, capacity_word);
             }
         }
@@ -434,37 +492,85 @@ test "SegmentedStringBuffer basic append and view" {
     try std.testing.expectEqual(@as(usize, 1), buffer.shelfCount());
     try std.testing.expectEqual(@as(usize, 1), buffer.stringCount());
     try std.testing.expectEqual(@as(usize, 5), buffer.payloadBytes());
-    try std.testing.expectEqualStrings("hello", res1.view);
+    try expectViewEquals("hello", res1.view);
 
     const res2 = try buffer.append(allocator, "world");
     try std.testing.expectEqual(@as(usize, 2), buffer.stringCount());
     try std.testing.expectEqual(@as(usize, 10), buffer.payloadBytes());
-    try std.testing.expectEqualStrings("world", buffer.view(res2.token));
+    const res2_view = buffer.view(res2.token);
+    try expectViewEquals("world", res2_view);
 
     const stats = buffer.debugStats();
     try std.testing.expectEqual(@as(usize, 2), stats.string_count);
     try std.testing.expectEqual(@as(usize, 10), stats.payload_bytes);
-    try std.testing.expect(stats.occupied_bytes >= stats.payload_bytes);
+    try std.testing.expectEqual(stats.payload_bytes, stats.occupied_bytes);
 }
 
 const TinyBuffer = SegmentedStringBuffer(.tiny);
+const PackedTokenConfig = SegmentedStringBufferConfig.init(4, 4, 12);
+const PackedTokenBuffer = SegmentedStringBuffer(PackedTokenConfig);
 
 test "SegmentedStringBuffer respects shelf boundaries" {
     var buffer = TinyBuffer.empty;
     const allocator = std.testing.allocator;
     defer buffer.deinit(allocator);
 
-    // Warm up the first shelf so the next append has to respect its capacity budget.
+    // Warm up the first shelf so the next append crosses into the following shelf.
     _ = try buffer.append(allocator, "ab");
-    const second = try buffer.append(allocator, "cccccccc");
-    const second_capacity = TinyBuffer.shelfCapacity(second.token.shelfIndex()) orelse unreachable;
-    try std.testing.expect(second.token.length() + second.token.byteOffset() <= second_capacity);
+    const payload = "abcdefghijklmnopqrst"; // 20 bytes.
+    const second = try buffer.append(allocator, payload);
+    try std.testing.expectEqual(@as(usize, 0), second.token.shelfIndex());
+    try std.testing.expectEqual(@as(usize, 2), second.token.byteOffset());
+
     const view = buffer.view(second.token);
-    try std.testing.expectEqual(@as(usize, 8), view.len);
-    try std.testing.expectEqualStrings("cccccccc", view);
+    try expectViewEquals(payload, view);
+    try std.testing.expectEqual(@as(usize, 14), view.head.len);
+    try std.testing.expectEqual(@as(usize, 0), view.bodySlices().len);
+    try std.testing.expectEqual(@as(usize, 6), view.tail.len);
+}
+
+test "SegmentedStringBuffer token packs shelf and offset" {
+    var buffer = PackedTokenBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const res_a = try buffer.append(allocator, "aa");
+    try std.testing.expectEqual(@as(usize, 0), res_a.token.packedLocation());
+
+    const res_b = try buffer.append(allocator, "bb");
+    const shelf_stride = (@as(usize, 1) << PackedTokenConfig.offset_bits);
+    try std.testing.expectEqual(@as(usize, 2), res_b.token.packedLocation());
+
+    const res_c = try buffer.append(allocator, "cc");
+    try std.testing.expectEqual(shelf_stride, res_c.token.packedLocation());
+
+    try expectViewEquals("aa", res_a.view);
+    try expectViewEquals("bb", res_b.view);
+    try expectViewEquals("cc", res_c.view);
 }
 
 const ThreadedBuffer = SegmentedStringBuffer(.streaming);
+
+fn expectViewEquals(expected: []const u8, view: anytype) !void {
+    try std.testing.expectEqual(expected.len, view.totalLength());
+    var cursor: usize = 0;
+
+    try std.testing.expect(cursor + view.head.len <= expected.len);
+    try std.testing.expectEqualStrings(expected[cursor .. cursor + view.head.len], view.head);
+    cursor += view.head.len;
+
+    for (view.bodySlices()) |segment| {
+        try std.testing.expect(cursor + segment.len <= expected.len);
+        try std.testing.expectEqualStrings(expected[cursor .. cursor + segment.len], segment);
+        cursor += segment.len;
+    }
+
+    try std.testing.expect(cursor + view.tail.len <= expected.len);
+    try std.testing.expectEqualStrings(expected[cursor .. cursor + view.tail.len], view.tail);
+    cursor += view.tail.len;
+
+    try std.testing.expectEqual(expected.len, cursor);
+}
 
 test "SegmentedStringBuffer concurrent append" {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
@@ -507,6 +613,6 @@ test "SegmentedStringBuffer concurrent append" {
         const got = buffer.view(token);
         var scratch: [64]u8 = undefined;
         const expected = try std.fmt.bufPrint(&scratch, "t{d}-{d}", .{ idx / per_thread, idx % per_thread });
-        try std.testing.expectEqualStrings(expected, got);
+        try expectViewEquals(expected, got);
     }
 }

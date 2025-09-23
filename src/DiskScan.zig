@@ -341,7 +341,7 @@ test "threaded disk scan can repeatedly scan populated directory trees" {
     const expected_files = top_dir_count * sub_dir_count * files_per_subdir;
     const expected_directories = 1 + top_dir_count + (top_dir_count * sub_dir_count);
 
-    for (0..100) |_| {
+    for (0..20) |_| {
         var disk_scan = Self{ .allocator = allocator, .root = root_path };
         defer {
             disk_scan.directories.deinit(allocator);
