@@ -8,6 +8,10 @@ const Context = @import("Context.zig");
 const Worker = @import("Worker.zig");
 const Reporter = @import("Report.zig");
 
+comptime {
+    _ = std.testing.refAllDecls(@This());
+}
+
 const Self = @This();
 
 /// Memory allocator for all dynamic allocations during the scan

@@ -4,49 +4,62 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const root_module = b.createModule(.{
+    const mod_wtfs = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .link_libc = true,
+    });
+
+    const mod_wtfscan = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
-        //        .sanitize_c = .full,
-        //        .sanitize_thread = true,
-        //        .stack_check = true,
     });
 
-    const exe = b.addExecutable(.{
+    mod_wtfscan.addImport("wtfs", mod_wtfs);
+
+    const exe_wtfscan = b.addExecutable(.{
         .name = "wtfs",
-        .root_module = root_module,
-        .use_llvm = true,
+        .root_module = mod_wtfscan,
     });
-    b.installArtifact(exe);
 
-    const run_cmd = b.addRunArtifact(exe);
+    const run_cmd = b.addRunArtifact(exe_wtfscan);
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    const structs_cmd = b.addRunArtifact(exe);
-    structs_cmd.addArgs(&.{"--dump-structs"});
-    const structs_step = b.step("structs", "Dump struct layouts");
-    structs_step.dependOn(&structs_cmd.step);
+    const run_dumpstruct = b.addRunArtifact(exe_wtfscan);
+    run_dumpstruct.addArg("--dump-structs");
+    const structfile = run_dumpstruct.captureStdOut();
+    const install_structfile = b.addInstallFile(structfile, "wtfstructs.txt");
 
-    const test_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+    b.getInstallStep().dependOn(&install_structfile.step);
+
+    const mod_test_wtfs = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    const tests = b.addTest(.{ .root_module = test_module });
-    const run_tests = b.addRunArtifact(tests);
+
+    const exe_tests = b.addTest(.{
+        .root_module = mod_test_wtfs,
+        .name = "wtfs-test",
+    });
+
+    const run_tests = b.addRunArtifact(exe_tests);
     run_tests.skip_foreign_checks = true;
 
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_tests.step);
+    const step_test = b.step("test", "Run tests");
+    step_test.dependOn(&run_tests.step);
 
-    const mac_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const mac_target = b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .os_tag = .macos,
+    });
+
     const mac_step = b.step("mac", "Check macOS cross-compilation");
 
     const mac_module = b.createModule(.{
@@ -55,20 +68,14 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .link_libc = true,
     });
+
     const mac_exe = b.addExecutable(.{
         .name = "wtfs",
         .root_module = mac_module,
     });
+
     mac_step.dependOn(&mac_exe.step);
 
-    const mac_test_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = mac_target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    const mac_tests = b.addTest(.{ .root_module = mac_test_module });
-    const run_mac_tests = b.addRunArtifact(mac_tests);
-    run_mac_tests.skip_foreign_checks = true;
-    mac_step.dependOn(&run_mac_tests.step);
+    b.installArtifact(exe_wtfscan);
+    b.installArtifact(exe_tests);
 }

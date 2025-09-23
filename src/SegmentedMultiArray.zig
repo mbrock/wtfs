@@ -139,6 +139,98 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
             }
         }
 
+        /// Reads `count` elements from `reader` and appends them, returning the
+        /// base index of the newly added block. The element type must have a
+        /// defined extern or packed layout.
+        pub fn takeFromReader(
+            self: *Self,
+            alloc: Allocator,
+            reader: *std.Io.Reader,
+            count: usize,
+            endian: std.builtin.Endian,
+        ) (Allocator.Error || std.Io.Reader.Error || error{Overflow})!usize {
+            comptime {
+                const info = @typeInfo(T);
+                switch (info) {
+                    .@"struct" => |s| {
+                        if (s.layout == .auto)
+                            @compileError("SegmentedMultiArray.takeFromReader requires a struct with defined layout");
+                    },
+                    else => @compileError("SegmentedMultiArray.takeFromReader only supports struct element types"),
+                }
+            }
+
+            if (count == 0) return self.len.load(.acquire);
+
+            const base = try self.reserveBlock(alloc, count);
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const elem = try reader.takeStruct(T, endian);
+                self.set(base + i, elem);
+            }
+            return base;
+        }
+
+        pub const DebugShelf = struct {
+            capacity: usize,
+            used: usize,
+        };
+
+        pub const DebugStats = struct {
+            len: usize,
+            cap: usize,
+            shelf_count: usize,
+            shelves: [MAX_SHELVES]DebugShelf,
+            field_bytes: [fields.len]usize,
+            total_bytes: usize,
+
+            pub fn bytesForField(self: @This(), comptime field: Field) usize {
+                return self.field_bytes[@intFromEnum(field)];
+            }
+        };
+
+        pub fn debugStats(self: *const Self) DebugStats {
+            var stats = DebugStats{
+                .len = self.len.load(.acquire),
+                .cap = @atomicLoad(usize, &self.cap, .acquire),
+                .shelf_count = self.shelf_count.load(.acquire),
+                .shelves = undefined,
+                .field_bytes = undefined,
+                .total_bytes = 0,
+            };
+
+            inline for (fields, 0..) |_, fi| {
+                stats.field_bytes[fi] = 0;
+            }
+            var s: usize = 0;
+            while (s < MAX_SHELVES) : (s += 1) {
+                stats.shelves[s] = .{ .capacity = 0, .used = 0 };
+            }
+
+            var remaining = stats.len;
+            var shelf_index: usize = 0;
+            while (shelf_index < stats.shelf_count) : (shelf_index += 1) {
+                const rows = shelfSizeByIndex(@intCast(shelf_index));
+                const take = @min(rows, remaining);
+                stats.shelves[shelf_index] = .{ .capacity = rows, .used = take };
+
+                inline for (fields, 0..) |f, fi| {
+                    if (@sizeOf(f.type) == 0) continue;
+                    const bytes = take * @sizeOf(f.type);
+                    stats.field_bytes[fi] += bytes;
+                    stats.total_bytes += bytes;
+                }
+
+                if (remaining > take) {
+                    remaining -= take;
+                } else {
+                    remaining = 0;
+                }
+            }
+
+            return stats;
+        }
+
         /// Appends a new row assuming an unused slot is already available.
         /// The caller must have ensured `self.len < self.cap` via
         /// `ensureTotalCapacity`, `ensureUnusedCapacity`, or prior growth.
@@ -298,8 +390,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         }
 
         pub fn slices(self: *Self) SliceView {
-            const len = self.len.load(.acquire);
-            return .{ .parent = self, .len = len };
+            return SliceView.init(self);
         }
 
         /// Compact into a contiguous std.MultiArrayList(T).
@@ -343,21 +434,9 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         pub const SliceView = struct {
             parent: *Self,
             len: usize,
-            data: [fields.len][MAX_SHELVES][]u8,
 
             pub fn init(self: *Self) @This() {
-                inline for (0..fields.len) |f| {
-                    for (0..Self.shelfIndex(self.len - 1) + 1) |s| {
-                        const entry = self.parent.shelves[f][s];
-                        if (entry.addr == 0 or @sizeOf(FieldTypeI(f)) == 0) {
-                            self.data[f][s] = &.{};
-                        } else {
-                            const rows = Self.shelfSizeByIndex(@intCast(s));
-                            const base: [*]FieldTypeI(f) = @as([*]FieldTypeI(f), @ptrFromInt(entry.addr));
-                            self.data[f][s] = base[0..rows];
-                        }
-                    }
-                }
+                return .{ .parent = self, .len = self.len.load(.acquire) };
             }
 
             /// Returns the number of logical elements visible to the view.
@@ -387,6 +466,11 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
                     }
                 }
                 return shelfslices[0 .. Self.shelfIndex(self.len - 1) + 1];
+            }
+
+            pub fn get(self: @This(), idx: usize) T {
+                std.debug.assert(idx < self.len);
+                return self.parent.get(idx);
             }
         };
 

@@ -297,6 +297,7 @@ fn MacOSDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
         pub const Mask = mask;
 
         fd: std.posix.fd_t,
+        dir: std.fs.Dir,
         reader: std.io.Reader,
         buf: []u8,
         provider_ctx: Provider.ContextType,
@@ -307,6 +308,7 @@ fn MacOSDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
         pub fn init(fd: std.posix.fd_t, buf: []u8, provider_ctx: Provider.ContextType) @This() {
             return .{
                 .fd = fd,
+                .dir = .{ .fd = fd },
                 .reader = std.io.Reader.fixed(buf),
                 .buf = buf,
                 .provider_ctx = provider_ctx,
@@ -568,7 +570,7 @@ fn LinuxDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
                 const name_z = self.nameSlice(entry);
                 const stat = Provider.awaitStat(self.provider_ctx, &entry.stat_req, self.dir.fd, name_z) catch |err| {
                     switch (err) {
-                        else => {}
+                        else => {},
                     }
                     // Ignore per-entry stat failures; siblings still use their data.
                     entry.queued = false;
