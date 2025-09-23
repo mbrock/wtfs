@@ -183,7 +183,6 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                 };
             }
 
-
             /// Create a limited token that covers only the specified number of bytes from a given position.
             /// This is useful for respecting Reader limits and creating constrained views of token data.
             ///
@@ -199,11 +198,7 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                     else => @min(@intFromEnum(io_limit), remaining_bytes),
                 };
 
-                return Token.init(
-                    self.shelfIndex(),
-                    self.byteOffset() + pos,
-                    max_bytes
-                );
+                return Token.init(self.shelfIndex(), self.byteOffset() + pos, max_bytes);
             }
 
             /// Create a Reader that streams this token's data
@@ -232,13 +227,11 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
 
             // Get current append position as our starting token
             const current_offset = self.payload_bytes.load(.acquire);
-            const current_shelf = Self.locateIndex(current_offset).shelf_index;
+            const current_location = Self.locateIndex(current_offset);
+            const current_shelf = current_location.shelf_index;
 
             // Create initial token at current append position
-            const initial_token = Token.init(
-                @intCast(current_shelf),
-                current_offset,
-                0 // Start with 0 length, will grow
+            const initial_token = Token.init(@intCast(current_shelf), current_location.offset, 0 // Start with 0 length, will grow
             );
 
             return LockingWriter.init(self, allocator, initial_token);
@@ -277,11 +270,7 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
 
             /// Get the token representing everything written so far
             pub fn token(self: *const LockingWriter) Token {
-                return Token.init(
-                    self.base_token.shelfIndex(),
-                    self.base_token.byteOffset(),
-                    self.bytes_written + self.writer.end
-                );
+                return Token.init(self.base_token.shelfIndex(), self.base_token.byteOffset(), self.bytes_written + self.writer.end);
             }
 
             fn setupBuffer(self: *LockingWriter) void {
@@ -421,7 +410,7 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                 const buffer_size = @min(remaining, shelf_available);
 
                 // Point writer buffer directly at shelf memory
-                self.writer.buffer = shelf[shelf_start..shelf_start + buffer_size];
+                self.writer.buffer = shelf[shelf_start .. shelf_start + buffer_size];
                 self.writer.end = 0;
             }
 
@@ -1906,7 +1895,6 @@ test "Token.limit method" {
     try std.testing.expectEqual(@as(usize, 0), beyond_token.length());
 }
 
-
 test "TokenReader basic functionality" {
     var buffer = SmallBuffer.empty;
     const allocator = std.testing.allocator;
@@ -2255,6 +2243,47 @@ test "LockingWriter exclusive access and growth" {
     // After deinit, append should work again
     const result = try buffer.append(allocator, "test");
     try std.testing.expect(result.token.length() == 4);
+}
+
+test "LockingWriter resumes writing immediately after payload" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const first_shelf_capacity = SmallBuffer.shelfCapacity(0);
+    const prefill_len = first_shelf_capacity + 2;
+
+    const prefill_data = try allocator.alloc(u8, prefill_len);
+    defer allocator.free(prefill_data);
+    @memset(prefill_data, 'A');
+
+    _ = try buffer.append(allocator, prefill_data);
+
+    const initial_payload = buffer.payloadBytes();
+    try std.testing.expect(initial_payload > first_shelf_capacity);
+
+    const extra = "more-data";
+
+    const token = blk: {
+        var locking_writer = try buffer.takeLockingWriter(allocator);
+        defer locking_writer.deinit();
+
+        try locking_writer.writer.writeAll(extra);
+
+        const token = locking_writer.token();
+        try std.testing.expectEqual(initial_payload, token.byteOffsetFromStart());
+
+        const expected_location = SmallBuffer.locateIndex(initial_payload);
+        try std.testing.expectEqual(expected_location.shelf_index, token.shelfIndex());
+        try std.testing.expectEqual(expected_location.offset, token.byteOffset());
+
+        try std.testing.expectEqual(extra.len, token.length());
+
+        break :blk token;
+    };
+
+    const view = buffer.view(token);
+    try expectViewEquals(extra, view);
 }
 
 test "LockingWriter prevents multiple locks" {
