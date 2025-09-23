@@ -183,50 +183,6 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                 };
             }
 
-            /// Iterator for reading bytes from token
-            pub const Iterator = struct {
-                buffer: *const Self,
-                token: Token,
-                shelf_index: usize,
-                shelf_offset: usize,
-                bytes_read: usize,
-
-                pub fn init(buffer: *const Self, token: Token) Iterator {
-                    return .{
-                        .buffer = buffer,
-                        .token = token,
-                        .shelf_index = token.shelfIndex(),
-                        .shelf_offset = token.byteOffset(),
-                        .bytes_read = 0,
-                    };
-                }
-
-                pub fn next(self: *Iterator) ?u8 {
-                    if (self.bytes_read >= self.token.length()) return null;
-
-                    const shelf = self.buffer.shelves[self.shelf_index];
-                    const byte = shelf[self.shelf_offset];
-
-                    self.bytes_read += 1;
-                    self.shelf_offset += 1;
-
-                    // Move to next shelf if needed
-                    if (self.shelf_offset >= shelf.len and self.bytes_read < self.token.length()) {
-                        self.shelf_index += 1;
-                        self.shelf_offset = 0;
-                    }
-
-                    return byte;
-                }
-
-                pub fn remaining(self: *const Iterator) usize {
-                    return self.token.length() - self.bytes_read;
-                }
-            };
-
-            pub fn iterator(self: Token, buffer: *const Self) Iterator {
-                return Iterator.init(buffer, self);
-            }
 
             /// Create a Reader that streams this token's data
             pub fn reader(self: Token, buffer: *const Self) TokenReader {
@@ -253,15 +209,29 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             fn stream(r: *std.Io.Reader, w: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
                 const self: *TokenReader = @fieldParentPtr("reader", r);
 
-                if (self.pos >= self.token.length()) return 0;
+                if (self.pos >= self.token.length()) {
+                    return error.EndOfStream;
+                }
 
-                // Simple: just stream one shelf slice at a time
+                // Calculate current position within the token data
                 const start_global = self.token.byteOffsetFromStart() + self.pos;
                 const start_loc = Self.locateIndex(start_global);
                 const shelf = self.buffer.shelves[start_loc.shelf_index];
-                const available = @min(shelf.len - start_loc.offset, self.token.length() - self.pos);
-                const slice = shelf[start_loc.offset .. start_loc.offset + available];
 
+                // Ensure we don't read beyond the shelf's actual data
+                if (start_loc.offset >= shelf.len) {
+                    return error.ReadFailed;
+                }
+
+                const shelf_available = shelf.len - start_loc.offset;
+                const token_remaining = self.token.length() - self.pos;
+                const available = @min(shelf_available, token_remaining);
+
+                if (available == 0) {
+                    return error.EndOfStream;
+                }
+
+                const slice = shelf[start_loc.offset .. start_loc.offset + available];
                 const wrote = try w.writeVec(&.{slice});
                 self.pos += wrote;
                 return wrote;
@@ -327,32 +297,45 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             buffer: *const Self,
 
             pub fn hash(ctx: TokenContext, token: Token) u64 {
-                var hasher = std.hash.Wyhash.init(0);
-                var iter = token.iterator(ctx.buffer);
+                var hash_buffer: [256]u8 = undefined;
+                var hashing_writer = std.Io.Writer.Hashing(std.hash.Wyhash).initHasher(std.hash.Wyhash.init(0), &hash_buffer);
+                var token_reader = token.reader(ctx.buffer);
 
-                // Hash bytes in chunks for efficiency
-                var chunk: [256]u8 = undefined;
-                while (iter.remaining() > 0) {
-                    const to_read = @min(iter.remaining(), chunk.len);
-                    for (0..to_read) |i| {
-                        chunk[i] = iter.next().?;
-                    }
-                    hasher.update(chunk[0..to_read]);
-                }
+                // Stream token data directly into hashing writer
+                token_reader.reader.streamExact(&hashing_writer.writer, token.length()) catch |err| switch (err) {
+                    error.ReadFailed => {
+                        // This indicates corrupted token data - should not happen in normal operation
+                        std.debug.panic("TokenReader failed - corrupted token data", .{});
+                    },
+                    error.WriteFailed => unreachable, // Hashing writer doesn't fail
+                    error.EndOfStream => unreachable, // Token has known length
+                };
 
-                return hasher.final();
+                return hashing_writer.hasher.final();
             }
 
             pub fn eql(ctx: TokenContext, a: Token, b: Token) bool {
                 if (a.length() != b.length()) return false;
                 if (a.length() == 0) return true;
 
-                var iter_a = a.iterator(ctx.buffer);
-                var iter_b = b.iterator(ctx.buffer);
+                var reader_a = a.reader(ctx.buffer);
+                var reader_b = b.reader(ctx.buffer);
 
-                while (iter_a.next()) |byte_a| {
-                    const byte_b = iter_b.next().?;
-                    if (byte_a != byte_b) return false;
+                var buf_a: [256]u8 = undefined;
+                var buf_b: [256]u8 = undefined;
+
+                while (true) {
+                    const bytes_a = reader_a.reader.readSliceShort(&buf_a) catch |err| switch (err) {
+                        error.ReadFailed => unreachable, // TokenReader doesn't fail
+                    };
+                    const bytes_b = reader_b.reader.readSliceShort(&buf_b) catch |err| switch (err) {
+                        error.ReadFailed => unreachable, // TokenReader doesn't fail
+                    };
+
+                    if (bytes_a != bytes_b) return false;
+                    if (bytes_a == 0) break; // End of both streams
+
+                    if (!std.mem.eql(u8, buf_a[0..bytes_a], buf_b[0..bytes_b])) return false;
                 }
 
                 return true;
@@ -364,17 +347,30 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             buffer: *const Self,
 
             pub fn hash(_: StringAdapter, key: []const u8) u64 {
-                return std.hash.Wyhash.hash(0, key);
+                var hash_buffer: [256]u8 = undefined;
+                var hashing_writer = std.Io.Writer.Hashing(std.hash.Wyhash).initHasher(std.hash.Wyhash.init(0), &hash_buffer);
+                hashing_writer.writer.writeAll(key) catch unreachable; // writeAll to fixed buffer can't fail
+                return hashing_writer.hasher.final();
             }
 
             pub fn eql(ctx: StringAdapter, key: []const u8, token: Token) bool {
                 if (key.len != token.length()) return false;
                 if (key.len == 0) return true;
 
-                var iter = token.iterator(ctx.buffer);
-                for (key) |expected_byte| {
-                    const actual_byte = iter.next().?;
-                    if (expected_byte != actual_byte) return false;
+                var token_reader = token.reader(ctx.buffer);
+                var remaining_key = key;
+
+                while (remaining_key.len > 0) {
+                    var buf: [256]u8 = undefined;
+                    const to_read = @min(buf.len, remaining_key.len);
+                    const bytes_read = token_reader.reader.readSliceShort(buf[0..to_read]) catch |err| switch (err) {
+                        error.ReadFailed => unreachable, // TokenReader doesn't fail
+                    };
+
+                    if (bytes_read == 0) return false; // Token ended before key
+                    if (!std.mem.eql(u8, remaining_key[0..bytes_read], buf[0..bytes_read])) return false;
+
+                    remaining_key = remaining_key[bytes_read..];
                 }
 
                 return true;
@@ -1445,53 +1441,6 @@ test "SegmentedStringBuffer deduplication memory efficiency" {
     try std.testing.expectEqual(@as(usize, test_str.len), buffer.payloadBytes());
 }
 
-test "Token iterator basic" {
-    var buffer = SmallBuffer.empty;
-    const allocator = std.testing.allocator;
-    defer buffer.deinit(allocator);
-
-    const result = try buffer.append(allocator, "hello");
-    var iter = result.token.iterator(&buffer);
-
-    try std.testing.expectEqual(@as(?u8, 'h'), iter.next());
-    try std.testing.expectEqual(@as(?u8, 'e'), iter.next());
-    try std.testing.expectEqual(@as(?u8, 'l'), iter.next());
-    try std.testing.expectEqual(@as(?u8, 'l'), iter.next());
-    try std.testing.expectEqual(@as(?u8, 'o'), iter.next());
-    try std.testing.expectEqual(@as(?u8, null), iter.next());
-}
-
-test "Token iterator cross-shelf" {
-    var buffer = TinyBuffer.empty;
-    const allocator = std.testing.allocator;
-    defer buffer.deinit(allocator);
-
-    // Fill first shelf partially
-    _ = try buffer.append(allocator, "0123456789");
-
-    // Add string that spans shelves
-    const spanning = try buffer.append(allocator, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
-
-    // Verify all bytes with iterator
-    var iter = spanning.token.iterator(&buffer);
-    const expected = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    for (expected) |expected_byte| {
-        const actual_byte = iter.next();
-        try std.testing.expectEqual(@as(?u8, expected_byte), actual_byte);
-    }
-    try std.testing.expectEqual(@as(?u8, null), iter.next());
-}
-
-test "Token iterator empty string" {
-    var buffer = SmallBuffer.empty;
-    const allocator = std.testing.allocator;
-    defer buffer.deinit(allocator);
-
-    const result = try buffer.append(allocator, "");
-    var iter = result.token.iterator(&buffer);
-
-    try std.testing.expectEqual(@as(?u8, null), iter.next());
-}
 
 test "TokenReader basic functionality" {
     var buffer = SmallBuffer.empty;
