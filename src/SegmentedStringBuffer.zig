@@ -647,3 +647,475 @@ test "SegmentedStringBuffer concurrent append" {
         try expectViewEquals(expected, got);
     }
 }
+
+test "SegmentedStringBuffer empty string handling" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Empty string should be allowed and return empty view
+    const empty_res = try buffer.append(allocator, "");
+    try std.testing.expectEqual(@as(usize, 0), empty_res.token.length());
+    try std.testing.expectEqual(@as(usize, 1), buffer.stringCount());
+    try std.testing.expectEqual(@as(usize, 0), buffer.payloadBytes());
+    try expectViewEquals("", empty_res.view);
+
+    // Mix empty and non-empty strings
+    const text1 = try buffer.append(allocator, "hello");
+    const empty2 = try buffer.append(allocator, "");
+    const text2 = try buffer.append(allocator, "world");
+
+    try std.testing.expectEqual(@as(usize, 4), buffer.stringCount());
+    try std.testing.expectEqual(@as(usize, 10), buffer.payloadBytes());
+
+    try expectViewEquals("hello", buffer.view(text1.token));
+    try expectViewEquals("", buffer.view(empty2.token));
+    try expectViewEquals("world", buffer.view(text2.token));
+}
+
+test "SegmentedStringBuffer single character strings" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const chars = "abcdefghijklmnopqrstuvwxyz";
+    var tokens: [26]SmallBuffer.Token = undefined;
+
+    for (chars, 0..) |c, i| {
+        const char_str = [_]u8{c};
+        const res = try buffer.append(allocator, &char_str);
+        tokens[i] = res.token;
+    }
+
+    try std.testing.expectEqual(@as(usize, 26), buffer.stringCount());
+    try std.testing.expectEqual(@as(usize, 26), buffer.payloadBytes());
+
+    for (chars, 0..) |c, i| {
+        const view = buffer.view(tokens[i]);
+        const expected = [_]u8{c};
+        try expectViewEquals(&expected, view);
+    }
+}
+
+test "SegmentedStringBuffer multi-shelf spanning" {
+    // Use tiny config with 16-byte shelves for predictable testing
+    var buffer = TinyBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // First shelf has 16 bytes
+    _ = try buffer.append(allocator, "012345678901234"); // 15 bytes, leaving 1 byte
+    try std.testing.expectEqual(@as(usize, 1), buffer.shelfCount());
+
+    // This should trigger second shelf allocation and span both shelves
+    const span1 = try buffer.append(allocator, "ABCDEFGHIJ"); // 10 bytes: 1 in first shelf, 9 in second
+    try std.testing.expectEqual(@as(usize, 2), buffer.shelfCount());
+
+    const view1 = buffer.view(span1.token);
+    try expectViewEquals("ABCDEFGHIJ", view1);
+    try std.testing.expect(view1.head.len > 0); // Should have content in head
+    try std.testing.expect(view1.tail.len > 0); // Should have content in tail
+}
+
+test "SegmentedStringBuffer triple shelf span" {
+    var buffer = TinyBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Fill first shelf (16 bytes)
+    _ = try buffer.append(allocator, "0123456789ABCDE"); // 15 bytes
+
+    // Create a string that will span 3 shelves
+    // Shelf 0: 1 byte remaining
+    // Shelf 1: 32 bytes full
+    // Shelf 2: remainder
+    const long_string = "X" ++ ("Y" ** 32) ++ "Z123456789"; // 1 + 32 + 10 = 43 bytes
+    const res = try buffer.append(allocator, long_string);
+
+    const view = buffer.view(res.token);
+    try expectViewEquals(long_string, view);
+    try std.testing.expectEqual(@as(usize, 43), view.totalLength());
+    try std.testing.expectEqual(@as(usize, 1), view.head.len); // "X" in first shelf
+    try std.testing.expectEqual(@as(usize, 1), view.body.len); // One full shelf in body
+    try std.testing.expectEqual(@as(usize, 32), view.body[0].len); // Full second shelf
+    try std.testing.expectEqual(@as(usize, 10), view.tail.len); // "Z123456789" in third shelf
+}
+
+test "SegmentedStringBuffer exact shelf boundary" {
+    var buffer = TinyBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Fill exactly to shelf boundary
+    const exact16 = try buffer.append(allocator, "0123456789ABCDEF");
+    try std.testing.expectEqual(@as(usize, 16), exact16.token.length());
+
+    const view = buffer.view(exact16.token);
+    try expectViewEquals("0123456789ABCDEF", view);
+    try std.testing.expectEqual(@as(usize, 16), view.head.len);
+    try std.testing.expectEqual(@as(usize, 0), view.body.len);
+    try std.testing.expectEqual(@as(usize, 0), view.tail.len);
+
+    // Next append should go to new shelf
+    const next = try buffer.append(allocator, "XYZ");
+    try std.testing.expectEqual(@as(usize, 2), buffer.shelfCount());
+    try std.testing.expectEqual(@as(usize, 1), next.token.shelfIndex());
+    try std.testing.expectEqual(@as(usize, 0), next.token.byteOffset());
+}
+
+test "SegmentedStringBuffer token encoding limits" {
+    // Test with tiny config (4 shelf bits, 12 offset bits)
+    var buffer = TinyBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Maximum offset is (1 << 12) - 1 = 4095
+    const max_offset_test = try buffer.append(allocator, "test");
+    try std.testing.expect(max_offset_test.token.byteOffset() <= 4095);
+
+    // Shelf index should fit in 4 bits (0-15)
+    try std.testing.expect(max_offset_test.token.shelfIndex() < 16);
+}
+
+test "SegmentedStringBuffer different configurations" {
+    const configs = [_]SegmentedStringBufferConfig{
+        SegmentedStringBufferConfig.tiny,
+        SegmentedStringBufferConfig.medium,
+        SegmentedStringBufferConfig.large,
+        SegmentedStringBufferConfig.streaming,
+    };
+
+    inline for (configs) |cfg| {
+        const TestBuffer = SegmentedStringBuffer(cfg);
+        var buffer = TestBuffer.empty;
+        const allocator = std.testing.allocator;
+        defer buffer.deinit(allocator);
+
+        const test_str = "Testing different configurations!";
+        const res = try buffer.append(allocator, test_str);
+        try expectViewEquals(test_str, buffer.view(res.token));
+        try std.testing.expectEqual(@as(usize, 1), buffer.stringCount());
+        try std.testing.expectEqual(test_str.len, buffer.payloadBytes());
+    }
+}
+
+test "SegmentedStringBuffer custom configuration" {
+    // Test custom config using init method directly with valid bit counts
+    const custom_config = SegmentedStringBufferConfig.init(256, 5, 11); // 5+11=16 bits total
+    const CustomBuffer = SegmentedStringBuffer(custom_config);
+
+    var buffer = CustomBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const test_str = "Custom configuration test";
+    const res = try buffer.append(allocator, test_str);
+    try expectViewEquals(test_str, buffer.view(res.token));
+
+    // Test another custom configuration with different parameters
+    const another_config = SegmentedStringBufferConfig.init(512, 6, 26); // 6+26=32 bits total
+    const AnotherBuffer = SegmentedStringBuffer(another_config);
+
+    var buffer2 = AnotherBuffer.empty;
+    defer buffer2.deinit(allocator);
+
+    const long_str = "A" ** 500;
+    const res2 = try buffer2.append(allocator, long_str);
+    try expectViewEquals(long_str, buffer2.view(res2.token));
+}
+
+test "SegmentedStringBuffer overflow detection" {
+    // Create buffer with tiny token size to test overflow
+    const tiny_config = SegmentedStringBufferConfig.init(4, 3, 13); // 3+13=16 bits total for location, len also 16 bits
+    const TinyTokenBuffer = SegmentedStringBuffer(tiny_config);
+
+    var buffer = TinyTokenBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Test within string length limits (max is 2^16-1 = 65535)
+    const ok_str = "A" ** 1000;
+    _ = try buffer.append(allocator, ok_str);
+
+    // This should fail - exceeds MAX_STRING_LEN for this config
+    const too_long = "B" ** 65536;
+    try std.testing.expectError(error.Overflow, buffer.append(allocator, too_long));
+}
+
+test "SegmentedStringBuffer isEmpty and initial state" {
+    var buffer = SmallBuffer.empty;
+    defer buffer.deinit(std.testing.allocator);
+
+    try std.testing.expect(buffer.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), buffer.stringCount());
+    try std.testing.expectEqual(@as(usize, 0), buffer.payloadBytes());
+    try std.testing.expectEqual(@as(usize, 0), buffer.occupiedBytes());
+    try std.testing.expectEqual(@as(usize, 0), buffer.capacityBytes());
+    try std.testing.expectEqual(@as(usize, 0), buffer.shelfCount());
+
+    _ = try buffer.append(std.testing.allocator, "test");
+    try std.testing.expect(!buffer.isEmpty());
+}
+
+test "SegmentedStringBuffer stress test with many small strings" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const count = 100; // Reduced count to avoid shelf limit
+    var tokens = try allocator.alloc(SmallBuffer.Token, count);
+    defer allocator.free(tokens);
+
+    var prng = std.Random.DefaultPrng.init(42);
+    const random = prng.random();
+
+    for (0..count) |i| {
+        var buf: [32]u8 = undefined;
+        const len = random.intRangeAtMost(usize, 1, 31);
+        for (0..len) |j| {
+            buf[j] = @as(u8, @intCast(65 + (i + j) % 26)); // A-Z pattern
+        }
+        const res = try buffer.append(allocator, buf[0..len]);
+        tokens[i] = res.token;
+    }
+
+    try std.testing.expectEqual(@as(usize, count), buffer.stringCount());
+
+    // Verify all strings are readable
+    for (tokens) |token| {
+        const view = buffer.view(token);
+        try std.testing.expect(view.totalLength() >= 1);
+        try std.testing.expect(view.totalLength() <= 31);
+    }
+}
+
+test "SegmentedStringBuffer large string spanning many shelves" {
+    const LargeConfig = SegmentedStringBufferConfig.init(256, 5, 27); // 5+27=32 bits, larger shelves
+    const LargeTestBuffer = SegmentedStringBuffer(LargeConfig);
+
+    var buffer = LargeTestBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Create a string that will span multiple shelves
+    const large_size = 2000; // Reduced size to fit in available shelves
+    const large_str = try allocator.alloc(u8, large_size);
+    defer allocator.free(large_str);
+
+    // Fill with pattern
+    for (large_str, 0..) |*c, i| {
+        c.* = @as(u8, @intCast(32 + (i % 95))); // Printable ASCII
+    }
+
+    const res = try buffer.append(allocator, large_str);
+    try std.testing.expectEqual(large_size, res.token.length());
+
+    const view = buffer.view(res.token);
+    try std.testing.expectEqual(large_size, view.totalLength());
+
+    // Verify content matches
+    var reconstructed = try allocator.alloc(u8, large_size);
+    defer allocator.free(reconstructed);
+
+    var pos: usize = 0;
+    @memcpy(reconstructed[pos .. pos + view.head.len], view.head);
+    pos += view.head.len;
+
+    for (view.body) |segment| {
+        @memcpy(reconstructed[pos .. pos + segment.len], segment);
+        pos += segment.len;
+    }
+
+    @memcpy(reconstructed[pos .. pos + view.tail.len], view.tail);
+    pos += view.tail.len;
+
+    try std.testing.expectEqualSlices(u8, large_str, reconstructed);
+}
+
+test "SegmentedStringBuffer debug stats accuracy" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const stats1 = buffer.debugStats();
+    try std.testing.expectEqual(@as(usize, 0), stats1.shelf_count);
+    try std.testing.expectEqual(@as(usize, 0), stats1.string_count);
+    try std.testing.expectEqual(@as(usize, 0), stats1.payload_bytes);
+
+    _ = try buffer.append(allocator, "hello");
+    _ = try buffer.append(allocator, "world");
+
+    const stats2 = buffer.debugStats();
+    try std.testing.expectEqual(@as(usize, 2), stats2.string_count);
+    try std.testing.expectEqual(@as(usize, 10), stats2.payload_bytes);
+    try std.testing.expect(stats2.shelf_count > 0);
+    try std.testing.expect(stats2.capacity_bytes >= stats2.payload_bytes);
+}
+
+test "SegmentedStringBuffer repeated identical strings" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const repeated = "test string";
+    var tokens: [10]SmallBuffer.Token = undefined;
+
+    for (&tokens) |*token| {
+        const res = try buffer.append(allocator, repeated);
+        token.* = res.token;
+    }
+
+    try std.testing.expectEqual(@as(usize, 10), buffer.stringCount());
+    try std.testing.expectEqual(@as(usize, repeated.len * 10), buffer.payloadBytes());
+
+    for (tokens) |token| {
+        const view = buffer.view(token);
+        try expectViewEquals(repeated, view);
+    }
+}
+
+test "SegmentedStringBuffer interleaved sizes" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const small = "a";
+    const medium = "hello world";
+    const large = "The quick brown fox jumps over the lazy dog. " ** 3;
+
+    const s1 = try buffer.append(allocator, small);
+    const m1 = try buffer.append(allocator, medium);
+    const l1 = try buffer.append(allocator, large);
+    const s2 = try buffer.append(allocator, small);
+    const l2 = try buffer.append(allocator, large);
+    const m2 = try buffer.append(allocator, medium);
+
+    try expectViewEquals(small, buffer.view(s1.token));
+    try expectViewEquals(medium, buffer.view(m1.token));
+    try expectViewEquals(large, buffer.view(l1.token));
+    try expectViewEquals(small, buffer.view(s2.token));
+    try expectViewEquals(large, buffer.view(l2.token));
+    try expectViewEquals(medium, buffer.view(m2.token));
+}
+
+test "SegmentedStringBuffer zero prealloc configuration" {
+    const zero_prealloc = SegmentedStringBufferConfig.init(0, 4, 12);
+    const ZeroPreallocBuffer = SegmentedStringBuffer(zero_prealloc);
+
+    var buffer = ZeroPreallocBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Should start with first shelf being 1 byte
+    const first = try buffer.append(allocator, "a");
+    try std.testing.expectEqual(@as(usize, 1), buffer.shelfCount());
+    try expectViewEquals("a", buffer.view(first.token));
+
+    // Fill up to trigger multiple shelf allocations
+    _ = try buffer.append(allocator, "bb");
+    _ = try buffer.append(allocator, "cccc");
+    _ = try buffer.append(allocator, "dddddddd");
+
+    try std.testing.expect(buffer.shelfCount() > 1);
+}
+
+test "SegmentedStringBuffer all ASCII printable characters" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    // Test all printable ASCII characters
+    var ascii_str: [95]u8 = undefined;
+    for (32..127, 0..) |c, i| {
+        ascii_str[i] = @intCast(c);
+    }
+
+    const res = try buffer.append(allocator, &ascii_str);
+    const view = buffer.view(res.token);
+    try expectViewEquals(&ascii_str, view);
+}
+
+test "SegmentedStringBuffer binary data with null bytes" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const binary_data = [_]u8{ 0, 1, 2, 255, 254, 253, 0, 0, 0, 128, 127 };
+    const res = try buffer.append(allocator, &binary_data);
+
+    const view = buffer.view(res.token);
+    try expectViewEquals(&binary_data, view);
+}
+
+test "SegmentedStringBuffer shelf capacity calculation" {
+    // Test the shelfCapacity function with different indices
+    try std.testing.expectEqual(@as(usize, 16), SmallBuffer.shelfCapacity(0));
+    try std.testing.expectEqual(@as(usize, 32), SmallBuffer.shelfCapacity(1));
+    try std.testing.expectEqual(@as(usize, 64), SmallBuffer.shelfCapacity(2));
+    try std.testing.expectEqual(@as(usize, 128), SmallBuffer.shelfCapacity(3));
+}
+
+test "SegmentedStringBuffer token byte offset calculation" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const res1 = try buffer.append(allocator, "first");
+    const res2 = try buffer.append(allocator, "second");
+    const res3 = try buffer.append(allocator, "third");
+
+    try std.testing.expectEqual(@as(usize, 0), res1.token.byteOffsetFromStart());
+    try std.testing.expectEqual(@as(usize, 5), res2.token.byteOffsetFromStart());
+    try std.testing.expectEqual(@as(usize, 11), res3.token.byteOffsetFromStart());
+}
+
+test "SegmentedStringBuffer concurrent stress test" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    defer {
+        std.debug.assert(gpa.deinit() == .ok);
+    }
+    const allocator = gpa.allocator();
+
+    var buffer = ThreadedBuffer.empty;
+    defer buffer.deinit(allocator);
+
+    const thread_count = 8;
+    const per_thread = 25;
+    const max_size = 100;
+
+    const tokens = try allocator.alloc(ThreadedBuffer.Token, thread_count * per_thread);
+    defer allocator.free(tokens);
+
+    var group = try test_threads.ThreadTestGroup.init(thread_count);
+
+    const Worker = struct {
+        fn run(tid: usize, buf: *ThreadedBuffer, alloc: Allocator, per: usize, token_slice: []ThreadedBuffer.Token) !void {
+            const base_index = tid * per;
+            var prng = std.Random.DefaultPrng.init(@intCast(tid * 31));
+            const random = prng.random();
+
+            var i: usize = 0;
+            while (i < per) : (i += 1) {
+                const size = random.intRangeAtMost(usize, 1, 100);
+                var scratch: [100]u8 = undefined;
+                for (0..size) |j| {
+                    scratch[j] = @as(u8, @intCast(65 + ((tid + i + j) % 26)));
+                }
+                const res = try buf.append(alloc, scratch[0..size]);
+                token_slice[base_index + i] = res.token;
+            }
+        }
+    };
+
+    try group.spawnMany(thread_count, Worker.run, .{ &buffer, allocator, per_thread, tokens });
+    group.wait();
+
+    try std.testing.expectEqual(@as(usize, thread_count * per_thread), buffer.stringCount());
+
+    // Verify all tokens are valid and retrievable
+    for (tokens) |token| {
+        const view = buffer.view(token);
+        try std.testing.expect(view.totalLength() >= 1);
+        try std.testing.expect(view.totalLength() <= max_size);
+    }
+}
