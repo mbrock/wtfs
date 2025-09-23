@@ -2,6 +2,7 @@ const std = @import("std");
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const test_threads = @import("test_threading.zig");
+const HashMapUnmanaged = std.HashMapUnmanaged;
 
 /// Configuration for `SegmentedStringBuffer`. Helper constructors and presets allow
 /// callers to specify intentional capacities without manual bit math. All functions
@@ -234,6 +235,131 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             capacity_bytes: usize,
         };
 
+        /// Context for hash map operations on tokens representing strings in the buffer.
+        /// This enables using tokens as keys in a HashMap for deduplication.
+        pub const TokenContext = struct {
+            buffer: *const Self,
+
+            pub fn hash(ctx: TokenContext, token: Token) u64 {
+                const string_view = ctx.buffer.view(token);
+                var hasher = std.hash.Wyhash.init(0);
+
+                hasher.update(string_view.head);
+                for (string_view.body) |segment| {
+                    hasher.update(segment);
+                }
+                hasher.update(string_view.tail);
+
+                return hasher.final();
+            }
+
+            pub fn eql(ctx: TokenContext, a: Token, b: Token) bool {
+                // Quick length check first
+                if (a.length() != b.length()) return false;
+                if (a.length() == 0) return true;
+
+                const view_a = ctx.buffer.view(a);
+                const view_b = ctx.buffer.view(b);
+
+                // Compare the segments
+                var pos_a: usize = 0;
+                var pos_b: usize = 0;
+                var seg_a = view_a.head;
+                var seg_b = view_b.head;
+                var seg_idx_a: usize = 0;
+                var seg_idx_b: usize = 0;
+
+                while (pos_a < a.length() and pos_b < b.length()) {
+                    const remain_a = seg_a.len;
+                    const remain_b = seg_b.len;
+                    const cmp_len = @min(remain_a, remain_b);
+
+                    if (!mem.eql(u8, seg_a[0..cmp_len], seg_b[0..cmp_len])) {
+                        return false;
+                    }
+
+                    pos_a += cmp_len;
+                    pos_b += cmp_len;
+                    seg_a = seg_a[cmp_len..];
+                    seg_b = seg_b[cmp_len..];
+
+                    // Move to next segment if current is exhausted
+                    if (seg_a.len == 0 and pos_a < a.length()) {
+                        if (seg_idx_a < view_a.body.len) {
+                            seg_a = view_a.body[seg_idx_a];
+                            seg_idx_a += 1;
+                        } else {
+                            seg_a = view_a.tail;
+                        }
+                    }
+
+                    if (seg_b.len == 0 and pos_b < b.length()) {
+                        if (seg_idx_b < view_b.body.len) {
+                            seg_b = view_b.body[seg_idx_b];
+                            seg_idx_b += 1;
+                        } else {
+                            seg_b = view_b.tail;
+                        }
+                    }
+                }
+
+                return pos_a == a.length() and pos_b == b.length();
+            }
+        };
+
+        /// Adapter for using string slices as lookup keys in the dedup set.
+        pub const StringAdapter = struct {
+            buffer: *const Self,
+
+            pub fn hash(_: StringAdapter, key: []const u8) u64 {
+                return std.hash.Wyhash.hash(0, key);
+            }
+
+            pub fn eql(ctx: StringAdapter, key: []const u8, token: Token) bool {
+                if (key.len != token.length()) return false;
+                if (key.len == 0) return true;
+
+                const string_view = ctx.buffer.view(token);
+                var pos: usize = 0;
+
+                // Compare against head
+                const head_cmp_len = @min(key.len, string_view.head.len);
+                if (!mem.eql(u8, key[0..head_cmp_len], string_view.head[0..head_cmp_len])) {
+                    return false;
+                }
+                pos += head_cmp_len;
+
+                // Compare against body segments
+                for (string_view.body) |segment| {
+                    if (pos >= key.len) break;
+                    const seg_cmp_len = @min(key.len - pos, segment.len);
+                    if (!mem.eql(u8, key[pos..pos + seg_cmp_len], segment[0..seg_cmp_len])) {
+                        return false;
+                    }
+                    pos += seg_cmp_len;
+                }
+
+                // Compare against tail
+                if (pos < key.len) {
+                    const tail_cmp_len = key.len - pos;
+                    if (!mem.eql(u8, key[pos..], string_view.tail[0..tail_cmp_len])) {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+        };
+
+        /// DedupSet provides string deduplication for the buffer.
+        /// Uses Token as key with void value to save memory.
+        pub const DedupSet = HashMapUnmanaged(
+            Token,
+            void,
+            TokenContext,
+            std.hash_map.default_max_load_percentage,
+        );
+
         shelves: [MAX_SHELVES]Shelf = mem.zeroes([MAX_SHELVES]Shelf),
         shelf_count: std.atomic.Value(u8) = .init(0),
         string_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -255,6 +381,30 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                 self.shelves[s] = mem.zeroes(Shelf);
             }
             self.* = undefined;
+        }
+
+        /// Append `bytes` with deduplication. If the string already exists, return its token.
+        /// Otherwise, append it and add to the dedup set.
+        /// IMPORTANT: For thread safety, this method should be called within appropriate synchronization.
+        pub fn appendDedup(
+            self: *Self,
+            dedup: *DedupSet,
+            alloc: Allocator,
+            bytes: []const u8,
+        ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!Token {
+            // Check if string already exists before appending
+            const maybe_existing = dedup.getKeyAdapted(bytes, StringAdapter{ .buffer = self });
+            if (maybe_existing) |existing_token| {
+                return existing_token;
+            }
+
+            // String doesn't exist, append it
+            const result = try self.append(alloc, bytes);
+            const new_token = result.token;
+
+            // Add to dedup set
+            try dedup.putContext(alloc, new_token, {}, TokenContext{ .buffer = self });
+            return new_token;
         }
 
         /// Append `bytes` as a new string and return its location.
@@ -313,6 +463,11 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
 
         /// Obtain a stable view for a previously returned token.
         pub fn view(self: *const Self, token: Token) SegmentedView {
+            // Handle empty strings
+            if (token.length() == 0) {
+                return SegmentedView.empty();
+            }
+
             const start_global = token.byteOffsetFromStart();
             const start_loc = Self.locateIndex(start_global);
             const available_shelves = @as(usize, self.shelf_count.load(.acquire));
@@ -1067,6 +1222,194 @@ test "SegmentedStringBuffer token byte offset calculation" {
     try std.testing.expectEqual(@as(usize, 0), res1.token.byteOffsetFromStart());
     try std.testing.expectEqual(@as(usize, 5), res2.token.byteOffsetFromStart());
     try std.testing.expectEqual(@as(usize, 11), res3.token.byteOffsetFromStart());
+}
+
+test "SegmentedStringBuffer deduplication basic" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    var dedup = SmallBuffer.DedupSet{};
+    defer dedup.deinit(allocator);
+
+    // First append should create new entry
+    const token1 = try buffer.appendDedup(&dedup, allocator, "hello");
+    try std.testing.expectEqual(@as(usize, 1), buffer.stringCount());
+    try std.testing.expectEqual(@as(usize, 5), buffer.payloadBytes());
+
+    // Second append of same string should return same token
+    const token2 = try buffer.appendDedup(&dedup, allocator, "hello");
+    try std.testing.expectEqual(token1, token2);
+    try std.testing.expectEqual(@as(usize, 1), buffer.stringCount());
+    try std.testing.expectEqual(@as(usize, 5), buffer.payloadBytes());
+
+    // Different string should create new entry
+    const token3 = try buffer.appendDedup(&dedup, allocator, "world");
+    try std.testing.expect(token3.packedLocation() != token1.packedLocation());
+    try std.testing.expectEqual(@as(usize, 2), buffer.stringCount());
+    try std.testing.expectEqual(@as(usize, 10), buffer.payloadBytes());
+
+    // Verify the strings
+    const view1 = buffer.view(token1);
+    const view3 = buffer.view(token3);
+    try expectViewEquals("hello", view1);
+    try expectViewEquals("world", view3);
+}
+
+test "SegmentedStringBuffer deduplication with empty strings" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    var dedup = SmallBuffer.DedupSet{};
+    defer dedup.deinit(allocator);
+
+    const empty1 = try buffer.appendDedup(&dedup, allocator, "");
+    const empty2 = try buffer.appendDedup(&dedup, allocator, "");
+
+    try std.testing.expectEqual(empty1, empty2);
+    try std.testing.expectEqual(@as(usize, 1), buffer.stringCount());
+}
+
+test "SegmentedStringBuffer deduplication across shelf boundaries" {
+    var buffer = TinyBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    var dedup = TinyBuffer.DedupSet{};
+    defer dedup.deinit(allocator);
+
+    // Create a string that will span shelves
+    const long_str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    // Fill up first shelf partially
+    _ = try buffer.append(allocator, "0123456789");
+
+    // Append long string that will span shelves
+    const token1 = try buffer.appendDedup(&dedup, allocator, long_str);
+
+    // Try to append same string again
+    const token2 = try buffer.appendDedup(&dedup, allocator, long_str);
+
+    try std.testing.expectEqual(token1, token2);
+    try expectViewEquals(long_str, buffer.view(token1));
+}
+
+test "SegmentedStringBuffer deduplication stress test" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    var dedup = SmallBuffer.DedupSet{};
+    defer dedup.deinit(allocator);
+
+    // Create patterns with duplicates
+    const patterns = [_][]const u8{
+        "alpha", "beta", "gamma", "delta", "epsilon",
+        "alpha", "beta", "alpha", "gamma", "alpha",
+    };
+
+    var tokens: [patterns.len]SmallBuffer.Token = undefined;
+    for (patterns, 0..) |pattern, i| {
+        tokens[i] = try buffer.appendDedup(&dedup, allocator, pattern);
+    }
+
+    // Verify deduplication worked
+    try std.testing.expectEqual(tokens[0], tokens[5]); // "alpha"
+    try std.testing.expectEqual(tokens[0], tokens[7]); // "alpha"
+    try std.testing.expectEqual(tokens[0], tokens[9]); // "alpha"
+    try std.testing.expectEqual(tokens[1], tokens[6]); // "beta"
+    try std.testing.expectEqual(tokens[2], tokens[8]); // "gamma"
+
+    // Should only have 5 unique strings
+    try std.testing.expectEqual(@as(usize, 5), buffer.stringCount());
+}
+
+test "SegmentedStringBuffer deduplication with binary data" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    var dedup = SmallBuffer.DedupSet{};
+    defer dedup.deinit(allocator);
+
+    const binary1 = [_]u8{ 0, 1, 2, 3, 255 };
+    const binary2 = [_]u8{ 0, 1, 2, 3, 255 };
+    const binary3 = [_]u8{ 0, 1, 2, 3, 254 };
+
+    const token1 = try buffer.appendDedup(&dedup, allocator, &binary1);
+    const token2 = try buffer.appendDedup(&dedup, allocator, &binary2);
+    const token3 = try buffer.appendDedup(&dedup, allocator, &binary3);
+
+    try std.testing.expectEqual(token1, token2);
+    try std.testing.expect(token1.packedLocation() != token3.packedLocation());
+    try std.testing.expectEqual(@as(usize, 2), buffer.stringCount());
+}
+
+test "SegmentedStringBuffer TokenContext hash and equality" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const str1 = try buffer.append(allocator, "test");
+    const str2 = try buffer.append(allocator, "test");
+    const str3 = try buffer.append(allocator, "different");
+
+    const ctx = SmallBuffer.TokenContext{ .buffer = &buffer };
+
+    // Same content should have same hash
+    const hash1 = ctx.hash(str1.token);
+    const hash2 = ctx.hash(str2.token);
+    try std.testing.expectEqual(hash1, hash2);
+
+    // Same content should be equal
+    try std.testing.expect(ctx.eql(str1.token, str2.token));
+
+    // Different content should not be equal
+    try std.testing.expect(!ctx.eql(str1.token, str3.token));
+}
+
+test "SegmentedStringBuffer StringAdapter equality" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const stored = try buffer.append(allocator, "hello world");
+    const adapter = SmallBuffer.StringAdapter{ .buffer = &buffer };
+
+    // Should match identical string
+    try std.testing.expect(adapter.eql("hello world", stored.token));
+
+    // Should not match different strings
+    try std.testing.expect(!adapter.eql("hello", stored.token));
+    try std.testing.expect(!adapter.eql("hello world!", stored.token));
+    try std.testing.expect(!adapter.eql("", stored.token));
+}
+
+test "SegmentedStringBuffer deduplication memory efficiency" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    var dedup = SmallBuffer.DedupSet{};
+    defer dedup.deinit(allocator);
+
+    // Add same string many times
+    const test_str = "This is a test string for deduplication";
+    var tokens: [100]SmallBuffer.Token = undefined;
+
+    for (&tokens) |*token| {
+        token.* = try buffer.appendDedup(&dedup, allocator, test_str);
+    }
+
+    // All tokens should be identical
+    for (tokens[1..]) |token| {
+        try std.testing.expectEqual(tokens[0], token);
+    }
+
+    // Should only have one string in buffer
+    try std.testing.expectEqual(@as(usize, 1), buffer.stringCount());
+    try std.testing.expectEqual(@as(usize, test_str.len), buffer.payloadBytes());
 }
 
 test "SegmentedStringBuffer concurrent stress test" {
