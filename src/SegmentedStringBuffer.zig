@@ -184,6 +184,28 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
             }
 
 
+            /// Create a limited token that covers only the specified number of bytes from a given position.
+            /// This is useful for respecting Reader limits and creating constrained views of token data.
+            ///
+            /// Parameters:
+            /// - pos: Starting position within this token (0-based offset)
+            /// - limit: std.Io.Limit specifying maximum bytes to include
+            ///
+            /// Returns: New token covering at most limit bytes starting from pos
+            pub fn limit(self: Token, pos: usize, io_limit: std.Io.Limit) Token {
+                const remaining_bytes = self.length() -| pos; // Saturating subtraction
+                const max_bytes = switch (io_limit) {
+                    .unlimited => remaining_bytes,
+                    else => @min(@intFromEnum(io_limit), remaining_bytes),
+                };
+
+                return Token.init(
+                    self.shelfIndex(),
+                    self.byteOffset() + pos,
+                    max_bytes
+                );
+            }
+
             /// Create a Reader that streams this token's data
             pub fn reader(self: Token, buffer: *const Self, reader_buffer: []u8) TokenReader {
                 return TokenReader.init(buffer, self, reader_buffer);
@@ -206,6 +228,31 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                 };
             }
 
+            /// Core streaming implementation that efficiently streams token data using vectored I/O.
+            ///
+            /// This function implements the Reader.stream interface by leveraging the SegmentedStringBuffer's
+            /// geometric shelf structure to create optimal vectored writes. The key insight is that we create
+            /// a "limited token" that respects the Limit parameter, then use the buffer's segmented view to
+            /// generate a head/body/tail structure that maps directly to three writeVec calls.
+            ///
+            /// Limit Handling Strategy:
+            /// Instead of trying to write the entire token and then checking limits (which can cause
+            /// WriteFailed when vectors exceed buffer capacity), we create a new token that covers exactly
+            /// the bytes we're allowed to write. The segmented view automatically adapts to show only the
+            /// portion that fits within the limit.
+            ///
+            /// Vectored I/O Pattern:
+            /// The three-writeVec approach maps the segmented buffer's structure directly to syscalls:
+            /// - Head writeVec: Partial first shelf (single slice)
+            /// - Body writeVec: Complete geometric shelves (multiple slices, perfect vector)
+            /// - Tail writeVec: Partial last shelf (single slice)
+            ///
+            /// This creates efficient pwritev syscalls that can handle multiple memory segments in a single
+            /// system call, regardless of how the data is distributed across the geometric shelf structure.
+            ///
+            /// Example trace with prealloc=16, limit=1024:
+            /// pwritev(fd, [{16 bytes}, {32 bytes}, {64 bytes}, {128 bytes}, {256 bytes}, {512 bytes}, {16 bytes}], 7, offset)
+            /// This writes 1024 bytes total across 7 segments in one syscall.
             fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
                 const self: *TokenReader = @fieldParentPtr("reader", r);
 
@@ -213,30 +260,39 @@ pub fn SegmentedStringBuffer(comptime config: SegmentedStringBufferConfig) type 
                     return error.EndOfStream;
                 }
 
-                // Calculate current position within the token data
-                const start_global = self.token.byteOffsetFromStart() + self.pos;
-                const start_loc = Self.locateIndex(start_global);
-                const shelf = self.buffer.shelves[start_loc.shelf_index];
+                // KEY INSIGHT: Create a limited token that covers exactly the bytes we can write.
+                // This ensures the segmented view will only include data that fits within our constraints,
+                // preventing WriteFailed errors when writeVec tries to write more than the limit allows.
+                const limited_token = self.token.limit(self.pos, limit);
 
-                // Ensure we don't read beyond the shelf's actual data
-                if (start_loc.offset >= shelf.len) {
-                    return error.ReadFailed;
+                if (limited_token.length() == 0) return 0;
+
+                const seg_view = self.buffer.view(limited_token);
+                var total_written: usize = 0;
+
+                // Three-writeVec pattern: each writeVec call maps to an efficient pwritev syscall
+
+                // 1. Write head: partial data from the first shelf
+                if (seg_view.head.len > 0) {
+                    const wrote = try w.writeVec(&[_][]const u8{seg_view.head});
+                    total_written += wrote;
                 }
 
-                const shelf_available = shelf.len - start_loc.offset;
-                const token_remaining = self.token.length() - self.pos;
-                const available = @min(shelf_available, token_remaining);
-
-                if (available == 0) {
-                    return error.EndOfStream;
+                // 2. Write body: complete geometric shelves as a perfect vector
+                // This is the most efficient part - multiple shelves in one vectored syscall
+                if (seg_view.body.len > 0) {
+                    const wrote = try w.writeVec(seg_view.body);
+                    total_written += wrote;
                 }
 
-                // Respect the limit parameter - key fix!
-                const slice = shelf[start_loc.offset .. start_loc.offset + available];
-                const limited_slice = limit.sliceConst(slice);
-                const wrote = try w.writeVec(&.{limited_slice});
-                self.pos += wrote;
-                return wrote;
+                // 3. Write tail: partial data from the last shelf
+                if (seg_view.tail.len > 0) {
+                    const wrote = try w.writeVec(&[_][]const u8{seg_view.tail});
+                    total_written += wrote;
+                }
+
+                self.pos += total_written;
+                return total_written;
             }
 
             const vtable: std.Io.Reader.VTable = .{ .stream = stream };
@@ -1445,6 +1501,35 @@ test "SegmentedStringBuffer deduplication memory efficiency" {
     // Should only have one string in buffer
     try std.testing.expectEqual(@as(usize, 1), buffer.stringCount());
     try std.testing.expectEqual(@as(usize, test_str.len), buffer.payloadBytes());
+}
+
+test "Token.limit method" {
+    var buffer = SmallBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const result = try buffer.append(allocator, "hello world");
+    const original_token = result.token;
+
+    // Test unlimited
+    const unlimited_token = original_token.limit(0, .unlimited);
+    try std.testing.expectEqual(@as(usize, 11), unlimited_token.length());
+
+    // Test limited to 5 bytes from start
+    const limited_token = original_token.limit(0, std.Io.Limit.limited(5));
+    try std.testing.expectEqual(@as(usize, 5), limited_token.length());
+
+    // Test limited from offset
+    const offset_token = original_token.limit(6, std.Io.Limit.limited(3));
+    try std.testing.expectEqual(@as(usize, 3), offset_token.length());
+
+    // Test limit larger than remaining bytes
+    const large_limit_token = original_token.limit(6, std.Io.Limit.limited(100));
+    try std.testing.expectEqual(@as(usize, 5), large_limit_token.length()); // Only 5 bytes remain after offset 6
+
+    // Test offset beyond token end
+    const beyond_token = original_token.limit(20, std.Io.Limit.limited(5));
+    try std.testing.expectEqual(@as(usize, 0), beyond_token.length());
 }
 
 
