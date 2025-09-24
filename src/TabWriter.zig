@@ -74,51 +74,17 @@ pub const TabWriter = struct {
     }
 
     pub fn printRow(self: *TabWriter, comptime fmts: anytype, args: anytype) !void {
-        const fmt_fields = std.meta.fields(@TypeOf(fmts));
-        const arg_fields = std.meta.fields(@TypeOf(args));
-
-        comptime {
-            if (fmt_fields.len != arg_fields.len)
-                @compileError("fmts and args must be the same length");
+        comptime var i = 0;
+        var row: [fmts.len][]const u8 = undefined;
+        var buf: [256]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        const alloc = fba.allocator();
+        inline for (fmts) |fmt| {
+            row[i] = try std.fmt.allocPrint(alloc, fmt, .{args[i]});
+            i += 1;
         }
 
-        if (fmt_fields.len != self.columns.len) {
-            return Error.InvalidColumnCount;
-        }
-
-        inline for (fmt_fields, 0..) |field_info, idx| {
-            const fmt_literal = @field(fmts, field_info.name);
-            const col_args = @field(args, arg_fields[idx].name);
-            const column = self.columns[idx];
-            const width = column.width;
-
-            const cell_len = std.fmt.count(fmt_literal, col_args);
-            const pad = if (width == 0 or cell_len >= width) 0 else width - cell_len;
-
-            switch (self.style) {
-                .none => {
-                    if (idx != 0) try self.writer.writeAll(self.gap);
-                    if (column.alignment == .right and pad != 0)
-                        try writeRepeated(self.writer, " ", pad);
-                    try self.writer.print(fmt_literal, col_args);
-                    if (column.alignment == .left and pad != 0)
-                        try writeRepeated(self.writer, " ", pad);
-                },
-                .box => {
-                    if (idx == 0) try self.writer.writeAll("│");
-                    try self.writer.writeByte(' ');
-                    if (column.alignment == .right and pad != 0)
-                        try writeRepeated(self.writer, " ", pad);
-                    try self.writer.print(fmt_literal, col_args);
-                    if (column.alignment == .left and pad != 0)
-                        try writeRepeated(self.writer, " ", pad);
-                    try self.writer.writeByte(' ');
-                    try self.writer.writeAll("│");
-                },
-            }
-        }
-
-        try self.writer.writeByte('\n');
+        try self.writeRow(&row);
     }
 
     pub fn finish(self: *TabWriter) !void {

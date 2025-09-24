@@ -1,6 +1,6 @@
 # Zig 0.15 std.Io.Writer / std.Io.Reader — A Brisk Primer for Engineers
 
-Zig 0.15's IO is built around two concrete structs—Writer and Reader—with a small vtable for slow-path behavior. The trick: the fast paths operate on a visible in-struct buffer. This lets the standard helpers (print, writeVec, writeSplat, read*, etc.) run without virtual calls when possible, and only touch the vtable when the buffer can't satisfy the request.
+Zig 0.15's IO is built around two concrete structs—Writer and Reader—with a small vtable for slow-path behavior. The trick: the fast paths operate on a visible in-struct buffer. This lets the standard helpers (print, writeVec, writeSplat, read\*, etc.) run without virtual calls when possible, and only touch the vtable when the buffer can't satisfy the request.
 
 Think "hot path inlined, cold path delegated."
 
@@ -55,6 +55,7 @@ The `data: []const []const u8` parameter to `drain()` is crucial. It represents:
 3. **Natural mapping**: Maps directly to vectored IO operations like `writev()`
 
 For example, if you have buffered bytes plus new data:
+
 ```zig
 // Conceptually, drain() receives something like:
 const data = &.{
@@ -95,6 +96,7 @@ Source → Reader → Writer → Sink
 ```
 
 Each stage can transform, buffer, or redirect data. For example:
+
 - A file Reader streams to a compression Writer
 - The compression Writer streams to a network Writer
 - All using the same interface
@@ -160,6 +162,7 @@ const self: *CountingWriter = @fieldParentPtr("writer", w);
 ```
 
 This works because:
+
 1. Zig guarantees struct field layout
 2. The offset from struct start to field is compile-time constant
 3. Simple pointer arithmetic recovers the parent
@@ -172,13 +175,13 @@ The SegmentedStringBuffer demonstrates sophisticated vectored I/O patterns that 
 
 ### Three-WriteVec Pattern
 
-The TokenReader implements a three-writeVec approach that respects both buffer limits and vectored I/O constraints:
+The SliceReader implements a three-writeVec approach that respects both buffer limits and vectored I/O constraints:
 
 ```zig
 fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) StreamError!usize {
-    // Create limited token that respects the limit parameter
-    const limited_token = self.token.limit(self.pos, limit);
-    const seg_view = self.buffer.view(limited_token);
+    // Create limited slice that respects the limit parameter
+    const limited_slice = self.slice.limit(self.pos, limit);
+    const seg_view = self.buffer.view(limited_slice);
 
     // Three writeVec calls map to efficient pwritev syscalls:
 
@@ -207,27 +210,31 @@ fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) StreamError
 With `prealloc=16` and geometric growth, here are actual `strace` traces showing the vectored I/O efficiency:
 
 **Small file (38 bytes):**
+
 ```
 pwritev(4, [{iov_base="...", iov_len=16}, {iov_base="...", iov_len=22}], 2, 0) = 38
 ```
+
 - Head: 16 bytes (first shelf)
 - Tail: 22 bytes (remainder)
 - Total: 1 syscall for entire file
 
 **Medium file (10240 bytes) with limit=1024:**
+
 ```
 pwritev(4, [{iov_base="...", iov_len=16}, {32}, {64}, {128}, {256}, {512}, {16}], 7, 0) = 1024
 pwritev(4, [{iov_base="...", iov_len=1008}, {iov_base="...", iov_len=16}], 2, 1024) = 1024
 pwritev(4, [{iov_base="...", iov_len=1024}], 1, 2048) = 1024
 ...
 ```
+
 - Each call writes exactly 1024 bytes (the limit)
 - Multiple memory segments combined into single syscalls
 - Perfect geometric progression: 16+32+64+128+256+512+16 = 1024
 
 ### Key Benefits
 
-1. **Limit Compliance**: Creates limited tokens that naturally respect Reader limits
+1. **Limit Compliance**: Creates limited slices that naturally respect Reader limits
 2. **Vectored Efficiency**: Multiple memory segments written in single syscalls
 3. **No Buffer Copying**: Direct vectored writes from geometric shelves
 4. **Predictable Performance**: Each writeVec maps to one pwritev syscall
@@ -235,11 +242,13 @@ pwritev(4, [{iov_base="...", iov_len=1024}], 1, 2048) = 1024
 ### Comparison with Byte-by-Byte
 
 Byte-by-byte writes rely on writer buffering:
+
 - 10240 individual `writeByte()` calls
 - Writer buffers everything, flushes as single `pwritev`
 - Works well but less explicit about I/O patterns
 
 Vectored approach:
+
 - 3 `writeVec()` calls per limit-sized chunk
 - Each writeVec immediately becomes efficient `pwritev`
 - Explicit control over system call patterns
@@ -293,6 +302,7 @@ Using `writeVec()` instead of `writeAll()` is more than just preference—it's a
 ## How the Standard File Writer Works (Roughly)
 
 `std.fs.File.Writer`'s drain:
+
 - Builds a small stack array of `iovec` entries combining:
   - any buffered bytes already in `writer.buffer[0..end]`,
   - your `data[0..len-2]`,
@@ -318,12 +328,14 @@ try writer.writeVec(segments);
 ```
 
 Without vectored IO, this would require:
+
 1. Allocate a 165-byte temporary buffer
 2. Copy all segments into it
 3. Single write() syscall
 4. Free the temporary buffer
 
 With vectored IO:
+
 1. Single `writev()` syscall with 3 `iovec` entries
 2. No copying, no allocation
 3. Same or better performance
@@ -381,6 +393,7 @@ try real_writer.writeAll(staged_data);
 ```
 
 This pattern is invaluable for:
+
 - Building packets/records that need length prefixes
 - Ensuring atomic writes (all-or-nothing)
 - Working with APIs that need contiguous buffers
@@ -435,7 +448,7 @@ fn drain(w: *Writer, data: []const []const u8, splat: usize) Error!usize {
 
 ## A Tiny std.Io.Reader View for Your Segmented Buffer
 
-Suppose your "token" points to len bytes starting at (shelf, off), possibly crossing shelves. This Reader will stream that region as 1–2 slices per shelf using writeVec:
+Suppose your slice index points to len bytes starting at (shelf, off), possibly crossing shelves. This Reader will stream that region as 1–2 slices per shelf using writeVec:
 
 ```zig
 const SegBufReader = struct {
@@ -445,13 +458,13 @@ const SegBufReader = struct {
     off: usize,
     left: usize,
 
-    pub fn init(seg: *const SegBuf, tok: SegBuf.Token) SegBufReader {
+    pub fn init(seg: *const SegBuf, slice: SegBuf.Slice) SegBufReader {
         return .{
             .reader = .{ .vtable = &vtable, .buffer = &.{} },
             .seg = seg,
-            .shelf = tok.shelfIndex(),
-            .off = tok.byteOffset(),
-            .left = tok.length(),
+            .shelf = slice.shelfIndex(),
+            .off = slice.byteOffset(),
+            .left = slice.length(),
         };
     }
 
@@ -504,8 +517,8 @@ This integrates perfectly with tar/http/zstd writers: they'll call `reader.strea
 
 ```zig
 // Example: stream segmented data to a tar archive
-var seg_reader = SegBufReader.init(&my_segmented_buffer, token);
-try tar_writer.writeFile("data.txt", token.length(), seg_reader.reader);
+var seg_reader = SegBufReader.init(&my_segmented_buffer, slice);
+try tar_writer.writeFile("data.txt", slice.length(), seg_reader.reader);
 // The tar writer internally calls seg_reader.stream(), which provides
 // shelf slices directly via writeVec() - no intermediate copying!
 ```
@@ -570,8 +583,8 @@ You can chain writers for layered processing:
 ```zig
 // Data flows: source → compression → encryption → network
 var network_writer = NetworkWriter.init(socket);
-var crypto_writer = CryptoWriter.init(network_writer.writer, key);
-var compress_writer = CompressWriter.init(crypto_writer.writer);
+var crypto_writer = CryptoWriter.init(&network_writer.writer, key);
+var compress_writer = CompressWriter.init(&crypto_writer.writer);
 
 // All writes flow through the chain
 try compress_writer.writer.writeAll(plaintext_data);
@@ -615,6 +628,7 @@ const MmapWriter = struct {
 ## TL;DR Checklists
 
 ### When implementing a Writer:
+
 - ✅ Put your struct as a parent with an embedded `.writer`.
 - ✅ Fill `.buffer` eagerly on hot path.
 - ✅ In drain, commit buffered bytes first, then handle multi-slice + splat.
@@ -622,12 +636,14 @@ const MmapWriter = struct {
 - ✅ Optionally implement rebase to grow the visible buffer (or leave default).
 
 ### When implementing a Reader:
+
 - ✅ Keep your own position; expose a `.reader` with vtable.
 - ✅ In stream, push up to limit into the sink Writer (prefer writeVec).
 - ✅ Short reads are OK; caller will retry.
 - ✅ Optionally fill Reader.buffer yourself and return 0 to enable zero-copy reads.
 
 ### Performance Considerations:
+
 - ✅ Minimize allocations in hot paths
 - ✅ Prefer `writeVec()` over `writeAll()` for multi-segment data
 - ✅ Use appropriate buffer sizes (usually 4KB-64KB)
@@ -635,6 +651,7 @@ const MmapWriter = struct {
 - ✅ Profile actual usage patterns rather than optimizing prematurely
 
 ### Error Handling:
+
 - ✅ Handle partial writes gracefully in `drain()`
 - ✅ Ensure resources are cleaned up on error paths
 - ✅ Provide meaningful error messages

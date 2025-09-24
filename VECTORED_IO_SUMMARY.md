@@ -2,22 +2,22 @@
 
 ## Summary
 
-Successfully implemented efficient vectored I/O for SegmentedStringBuffer's TokenReader using a three-writeVec pattern that maps geometric shelf structure directly to `pwritev` syscalls.
+Successfully implemented efficient vectored I/O for SegmentedStringBuffer's SliceReader using a three-writeVec pattern that maps geometric shelf structure directly to `pwritev` syscalls.
 
-## Key Innovation: Limited Token Approach
+## Key Innovation: Limited Slice Approach
 
-The critical insight was to create a "limited token" that respects the `std.Io.Limit` parameter. This is now encapsulated in a clean `Token.limit()` method:
+The critical insight was to create a "limited slice" that respects the `std.Io.Limit` parameter. This is now encapsulated in a clean `Slice.limit()` method:
 
 ```zig
-// Clean API for creating limited tokens
-const limited_token = self.token.limit(self.pos, limit);
-const seg_view = self.buffer.view(limited_token);
+// Clean API for creating limited slices
+const limited_slice = self.slice.limit(self.pos, limit);
+const seg_view = self.buffer.view(limited_slice);
 ```
 
-The `Token.limit(pos, io_limit)` method:
+The `Slice.limit(pos, io_limit)` method:
 - Takes a position offset within the token
 - Respects the `std.Io.Limit` parameter (unlimited or specific byte count)
-- Returns a new token covering exactly the allowed bytes
+- Returns a new slice covering exactly the allowed bytes
 - Uses saturating arithmetic to handle edge cases safely
 
 This prevents `WriteFailed` errors by ensuring the segmented view only includes data that fits within constraints.
@@ -93,7 +93,7 @@ pwritev(3, [{1024}], 1, 2048) = 1024
 - ✗ Complex limit checking logic
 - ✗ Potential for partial writes
 
-### Limited Token Approach (Our Solution)
+### Limited Slice Approach (Our Solution)
 - ✓ Respects all constraints naturally
 - ✓ Optimal syscall patterns
 - ✓ Clean three-writeVec implementation
@@ -101,7 +101,7 @@ pwritev(3, [{1024}], 1, 2048) = 1024
 
 ## Files Modified
 
-- `src/SegmentedStringBuffer.zig`: Enhanced TokenReader.stream() with vectored I/O
+- `src/SegmentedStringBuffer.zig`: Enhanced SliceReader.stream() with vectored I/O
 - `docs/zig-io-primer.md`: Added advanced vectored I/O section with real traces
 - `vector_demo.zig`: Clean demonstration program
 - `bytewise_demo.zig`: Byte-by-byte comparison implementation
