@@ -7,6 +7,7 @@ const ShiftInt = std.math.Log2Int(usize);
 const MAX_SHELVES = @bitSizeOf(usize);
 const builtin = @import("builtin");
 const test_threads = @import("test_threading.zig");
+const CapacityLatch = @import("CapacityLatch.zig");
 
 /// Shared storage for fabricating pointers to zero-sized fields.
 var zst_sentinel_byte: u8 = 0;
@@ -69,10 +70,8 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         };
 
         shelves: [fields.len][MAX_SHELVES]ShelfEntry = undefined,
-        len: std.atomic.Value(usize) = .init(0), // logical rows used
-        cap: usize = 0, // logical rows addressable (only grower mutates)
+        latch: CapacityLatch = .{},
         shelf_count: std.atomic.Value(usize) = .init(0),
-        grow_token: std.atomic.Value(u8) = .init(0), // 0 = free, 1 = owned
 
         pub const empty: Self = .{};
 
@@ -99,23 +98,31 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         /// Ensures that at least `new_cap` logical rows can be addressed without changing `len`.
         /// Returns `error.OutOfMemory` if a shelf allocation fails.
         pub fn ensureTotalCapacity(self: *Self, alloc: Allocator, new_cap: usize) !void {
-            const cap_now = @atomicLoad(usize, &self.cap, .acquire);
-            if (new_cap <= cap_now) return;
-            try self.growTo(alloc, new_cap);
+            try self.ensureCapacityTo(alloc, new_cap);
         }
 
         /// Ensures that at least `additional` unused rows are available past the current length.
         /// Returns `error.OutOfMemory` if new shelves cannot be allocated.
         pub fn ensureUnusedCapacity(self: *Self, alloc: Allocator, additional: usize) !void {
-            const len_now = self.len.load(.acquire);
+            const len_now = self.len();
             const want = try std.math.add(usize, len_now, additional);
             try self.ensureTotalCapacity(alloc, want);
+        }
+
+        /// Returns the number of rows that have been logically appended.
+        pub fn len(self: *const Self) usize {
+            return self.latch.len.load(.acquire);
+        }
+
+        /// Returns the number of rows currently available to append safely.
+        pub fn capacity(self: *const Self) usize {
+            return self.latch.cap.load(.acquire);
         }
 
         /// Grows or shrinks the logical length to `new_len`, allocating shelves when necessary.
         pub fn resize(self: *Self, alloc: Allocator, new_len: usize) !void {
             try self.ensureTotalCapacity(alloc, new_len);
-            self.len.store(new_len, .release);
+            self.latch.len.store(new_len, .release);
         }
 
         /// Appends a new row, extending capacity when required, and returns its index.
@@ -128,15 +135,59 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         /// Ensures capacity exactly once for the entire block.
         pub fn reserveBlock(self: *Self, alloc: Allocator, count: usize) !usize {
             std.debug.assert(count > 0);
+            var reservation = try self.latch.reservation(count);
             while (true) {
-                const base = self.len.load(.acquire);
-                const want = try std.math.add(usize, base, count);
-                try self.ensureTotalCapacity(alloc, want);
-                if (self.len.cmpxchgStrong(base, want, .acq_rel, .acquire) == null) {
+                try self.ensureCapacityTo(alloc, reservation.len);
+                if (reservation.take()) |base| {
                     return base;
                 }
+                reservation = try self.latch.reservation(count);
                 std.atomic.spinLoopHint();
             }
+        }
+
+        fn ensureCapacityTo(
+            self: *Self,
+            alloc: Allocator,
+            target: usize,
+        ) (Allocator.Error || error{OutOfMemory})!void {
+            while (true) {
+                const snap = self.latch.snapshot();
+                if (snap.cap >= target) return;
+
+                if (self.latch.acquireOrWaitFor(target)) |growth_value| {
+                    var g = growth_value;
+                    defer g.unlock();
+
+                    try self.growUntilCapacityLocked(alloc, target);
+                    const new_cap = self.totalCapacity();
+                    std.debug.assert(new_cap >= target);
+                    std.debug.assert(new_cap >= g.start_cap);
+                    g.publishTo(new_cap);
+                } else {
+                    return;
+                }
+            }
+        }
+
+        fn growUntilCapacityLocked(
+            self: *Self,
+            alloc: Allocator,
+            target: usize,
+        ) (Allocator.Error || error{OutOfMemory})!void {
+            while (self.totalCapacity() < target) {
+                try self.growOneShelf(alloc);
+            }
+        }
+
+        fn totalCapacity(self: *const Self) usize {
+            const count = self.shelf_count.load(.acquire);
+            var total: usize = 0;
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                total += shelfSizeByIndex(@intCast(i));
+            }
+            return total;
         }
 
         /// Reads `count` elements from `reader` and appends them, returning the
@@ -149,7 +200,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
             count: usize,
             endian: std.builtin.Endian,
         ) (Allocator.Error || std.Io.Reader.Error || error{Overflow})!usize {
-            if (count == 0) return self.len.load(.acquire);
+            if (count == 0) return self.len();
 
             const base = try self.reserveBlock(alloc, count);
             var i: usize = 0;
@@ -180,8 +231,8 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
 
         pub fn debugStats(self: *const Self) DebugStats {
             var stats = DebugStats{
-                .len = self.len.load(.acquire),
-                .cap = @atomicLoad(usize, &self.cap, .acquire),
+                .len = self.len(),
+                .cap = self.capacity(),
                 .shelf_count = self.shelf_count.load(.acquire),
                 .shelves = undefined,
                 .field_bytes = undefined,
@@ -221,31 +272,12 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         }
 
         /// Appends a new row assuming an unused slot is already available.
-        /// The caller must have ensured `self.len < self.cap` via
+        /// The caller must have ensured `self.len() < self.capacity()` via
         /// `ensureTotalCapacity`, `ensureUnusedCapacity`, or prior growth.
         pub fn addOneAssumeCapacity(self: *Self) usize {
-            const idx = self.len.fetchAdd(1, .acq_rel);
-            std.debug.assert(idx < @atomicLoad(usize, &self.cap, .acquire));
+            const idx = self.latch.len.fetchAdd(1, .acq_rel);
+            std.debug.assert(idx < self.capacity());
             return idx;
-        }
-
-        fn growTo(self: *Self, alloc: Allocator, want_cap: usize) !void {
-            while (@atomicLoad(usize, &self.cap, .acquire) < want_cap) {
-                if (self.grow_token.cmpxchgWeak(0, 1, .acq_rel, .acquire) == null) {
-                    defer self.grow_token.store(0, .release);
-
-                    while (self.cap < want_cap) {
-                        try self.growOneShelf(alloc);
-                    }
-                } else {
-                    const before = self.shelf_count.load(.acquire);
-                    while (@atomicLoad(usize, &self.cap, .acquire) < want_cap and
-                        self.shelf_count.load(.acquire) == before)
-                    {
-                        std.atomic.spinLoopHint();
-                    }
-                }
-            }
         }
 
         fn growOneShelf(self: *Self, alloc: Allocator) !void {
@@ -259,7 +291,6 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
                 self.shelves[fi][s].addr = @intFromPtr(buf.ptr);
             }
 
-            self.cap += rows;
             self.shelf_count.store(s + 1, .release);
         }
 
@@ -307,7 +338,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         /// Returns a pointer to `field` at logical row `idx`.
         /// Pointers remain valid across future growth because shelves are never relocated.
         pub fn ptr(self: *Self, comptime field: Field, idx: usize) *FieldType(field) {
-            std.debug.assert(idx < self.len.load(.acquire));
+            std.debug.assert(idx < self.len());
             const fi = @intFromEnum(field);
             const sb = shelfIndex(idx);
             const bi = boxIndex(idx, sb);
@@ -327,7 +358,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         /// Read the full element at `idx` by gathering from each field.
         /// Materializes the value at row `idx` by gathering every field into a `T`.
         pub fn get(self: *Self, idx: usize) T {
-            std.debug.assert(idx < self.len.load(.acquire));
+            std.debug.assert(idx < self.len());
             var e: Elem = undefined;
             inline for (fields, 0..) |f, fi| {
                 if (@sizeOf(f.type) != 0) {
@@ -353,7 +384,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         /// Overwrites the row at `idx` with `elem`.
         /// Existing pointers to the same row remain valid.
         pub fn set(self: *Self, idx: usize, elem: T) void {
-            std.debug.assert(idx < self.len.load(.acquire));
+            std.debug.assert(idx < self.len());
             const e = switch (@typeInfo(T)) {
                 .@"struct" => elem,
                 .@"union" => Elem.fromT(elem),
@@ -387,7 +418,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         /// Each shelf is copied in order; callers own the returned list and must `deinit` it.
         pub fn toMultiArrayList(self: *Self, alloc: Allocator) !std.MultiArrayList(T) {
             var mal: std.MultiArrayList(T) = .{};
-            const len_snapshot = self.len.load(.acquire);
+            const len_snapshot = self.len();
             try mal.ensureTotalCapacity(alloc, len_snapshot);
             mal.len = len_snapshot;
             var out = mal.slice();
@@ -425,7 +456,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
             len: usize,
 
             pub fn init(self: *Self) @This() {
-                return .{ .parent = self, .len = self.len.load(.acquire) };
+                return .{ .parent = self, .len = self.len() };
             }
 
             /// Returns the number of logical elements visible to the view.
@@ -472,13 +503,13 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
 
                 /// Returns the number of logical elements visible to the view.
                 pub fn lenItems(self: @This()) usize {
-                    return self.parent.len.load(.acquire);
+                    return self.parent.len();
                 }
 
                 /// Returns the `idx`th element from the segmented field.
                 /// Zero-sized field types read as their zero value.
                 pub fn get(self: @This(), idx: usize) ViewedFieldType {
-                    std.debug.assert(idx < self.parent.len.load(.acquire));
+                    std.debug.assert(idx < self.parent.len());
                     if (@sizeOf(ViewedFieldType) == 0) return mem.zeroes(ViewedFieldType);
                     const s = Self.shelfIndex(idx);
                     const b = Self.boxIndex(idx, s);
@@ -491,7 +522,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
                 /// Returns a pointer to the `idx`th element in the segmented field.
                 /// Pointers remain valid for the lifetime of the parent array.
                 pub fn ptr(self: @This(), idx: usize) *ViewedFieldType {
-                    std.debug.assert(idx < self.parent.len.load(.acquire));
+                    std.debug.assert(idx < self.parent.len());
                     if (@sizeOf(ViewedFieldType) == 0) {
                         return @ptrCast(&zst_sentinel_byte);
                     }
@@ -506,7 +537,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
                 /// Returns an iterator that walks the view in row order across shelves.
                 /// Zero-sized field types yield their zero value on each iteration.
                 pub fn iterator(self: @This()) SegIter {
-                    const len_snapshot = self.parent.len.load(.acquire);
+                    const len_snapshot = self.parent.len();
                     return .{
                         .parent = self.parent,
                         .field_index = field_index,
@@ -574,7 +605,7 @@ test "SegmentedMultiArray basic struct usage, PREALLOC=0" {
         sma.set(idx1, .{ .a = 3, .b = 4 });
     }
 
-    try testing.expectEqual(@as(usize, 2), sma.len.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), sma.len());
     try testing.expectEqual(@as(u32, 1), sma.get(0).a);
     try testing.expectEqual(@as(u8, 4), sma.get(1).b);
 
@@ -584,7 +615,7 @@ test "SegmentedMultiArray basic struct usage, PREALLOC=0" {
         sma.set(i, .{ .a = @intCast(i + 10), .b = @intCast((i % 250) + 1) });
     }
 
-    try testing.expectEqual(@as(usize, 20), sma.len.load(.acquire));
+    try testing.expectEqual(@as(usize, 20), sma.len());
     try testing.expectEqual(@as(u32, 10 + 19), sma.get(19).a);
 
     // Field view
@@ -641,7 +672,7 @@ test "SegmentedMultiArray growth by addOne, many rows" {
         });
     }
 
-    try testing.expectEqual(@as(usize, 1000), sma.len.load(.acquire));
+    try testing.expectEqual(@as(usize, 1000), sma.len());
     try testing.expectEqual(@as(u32, 300), sma.get(100).c);
     try testing.expectEqual(@as(u8, 255), sma.get(999).d);
 }
@@ -661,7 +692,7 @@ test "SegmentedMultiArray tagged union roundtrip" {
     const ix1 = try sma.addOne(testing.allocator);
     sma.set(ix1, .{ .active = true });
 
-    try testing.expectEqual(@as(usize, 2), sma.len.load(.acquire));
+    try testing.expectEqual(@as(usize, 2), sma.len());
     try testing.expectEqual(Tag.value, sma.ptr(.tags, ix0).*);
     try testing.expectEqual(Tag.active, sma.ptr(.tags, ix1).*);
 
@@ -719,7 +750,7 @@ test "SegmentedMultiArray zero-sized fields and segmented iteration" {
     defer sma.deinit(testing.allocator);
 
     try sma.resize(testing.allocator, 9);
-    const len_snapshot = sma.len.load(.acquire);
+    const len_snapshot = sma.len();
     for (0..len_snapshot) |i| {
         sma.ptr(.id, i).* = @intCast(200 + i);
         sma.ptr(.valid, i).* = (i % 2 == 0);
@@ -762,7 +793,7 @@ test "SegmentedMultiArray segmented view pointer edits" {
     }
 
     var primary_view = sma.itemsSeg(.primary);
-    const len_snapshot = sma.len.load(.acquire);
+    const len_snapshot = sma.len();
     try testing.expectEqual(len_snapshot, primary_view.lenItems());
     for (0..primary_view.lenItems()) |i| {
         primary_view.ptr(i).* += 1;
@@ -821,7 +852,7 @@ test "SegmentedMultiArray concurrent reserveBlock" {
     try group.spawnMany(6, Worker.run, .{ &sma, alloc, block });
     group.wait();
 
-    try testing.expectEqual(@as(usize, total), sma.len.load(.acquire));
+    try testing.expectEqual(@as(usize, total), sma.len());
 
     var seen = try testing.allocator.alloc(bool, total);
     defer testing.allocator.free(seen);
@@ -888,7 +919,7 @@ test "SegmentedMultiArray concurrent addOne" {
 
     group.wait();
 
-    try testing.expectEqual(@as(usize, total), sma.len.load(.acquire));
+    try testing.expectEqual(@as(usize, total), sma.len());
 
     var seen = try testing.allocator.alloc(bool, total);
     defer testing.allocator.free(seen);

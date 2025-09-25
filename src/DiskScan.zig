@@ -365,7 +365,7 @@ test "threaded disk scan can repeatedly scan populated directory trees" {
 
 const StatsAggregator = struct {
     fn aggregateUp(self: *Self) void {
-        const len_snapshot = self.directories.len.load(.acquire);
+        const len_snapshot = self.directories.len();
         var idx = len_snapshot;
         while (idx > 0) {
             idx -= 1;
@@ -395,7 +395,7 @@ const SummaryBuilder = struct {
         var entries = std.ArrayList(SummaryEntry){};
         errdefer Summary.freeEntryList(self.allocator, &entries);
         self.progress_root.setName("Building paths");
-        const len_snapshot = self.directories.len.load(.acquire);
+        const len_snapshot = self.directories.len();
         self.progress_root.setEstimatedTotalItems(len_snapshot);
 
         var idx: usize = 0;
@@ -426,7 +426,7 @@ const SummaryBuilder = struct {
         var top_indexes = std.ArrayList(usize){};
         defer top_indexes.deinit(self.allocator);
 
-        const len_snapshot = self.directories.len.load(.acquire);
+        const len_snapshot = self.directories.len();
 
         var idx: usize = 1; // Skip root
         while (idx < len_snapshot) : (idx += 1) {
