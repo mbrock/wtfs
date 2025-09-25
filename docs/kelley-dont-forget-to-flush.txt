@@ -1,0 +1,700 @@
+0:10
+[Music]
+0:20
+[Music]
+0:36
+All is one. One is all. Who believes?
+0:43
+That's right. Our entire lives are each tiny components in the meta consciousness that is mother earth
+0:50
+itself a blip in the existence of a structure vast and great. And yet it is
+0:55
+us. We are it. And stack memory is just arena allocated heap memory.
+1:03
+All programs require memory in order to function. Some more than others.
+1:09
+You can ask for an arbitrary amount of memory while the program is running and the operating system might give it to you or it might not or it might give it
+1:17
+to you but kill you if you try to use it or it might give it to you but then kill some other random p program to make room
+1:23
+for your request possibly even crashing the entire system. One brilliant trick that programs use in
+1:30
+order to require less memory is the stack stack allocation. The idea is to
+1:36
+only allocate memory once upfront and then use that for most stuff. The pattern is so common that it's baked
+1:42
+into operating systems directly. They do the allocation even before any of your code runs. This allocation is called the
+1:48
+stack. It's it's super handy. As long as you know ahead of time how much memory you'll need, you don't need to know uh
+1:56
+as long sorry, as long as you know ahead of time how much you need, you can use the stack. If you don't, you need heap
+2:01
+allocation. That's how we usually think of it anyway. But wait a minute. What if I
+2:06
+want to do two things at once? To do things at once, we need threads or
+2:12
+processes. And the first thing that we do in order to spawn a thread is heap allocate the new thread stack.
+2:19
+Is this stack memory or heap memory? It's both. All is one. One is all. And
+2:26
+this is true. Even if we use child processes to do two things at once, it's still dynamic dynamically allocated
+2:31
+memory. even if the OS is doing it for us. This way of thinking is not merely a
+2:36
+mental exercise. It forces us to re-evaluate things like buffer sizes on the stack. Does this code look familiar
+2:42
+to anyone? It can feel free to create a big buffer on the stack like this. But
+2:48
+the moment you understand that this code participates in a greater hole, it starts to matter.
+2:54
+What makes a good stack buffer size? Well, let's dig into uh the
+3:01
+Oh, I guess we have to talk about concurrency models first.
+3:06
+So, first we have singlethreaded blocking IO. This is the baseline that most people think of. It's what we teach
+3:12
+to beginners. It's what we can imagine easily in our heads without squinting too hard. Your code runs from top to
+3:17
+bottom doing everything order. Easy as one, two, three. The next trick we start messing with is introducing threads.
+3:23
+This is where you have multiple pieces of logic running actually at the same time, thereby introducing a sporgoras
+3:29
+board of new ways to shoot yourself in the foot. Already, we're well beyond what survival of the fittest by natural
+3:34
+selection prepared our minds to reason about. And yet, we press on. When we introduce a second thread, we
+3:41
+have made scheduling part of our application. Naively, we might spawn a new thread for every piece of concurrent
+3:47
+work that we have available to do. This means that we have left all the scheduling decisions up to the operating
+3:52
+system. Unfortunately, operating systems often make utterly ridiculous scheduling decisions. Partly, this is due to the
+3:58
+application having more domain specific knowledge than the OS, but mainly it's because modern operating systems fail to
+4:04
+provide applications with the primitives needed to communicate such knowledge or at least use such knowledge to directly
+4:10
+affect the OS's contemptable scheduling decisions. To mitigate this disaster, it's common
+4:16
+for applications to make use of a thread pool. The idea here is to limit the amount of resources used simultaneously
+4:22
+by pre-spawning a fixed amount of threads, usually equal to the number of logical CPU cores of the computer and
+4:28
+then multiplexing all the work onto only those threads. Famous example of not doing this is
+4:35
+make- j. Uh, raise of hands. Has anyone here used make-j?
+4:42
+Okay, quite a few hands. Uh, put your hands down if it didn't crash your system.
+4:47
+[Laughter] Now think about this carefully. The
+4:53
+moment that we've introduced a thread pool into the application, for example, by putting a number eight here, the
+4:58
+application has taken responsibility for scheduling. Quite simply, if you have x amount of tasks and y amount of threads
+5:05
+and x is greater than y, then you must make a decision about in what order to
+5:11
+queue up those tasks. This can have profound effects on performance, especially if a given task has the
+5:16
+possibility of spawning a follow-up task. We can think of software as a pipeline just like the OS it's running
+5:22
+on and just like the hardware that it in turn is running on. As above, so below.
+5:31
+Moving on, we have singlethreaded non-blocking IO. This is where APIs like EOL, KQ, IO ring, and IO completion
+5:39
+ports come in. Each of these is a mechanism for asking the operating system to perform IO operations without
+5:46
+waiting for them to complete. Without additional sophistication, usage of such APIs is affectionately known as callback
+5:53
+hell. Towers of functions that are invoked when the respective IO is complete. This strategy too means the
+5:59
+application taking responsibility for scheduling.
+6:06
+Each time the OS wakes up the application, there are any number of callbacks to run. And again, a decision
+6:11
+must be made about in which order to run them in. Again, this can have dramatic effects on performance, particularly
+6:17
+when there's anything CPU intensive to do.
+6:31
+Finally, if we don't want to leave any performance on the table, we have the MN hybrid model. Sometimes called green
+6:37
+threads, sometimes called fibers. Here we combine a thread pool with non-blocking IO. This strategy centers
+6:43
+around the ability for yield to be implemented in the application, which looks something like this.
+6:51
+These nine instructions cause the current process to switch to another thread without reporting back to the OS.
+6:59
+How cool is that? This snippet does it by saving and restoring certain registers. But even on architectures
+7:05
+where that's not available, such as web assembly, you can implement yield via stackless co- routines, a transformation
+7:12
+that is always technically possible for programmers to do by hand, but it's a lot more convenient when the compiler
+7:18
+does it for you. Now, when we yield, which task should we yield to? Rhetorical question. That's obviously a
+7:24
+scheduling decision, which brings me to my main point. We cannot escape scheduling decisions when we write
+7:31
+applications. If we look back at even singlethreaded blocking with fresh eyes, what do we
+7:38
+see? A staticuler. We made all of the scheduling decisions ahead of time. For
+7:43
+example, we could have chose to swap these two operations and then recompile the code. That's a compile time
+7:48
+scheduling decision. With all that in mind, it's time to talk about function colors.
+7:56
+Wake up. Some languages that are not Lua have the concept of async functions and regular
+8:03
+functions. All functions can call regular functions but only async functions can call async functions. The
+8:09
+problem is that async functions can yield but regular functions cannot yield. And so we have this divide. This
+8:15
+problem arises specifically when yield is implemented via stackless co- routines. Like I mentioned earlier, this
+8:22
+strategy means converting a function into a state machine and thereby changing the rules about how it must be
+8:27
+called, creating this limitation that prevents it from being called by a regular function. Unfortunately,
+8:33
+although having two different kinds of functions solves that problem, it's freaking annoying to program this way.
+8:39
+Nobody wants to have multiple kinds of functions that can't call each other for esoteric reasons. That's nerd This
+8:45
+kind of function coloring can be avoided by careful programming language design. Lua, for example, takes advantage of its
+8:51
+dynamic nature to avoid distinguishing between these types of functions. Zigg, for example, takes advantage of
+8:57
+everything being in the same compilation unit to automatically infer which functions require the async calling
+9:03
+convention. JavaScript, for example, uh has no excuse.
+9:08
+What can't be avoided is whether a given piece of logic is compatible with a particular concurrency model. For
+9:15
+instance, here we have some code that reads two different files and then reports the hash of their hashes. This
+9:22
+logic does not require any particular concurrency model. Here I've made the
+9:27
+logic singlethreaded blocking and I can manually uh reorder the calls like so
+9:33
+with no change in the result. The same logic could participate in non-blocking IO application by having operations
+9:40
+switch tasks while waiting. Or we could switch to a threaded concurrency model like this.
+9:46
+Wouldn't it be nice if we could write this logic in a way that's agnostic to what concurrency model it's running in?
+9:51
+It might look something like this. Now only by changing the implementation of start and finish, we can make the exact
+9:58
+same code participate optimally in any context. single threaded blocking, thread pool, MN or anything else we can
+10:05
+dream up. On the other hand, this simple server can only be used with a subset of
+10:12
+concurrency models. If we use singlethreaded blocking here, then waiting for one client to reply will
+10:18
+prevent all the other clients from interacting with the server. This logic is fundamentally incompatible with that
+10:25
+concurrency model. Similarly, if a thread pool is used, some clients will experience latency, spikes or hangs when
+10:33
+a number of other clients connected is equal to the thread size or more. However, any non-blocking implementation
+10:39
+can be used as well as naive threading, one one thread per client. Should we try to write this logic to be
+10:45
+reusable in every concurrency model? Well, if we do, we just end up redundantly implementing one concurrency
+10:51
+model on top of another one. If we tried to fix the server for instance, we might introduce pull in order to not block
+10:58
+while waiting for any one client. Congratulations, we have now implemented singlethreaded non-blocking concurrency
+11:03
+one layer up in the application stack. As above, so below. My point is that
+11:10
+unlike with function coloring, the distinction between these two code snippets is is not an arbitrary
+11:16
+self-imposed limitation. It is a fundamental property of the logic itself. So let's decouple logic from
+11:27
+what I had to go through. I'm talking file systems, networking, timers,
+11:35
+synchronization primitives, and yes, async aait, anything that can block the
+11:40
+current thread of execution, including chunks of CPU intensive work. Uh, the
+11:45
+Zigg programming language already makes you pass an allocator to every function that wants to dynamically allocate
+11:50
+memory. Compared to that, this is a piece of cake.
+12:04
+ally well suited position to experiment with the answer to this question. Despite everyone's best efforts to bully
+12:10
+me into committing to tagging Zigg 1.0 over the last 10 years, I have resisted,
+12:16
+which means that I can go edit the standard library, break everybody's code, and find out whether I'm a genius or insane.
+12:22
+Now, I'm being flippant to make the talk more entertaining. But let me be clear, I have put a ton of effort into evaluating this idea before deciding to
+12:29
+inflict it on everyone. The benefits are no joke. So first of all, function purity becomes
+12:35
+super obvious. This is a little visualization of what you would probably see a lot of as far as parameters go.
+12:42
+Two points here. One, if it does not have an IO parameter, it does not do IO.
+12:47
+That's already pretty damn useful when you're trying to understand what code does. And number two, if it does have an
+12:54
+IO parameter, it can still be pure in the sense that the caller controls the effects. For example, it could be
+13:01
+possible to create an IO implementation that works at compile time. And then now we even have the ability to run code at
+13:07
+compile time that does IO. We have freestanding targets. This is
+13:12
+all embedded programming plus people making their own hobby operating systems. Embedded programming is
+13:17
+probably the use case that's easier to take seriously. But I've been complaining about operating system behavior for about uh 15 minutes now. So
+13:25
+obviously I'm in favor of people working on that stuff as much as possible. Point here being of course when you use IO as
+13:31
+an interface third party code becomes reusable also on freestanding targets provided that developers create
+13:37
+implementations of the interface for those uh for those applications.
+13:43
+Next up we have leak checking. So Zigg already does this for memory allocations but wouldn't it be pretty handy if it
+13:49
+also did it for file descriptors network sockets and and all those other kinds of resources too.
+13:56
+Finally debugging. Does anyone use thread sanitizer? I see fair amount of hands. Thread
+14:02
+sanitizer is a handy tool for finding race conditions. A similar tool could be implemented at the IO interface API
+14:08
+layer instead, which would be significantly more performant and thus able to quickly test a greater number of
+14:13
+possible combinations that might lead to bugs. Wouldn't it be sweet to fuzz test your execution order? I bet an entire
+14:20
+company could be made about that concept. Uh, next we have uh dependency
+14:26
+injection. Remember 2012? No. Really? Has it been that long?
+14:31
+Here's a reminder. Uh, dependency injection was hot We didn't have cryptocurrency yet. Jesus, we certainly
+14:36
+didn't have AI. All we had was a dependency injection to get us all hyped up. As you can clearly see in this
+14:42
+unobstructed, legible article. Kidding aside, the point here is that
+14:47
+when you code against an IO interface, you can fake that interface in order to more easily unit test. Could be handy
+14:52
+sometimes. Uh, next we have custom scheduling. So uh when other people code
+14:57
+against an IO interface, the logic no longer has opinions about scheduling.
+15:02
+This means that you can take third party code, run it under your application and get optimal behavior despite the
+15:09
+maintainer, the third party maintainer knowing nothing about your application in particular.
+15:14
+Next we have cancellation. So you can start operations and then decide later
+15:19
+that you're not interested in the results or effects. After all, this is something that tends to get really messy
+15:24
+real fast when you try to put directly into a programming language alongside async8 functionality. But it actually
+15:30
+works quite well in userland instead in the standard library, which I will demonstrate in a moment.
+15:36
+But of course, the main benefit is the part I spent all of one building up to. You can write logic that is agnostic to
+15:42
+the concurrency model, expanding the meaning of the word reusable code into another dimension. Here's a proof of
+15:49
+concept that already works today. Here's our setup code. Right now, we're
+15:55
+initializing a thread pool implementation, but I could trivially comment that out and then swap in the
+16:00
+commented out code below. And the following examples will continue to work under an MN concurrency model with no
+16:07
+modifications to the example code.
+16:14
+So, here's a simple example of async8 to wet your appetite. Even though this
+16:19
+calculate sum function does not do any IO, the IO implementation may choose to run the logic in parallel since it's
+16:26
+expressed with async. You can imagine that doing something a lot more CPU intensive and and gaining
+16:31
+parallelism.
+16:36
+Here's an example of cancellation. Lot more going on here, but I'll walk you through it. when an error occurs uh when
+16:43
+an error occurs at the at the try statements there in red uh it's going to
+16:49
+send control flow up and it's going to make it's going to run those expressions in those defer blocks there. So when
+16:56
+whenever an error occurs it's going to cancel all the other in-flight operations causing them to return a
+17:02
+cancelled error. This dovetales nicely with a typical way of handling errors in Zigg because as an unhandled canceled
+17:09
+error is returned up the stack, it will propagate the cancellation to any more in-flight operations along the way,
+17:15
+elegantly canceling entire towers of operations with minimal boiler plate.
+17:20
+So you get the express.
+17:26
+Here's an sorry, here's an implementation of a Q which has equivalent semantics to channels in Go.
+17:34
+I also have a select implementation. I suppose you could say this was inspired by Go's select keyword. In fact, with
+17:42
+this IO interface, every Go program has a semantically equivalent Zigg program aside from garbage collection. I don't
+17:48
+know about you, but to me, Go's lunch is looking pretty tasty right about now, and I'm hungry.
+17:57
+Now that we've tackled concurrency models, uh we can get back to answering this question. Uh I observed earlier
+18:03
+that when doing multiple things at once, the stack memory becomes heap allocated. That means when we use async, we must
+18:09
+allocate a chunk of memory big enough for all the functions that you call. This means that we can't go wild with
+18:15
+stack allocated buffers. In order to achieve optimal code reusability, we have to find an appropriate buffer size.
+18:21
+Not too big since that limits how fast we can do things in parallel and how much we can do things in parallel. not
+18:28
+too small or we fail to batch operations together, tanking performance. And that
+18:33
+brings me to part three, designing a streaming IO interface. Every programming language has this
+18:40
+concept. This is the fundamental API against which one writes reusable abstractions.
+18:45
+In C, it's filear. In Go, it's buff.io reader and buff.io.riter.
+18:52
+In Rust, it's the IO read and IO. Traits. In Node.js, it's the stream. Stream. In Python, it's IO.buffer
+18:58
+reader, buffered writer. In C++, it's standard eream, standard ostream. In Java, it's Java.io. I swear to God, if I
+19:05
+see one more cookie banner in C, it's system.io.buffered stream. I think you
+19:10
+get the idea by now. So, now I have to talk about naming things for a moment. So, we have this
+19:16
+thing that we need to name. Okay. Uh, it's a stream. It's an input stream.
+19:21
+Let's try out the name input stream. So, it's a stream that inputs, right?
+19:28
+Okay. So, well, what's this buffer then? It's the it's the input of the output stream.
+19:36
+Okay. Well, let's try writer and reader. Okay. So, we have writer. So, it's a stream that writes. Okay. Uh well, what
+19:44
+does the writer do? It reads from your buffer.
+19:50
+And a reader writes to your buffer. Ah, okay. So that's why I think despite
+19:56
+all the standard names, I think we should use audio terminology. You get buffers from a source and you give
+20:02
+buffers to a sync. No more ambiguity. Putting that aside
+20:08
+to illustrate how important buffering is, let's write SIS calls for printing hello world. One bite at a time with and
+20:14
+without buffering. Uh so obviously you you have 14 right sys calls versus one.
+20:21
+Obviously the one's going to be faster. How much faster is it going to be? Shout out some numbers. 14x
+20:29
+perhaps less than that. Well, if you believe this chart, it's about a thousand times
+20:35
+slower, assuming that your buffer fits into the CPU's L1 cache. So, that's obviously
+20:41
+important. Uh but it's also important to avoid indirect calls not only because
+20:46
+the CPU executes them more slowly but because they are more opaque to
+20:52
+compiler optimizations. So we need to talk about vtables.
+20:59
+Each interface in any programming language has a strct which potentially has fields and methods. Crucially, one
+21:07
+or more of these fields will be what's called a vtable, which is a name for a set of runtime known function pointers
+21:14
+that are populated in order to satisfy a given interface. The fields and methods
+21:19
+of the strruct are transparent to the uh sorry, the fields and methods of the strct are transparent to the compiler
+21:24
+available to be inlined, abstractly interpreted, inspected, and otherwise optimized. On the other hand, since the
+21:30
+function pointers are runtime known, the compiler typically has to treat them as a black box. There this there's a
+21:38
+crucial distinction between above the vtable and below the vtable. You really want to keep your hot paths north of the
+21:45
+vtable boundary. To illustrate this, here's another example of our code that writes one bite
+21:51
+at a time. In this case, we'll have two examples. They're both buffered, and
+21:56
+both will use this exact same setup code. And this example function is truly
+22:02
+reusable. It will generate exactly one chunk of x86 machine code in this
+22:07
+example that supports all possible sync instances. So reusable in the sense that
+22:12
+literally the same machine code can be used with different runtime functions.
+22:18
+First we look at buffering in the implementation. So here's our interface which does not do the buffering. This is
+22:24
+just a example of a function pointer. Here's the implementation which does the
+22:30
+buffering. Sorry, this is doing the buffering in the implementation. So we have our
+22:35
+function pointer pointing to that write function and it's just writing the bite to a buffer and when it gets full then
+22:40
+it calls the final output. You don't have to try to understand it too much. Just understand that it is buffering in
+22:46
+the implementation. This is the generated optimized machine code. In addition to the buffering logic
+22:53
+in the rectangle, there's an indirect call for every single bite.
+23:01
+Meanwhile, if we take the same logic and just move it into the interface, now we have uh the buffer inside the inside
+23:08
+that strct and we just move the logic above the v table.
+23:15
+The compiler deleted. Hey, wait a minute. Pull up that example again.
+23:22
+Where's Where's Marina? What's my talks called again? Flushing.
+23:27
+God damn it. Forgot to flush.
+23:32
+That actually happened while I was working on my talk. Okay, now that we fixed that, uh, that's
+23:38
+the actual output. Now, not only is this code doing the cheapest operations possible, simple register operation plus
+23:44
+a memory right, since it's optimizer friendly, the compiler was able to combine all the rights into a single
+23:51
+operation. So, we were doing right by A, right by B, right by C, right by D, so on. That's uh and that that's that's
+24:00
+those green lines are just um directly putting them those those bytes right into the buffer, not even doing any
+24:06
+extra work. Okay, but that's cheating though. We're trying to examine reusable
+24:11
+code. So, we actually need to not give the optimizer this extra information. So, let's delete that. We're going to
+24:18
+put the we're going to export the example function directly.
+24:23
+So, when we do this, we get worse code. This code is slightly less amazing, but it is nonetheless superior. We have
+24:29
+traded an indirect function call for dramatically cheaper operations without giving up the property that the same
+24:35
+machine code supports any sync instance including those dynamically loaded at runtime. So to give you the highle
+24:42
+picture of what this code's doing, it is writing a bite uh doing a couple of uh
+24:48
+the cheapest possible operations, skipping some expensive code, and then repeating that for every write. that's
+24:55
+gonna that's going to beat your performance of your indirect function calls anytime.
+25:00
+So the challenge this creates however is that the more logic we move into the interface, the less flexible the
+25:07
+interface is. This is a fundamental trade-off. The very nature of logic being runtime or compile time known is
+25:14
+exactly what makes it respectively less or more friendly to the CPU optimizer and the maintenance maintenance burden.
+25:21
+The key observation here is understand the deal you're making with the laws of physics. Don't relinquish your code's
+25:28
+performance and ease of static analysis unless you're gaining code reusability in return. Too many times I see less
+25:35
+experienced programmers use interfaces or function pointers when they could be simply calling functions directly and
+25:42
+they don't gain anything for it. It only makes the code harder to read for humans and machines alike.
+25:49
+With that in mind, let's survey the landscape. We briefly went over the IO stream interface in many popular
+25:56
+programming languages, but let's dig in a little deeper and let's see what they decided to put uh above their vtable and
+26:01
+below their vtable. What they decided to put in their imple uh interface and their implementation.
+26:08
+After that, I'll show you what I landed on in how I designed the new zig standard library IO streams.
+26:15
+So, first we have uh Gibbc. Uh I'm sorry, what?
+26:21
+Okay. Uh that's ominous. Okay, let's look at a more modern libby instead. Okay, that's
+26:27
+better. That's more readable, but there's still a lot going on here. Um, suffice to say, Libby Cy has loads of
+26:34
+stuff north of the vtable interface, including more than one buffer, the concept of seeking, closing, locking,
+26:40
+local, cookies, and oh, yeah, of course, voidar must be zero_2.
+26:48
+I won't make you look at the implementation, but I can confirm that the buffering at least happens before it calls into those uh function pointers.
+26:56
+So here's our here's our same example from before uh translated into C. And
+27:02
+now if we compile this code, it's not able to inline the calls uh to put C due
+27:08
+to being across compilation unit boundaries. Uh which is disappointing, but it at least avoids indirect calls
+27:14
+and SIS calls. Let's move on to a more modern language with less cr. So here we
+27:19
+have Go. Here's the interface. Um there's no buffer in the interface. I guess Go programmers are supposed to
+27:25
+pass around buffio.riter instances instead. Let's ask uh the modern internet whether it's more idiomatic to
+27:32
+accept buffio.riter or io.riter in reusable functions. Oh, perfect.
+27:38
+As you can see, I found my exact question on Stack Overflow.
+27:44
+Uh after using the web inspector to delete the cookie banner, we have our answer. Uh this is awful advice.
+27:50
+This would generate by far the worst code out of all of our examples here if I followed it. Uh, in other words, it's
+27:56
+perfect AI training data. Uh, just to show you how clueless this
+28:02
+suggestion is, let's quickly examine the code it generates. So, here's the example again ported to Go. And here's
+28:07
+the generated code. It managed to do the worst possible thing plus heap allocate each bite as a string object.
+28:14
+Goodness. Okay, so let's do my opinion instead. Let's turn our brains back on. Uh the
+28:19
+ability to write bytes one at a time like this is the point of buff IO. That's why it has a flush function. Uh
+28:25
+so if we do this uh this is about the same quality as the C code. If I had to guess, I'd say uh the reason it doesn't
+28:32
+inline those functions is it's a limitation of the Goer. It wants to compile faster. It doesn't
+28:37
+want to inline aggressively. Fair fair trade-off. Okay, let's move on. Let's
+28:43
+take a look at Rust. This interface is looking quite interesting by comparison. I like that you can write vectors. We
+28:49
+got a flush in there, too. So, this interface is aware of buffering, but Rust traits don't support fields. So, it
+28:56
+looks like our buffering is unfortunately going to happen southside. There's a buff writer type, but it's a
+29:01
+generic, so it can't be used without making our example function generic, too. Here's the example code. We'll
+29:07
+compile it into a crate to prevent any generics or deirtualization shenanigans.
+29:14
+Uh, those are all indirect function calls for each bite. Uh, however, when
+29:19
+investigating this, I did notice that Rust was extraordinarily good at devirtualization. Every example I looked
+29:25
+at that didn't use crates managed to get the optimization. That's cheating, though. This analysis is specifically
+29:31
+for the cases where the stream implementation is runtime known. So, the behavior when going through a crate is
+29:36
+the relevant one to this comparison. All right, moving on. Finally, C++
+29:43
+I don't get paid enough to try and find the actual interface inside this dumpster fire of a standard library.
+29:48
+Let's just try it and see, shall we? There's our code. Okay, it looks like basically the same results as C. It is
+29:56
+incredible how much more readable x8664 machine code is than the C++ source code that generates it.
+30:06
+Uh, so none of these mainstream languages managed to get buffering into their interfaces. They all have it
+30:12
+southside. And you know what? I get it. I completely understand because I've been working on this since February and
+30:18
+I'm still not done. I got a 30,000line diff typed out by hand
+30:25
+and it's not even compiling yet, let alone test passing. When you change the API of IO streams, you have to rework a
+30:32
+lot of code. And I don't mean just trivial refactorings. I mean it changes the core constraints and considerations.
+30:38
+It affects the internal state of everything that operates on streams. I've already had to rewrite large
+30:44
+portions of JSON, HTTP, TLS, the linker, Zstandard compression, LZMA, Inflate,
+30:50
+and Zip files, Git protocol fetching, and a bunch of hashing algorithms. All this stuff is loadbearing, too, because
+30:56
+it's used in Zigg's package manager. That's why it's important to think carefully about the vable and get the
+31:03
+interface right. I'll give you a little demonstration about what this iterative process is like. Uh so here we have an
+31:09
+interface with a simple write function that takes a buffer pretty familiar but uh let's take advantage of things like
+31:16
+write v and send message that accepts multiple data buffers. Uh sorry let me see my notes again multiple data buffers
+31:22
+for one sys call. Let's add that to the interface. Okay so now we add it and uh let's go ahead and uh let's run those
+31:29
+unit tests. Okay, it looks like we have our work cut out for us.
+31:35
+Uh, nine hours later. Okay. Well, I still didn't fix
+31:41
+everything yet. But in doing so, I just realized something. If we give the vable functions access to all the state,
+31:48
+including the buffer, then more advanced use cases are handled, such as compression and decompression without an internal ring buffer. Yeah. Okay. So,
+31:55
+let's take that and let's make that change. So far so good. Ah, everything's
+32:00
+broken again. Okay. Uh I've already repeated this process seven
+32:06
+times and faced the consequences each time. I'm not even sure it won't happen again before I land the branch. Uh but I
+32:12
+will share with you what I have so far. So this is the current state in my work
+32:18
+in progress branch. The interesting concepts here are sync supports vectors
+32:23
+and splats including together. Now, a splat means to repeat the last buffer n
+32:29
+times, which in short summary means you can logically send a mems set across a chain of syncs without redundantly
+32:36
+writing out and copying that memory.
+32:41
+Sync supports sending data from open files which can result in direct FD to FD transfers in the kernel under the
+32:48
+right conditions. Source supports dropping data without storing it. can imagine how that might
+32:54
+be more uh efficient sometimes. Source also directly writes to a sync without an intermediate buffer.
+33:02
+And let's look at a real world example of using these APIs. This is the standard library documentation that we
+33:08
+ship with the Zig compiler. It's actually generated on the fly uh in an ad hoc web server that spawns when you
+33:14
+run Zigg STD. Spawns a little URL. You can click that and then you got uh it pops open a
+33:21
+browser window that looks like this. So you can browse or search the the standard library documentation. It works
+33:27
+by compiling on the fly compiling a web assembly module from source then spawning an HTTP server to provide that
+33:33
+as well as the HTML JavaScript and Atar ball of Zig source code which the web assembly code uses to generate
+33:39
+documentation on the fly. So this all happens in a little pipeline. Let's imag let's examine for a
+33:47
+moment the HTTP request from the browser to load the sourc's tarball. The tarball
+33:52
+specifically that has all these files just just being sent to the browser. So the server process sets up a chain of
+33:59
+streams. You know when you just set up a bunch of streams in a row like a writer writes to this and the writes to this one. So we have the connection with the
+34:06
+browser on one end wrapped by an HTTP server response uh which is probably
+34:12
+what a a chunked um what is it called transfer encoding chunked you know we
+34:17
+wrapped that with a tarball stream piped to from a file stream. So we have these we have these four instances of the
+34:24
+streaming IO interface connected to each other. If you look at this in most languages you will see a lot of extra
+34:30
+buffering memcopying and sis calls. Um, but with the stream API that I've come
+34:36
+up with, we're able to be SIS call optimal here, including using send file to directly transfer the file data to
+34:43
+the network socket despite it being part of an HTTP multiart chunk.
+34:48
+Now, this doesn't really matter for the Zig STD command line interface. And it's just it's just an example, but it is a
+34:55
+good proof of concept because you know this this efficiency in this server will translate to an efficiency in a you know
+35:02
+production grade server where every bit of latency or buffering sorry not buffering latency or bandwidth really
+35:07
+counts. So with all that we're finally ready to
+35:13
+tackle the question of the day. What makes a good stack buffer size?
+35:18
+And now we have enough information to answer this. What you want to do is try to simplify
+35:25
+the implementation, avoid accidental complexity. So you can actually combine
+35:31
+with you you strategically want to use short writes and short reads, right? So this is when you're implementing the
+35:37
+stream and you're supposed to do a write, but you can just only process a
+35:43
+limited subset of your inputs. And what you want to do is optimize for
+35:49
+minimizing accidental complexity. So just return zero if you have to. Maybe you just needed to shuffle some stuff
+35:56
+around and return zero. And then next time you're going to process the next big buffer, whatever simplifies your
+36:01
+implementation. And for instance for uh TLS uh not to be confused with Fred
+36:08
+local storage, not to be confused with top level step. I'm talking about uh transport layer security. For DLS, I
+36:14
+picked the maximum encrypted frame size. This allowed me to dramatically simplify the implementation logic. Don't don't
+36:21
+try to read this red deleted code. Nobody has to suffer anymore.
+36:26
+Uh and finally, for the endpoint, sacrifice a few cache lines in order to avoid SIS call overhead. So, you know,
+36:32
+on the actual write, on the actual read, that's the trade-off. It's like you're going to have to um you're going to have
+36:38
+to murder some cache lines, but in exchange, you're going to batch SIS call SIS calls together. So you find that sweet spot there and that answers all of
+36:44
+the buffering questions across your entire chain. And
+36:50
+as always, don't forget to flush [Applause]
+37:05
+[Music]

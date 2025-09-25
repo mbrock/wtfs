@@ -1,7 +1,9 @@
 const std = @import("std");
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
+const CapacityLatch = @import("CapacityLatch.zig");
 const test_threads = @import("test_threading.zig");
+const segments = @import("segments.zig");
 
 pub const SegmentedStringBuffer = struct {
     const Self = @This();
@@ -97,7 +99,7 @@ pub const SegmentedStringBuffer = struct {
 
         pub fn init(shelf_index: usize, offset: usize) Index {
             std.debug.assert(shelf_index < (1 << shelf_bit_count));
-            std.debug.assert(offset <= std.math.maxInt(OffsetInt));
+            std.debug.assert(offset <= shelfCapacity(shelf_index));
             return .{
                 .parts = .{
                     .shelf = @intCast(shelf_index),
@@ -151,6 +153,10 @@ pub const SegmentedStringBuffer = struct {
             return self.index.byteOffsetFromStart();
         }
 
+        pub fn skip(self: Slice, n: usize) Slice {
+            return self.limit(n, .unlimited);
+        }
+
         pub fn limit(self: Slice, pos: usize, io_limit: std.Io.Limit) Slice {
             const remaining = self.length() -| pos;
             const allowed = switch (io_limit) {
@@ -167,8 +173,18 @@ pub const SegmentedStringBuffer = struct {
             return SliceReader.init(buffer, self, scratch);
         }
 
-        pub fn writer(self: Slice, buffer: *Self) SliceWriter {
-            return SliceWriter.init(buffer, self);
+        pub fn writer(self: Slice, buffer: *Self) segments.SegmentsWriter {
+            const i = self.shelfIndex();
+            const j = buffer.shelfCount();
+            var head = buffer.shelves[i][self.byteOffset()..];
+            head.len = @min(head.len, self.len);
+
+            const body = if (i < j) buffer.shelves[i + 1 .. j] else &.{};
+            return segments.SegmentsWriter.init(
+                head,
+                body,
+                .limited(self.len),
+            );
         }
 
         pub fn fromParts(index: Index, slice_len: usize) Slice {
@@ -185,95 +201,10 @@ pub const SegmentedStringBuffer = struct {
         view: SegmentedView,
     };
 
-    pub const SliceWriter = struct {
-        writer: std.Io.Writer,
-        segbuf: *Self,
-        slice: Slice,
-        current_shelf: usize,
-        slice_bytes_written: usize,
-
-        pub fn init(buffer: *Self, slice: Slice) SliceWriter {
-            var self = SliceWriter{
-                .writer = .{ .vtable = &vtable, .buffer = &.{}, .end = 0 },
-                .segbuf = buffer,
-                .slice = slice,
-                .current_shelf = slice.shelfIndex(),
-                .slice_bytes_written = 0,
-            };
-            self.setupBuffer();
-            return self;
-        }
-
-        pub fn pos(self: *const SliceWriter) usize {
-            return self.slice_bytes_written + self.writer.end;
-        }
-
-        fn setupBuffer(self: *SliceWriter) void {
-            if (self.slice_bytes_written >= self.slice.length()) {
-                self.writer.buffer = &.{};
-                self.writer.end = 0;
-                return;
-            }
-
-            const remaining = self.slice.length() - self.slice_bytes_written;
-            const current_global_pos = self.slice.byteOffsetFromStart() + self.slice_bytes_written;
-            const location = Self.locateIndex(current_global_pos);
-
-            self.current_shelf = location.shelf_index;
-            const shelf = self.segbuf.shelves[self.current_shelf];
-            const shelf_start = location.offset;
-            const shelf_available = shelf.len - shelf_start;
-            const buffer_size = @min(remaining, shelf_available);
-
-            self.writer.buffer = shelf[shelf_start .. shelf_start + buffer_size];
-            self.writer.end = 0;
-        }
-
-        fn drain(w: *std.Io.Writer, data: []const []const u8, _: usize) std.Io.Writer.Error!usize {
-            const self: *SliceWriter = @fieldParentPtr("writer", w);
-
-            self.slice_bytes_written += w.end;
-            w.end = 0;
-
-            if (self.slice_bytes_written >= self.slice.length()) {
-                return error.WriteFailed;
-            }
-
-            self.setupBuffer();
-
-            if (w.buffer.len > 0 and data.len > 0) {
-                const first_slice = data[0];
-                const to_copy = @min(first_slice.len, w.buffer.len);
-                @memcpy(w.buffer[0..to_copy], first_slice[0..to_copy]);
-                w.end = to_copy;
-                return to_copy;
-            }
-
-            return 0;
-        }
-
-        fn flush(_: *std.Io.Writer) std.Io.Writer.Error!void {}
-
-        fn rebase(w: *std.Io.Writer, preserve: usize, minimum_len: usize) std.Io.Writer.Error!void {
-            const self: *SliceWriter = @fieldParentPtr("writer", w);
-            const current_pos = self.slice_bytes_written + w.end;
-            const needed_total = preserve + minimum_len;
-            const would_exceed_token = current_pos + needed_total > self.slice.length();
-
-            if (!would_exceed_token) {
-                return std.Io.Writer.defaultRebase(w, preserve, minimum_len);
-            }
-
-            return error.WriteFailed;
-        }
-
-        const vtable: std.Io.Writer.VTable = .{
-            .drain = drain,
-            .flush = flush,
-            .rebase = rebase,
-        };
-    };
-
+    /// Limited writer into a segmented string buffer slice.
+    ///
+    /// Uses existing shelf storage without copying the segment list. The
+    /// writer simply walks `shelves` one slice at a time.
     pub const SliceReader = struct {
         reader: std.Io.Reader,
         buffer: *const Self,
@@ -320,8 +251,7 @@ pub const SegmentedStringBuffer = struct {
 
     shelves: [max_supported_shelves][]u8 = mem.zeroes([max_supported_shelves][]u8),
     shelf_count: u8 = 0,
-    len_counter: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    grow_mutex: std.Thread.Mutex = .{},
+    latch: CapacityLatch = .{},
 
     pub const empty: Self = .{};
 
@@ -482,7 +412,7 @@ pub const SegmentedStringBuffer = struct {
     }
 
     pub fn len(self: *const Self) usize {
-        return self.len_counter.load(.acquire);
+        return self.latch.len.load(.acquire);
     }
 
     pub fn occupiedBytes(self: *const Self) usize {
@@ -490,7 +420,7 @@ pub const SegmentedStringBuffer = struct {
     }
 
     pub fn capacityBytes(self: *const Self) usize {
-        return self.totalCapacity();
+        return self.latch.cap.load(.acquire);
     }
 
     pub fn shelfCount(self: *const Self) usize {
@@ -515,38 +445,53 @@ pub const SegmentedStringBuffer = struct {
         alloc: Allocator,
         reserve_len: usize,
     ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!usize {
+        if (reserve_len == 0) {
+            return self.latch.len.load(.acquire);
+        }
+
+        var reservation = try self.latch.reservation(reserve_len);
         while (true) {
-            const current = self.len_counter.load(.acquire);
-            const end = std.math.add(usize, current, reserve_len) catch return error.Overflow;
-            try self.ensureCapacityFor(alloc, end);
-            if (self.len_counter.cmpxchgWeak(current, end, .acq_rel, .acquire) == null) {
-                return current;
+            try self.ensureCapacityTo(alloc, reservation.len);
+            if (reservation.take()) |base| {
+                return base;
             }
+            reservation = try self.latch.reservation(reserve_len);
             std.atomic.spinLoopHint();
         }
     }
 
-    fn ensureCapacityFor(
+    fn ensureCapacityTo(
         self: *Self,
         alloc: Allocator,
-        required: usize,
+        target: usize,
     ) (Allocator.Error || error{ShelfLimitReached})!void {
         while (true) {
-            if (self.totalCapacity() >= required) return;
-            try self.growForCapacity(alloc, required);
+            const snap = self.latch.snapshot();
+            if (snap.cap >= target) return;
+
+            if (self.latch.acquireOrWaitFor(target)) |growth_value| {
+                var g = growth_value;
+                defer g.unlock();
+
+                try self.growUntilCapacityLocked(alloc, target);
+                const new_cap = self.totalCapacity();
+                std.debug.assert(new_cap >= target);
+                std.debug.assert(new_cap >= g.start_cap);
+                g.publishTo(new_cap);
+            } else {
+                return;
+            }
         }
     }
 
-    fn growForCapacity(
+    fn growUntilCapacityLocked(
         self: *Self,
         alloc: Allocator,
-        required: usize,
+        target: usize,
     ) (Allocator.Error || error{ShelfLimitReached})!void {
-        self.grow_mutex.lock();
-        defer self.grow_mutex.unlock();
-
-        if (self.totalCapacity() >= required) return;
-        try self.growOneShelf(alloc);
+        while (self.totalCapacity() < target) {
+            try self.growOneShelf(alloc);
+        }
     }
 
     fn growOneShelf(
@@ -567,7 +512,7 @@ pub const SegmentedStringBuffer = struct {
         @atomicStore(u8, &self.shelf_count, @intCast(index + 1), .release);
     }
 
-    fn shelfCapacity(index: usize) usize {
+    pub fn shelfCapacity(index: usize) usize {
         if (index >= max_supported_shelves) return 0;
         var size: usize = base_unit;
         var i: usize = 0;
@@ -686,18 +631,69 @@ test "SegmentedStringBuffer SliceReader streams" {
     var scratch: [16]u8 = undefined;
     var reader = res.slice.reader(&buffer, &scratch);
 
-    var collected = std.ArrayList(u8){};
-    defer collected.deinit(allocator);
+    var collected = std.Io.Writer.Allocating.init(allocator);
+    defer collected.deinit();
 
-    var array_writer = collected.writer(allocator);
-    var adapter_buffer: [128]u8 = undefined;
-    var adapter = array_writer.adaptToNewApi(&adapter_buffer);
+    const wrote = try reader.reader.streamRemaining(&collected.writer);
 
-    const wrote = try reader.reader.streamRemaining(&adapter.new_interface);
-    try adapter.new_interface.flush();
-    try std.testing.expect(adapter.err == null);
     try std.testing.expectEqual(text.len, wrote);
-    try std.testing.expectEqualSlices(u8, text, collected.items);
+    try std.testing.expectEqualSlices(u8, text, collected.written());
+}
+
+test "SegmentedStringBuffer SliceWriter writes within one shelf" {
+    var buffer = SegmentedStringBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const initial = "........";
+    const res = try buffer.append(allocator, initial);
+
+    var writer = res.slice.writer(&buffer);
+
+    try writer.writer().writeAll("ABC");
+    try writer.writer().writeAll("DEF");
+    try writer.writer().writeAll("GH");
+
+    try expectViewEquals("ABCDEFGH", buffer.view(res.slice));
+}
+
+test "SegmentedStringBuffer SliceWriter drains across shelves" {
+    var buffer = SegmentedStringBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const total_len = SegmentedStringBuffer.first_shelf_bytes + 256;
+
+    const placeholder = try allocator.alloc(u8, total_len);
+    defer allocator.free(placeholder);
+    @memset(placeholder, '.');
+    const res = try buffer.append(allocator, placeholder);
+
+    const expected = try allocator.alloc(u8, total_len);
+    defer allocator.free(expected);
+    for (expected, 0..) |*byte, idx| {
+        byte.* = @intCast('a' + (idx % 26));
+    }
+
+    var writer = res.slice.writer(&buffer);
+    try writer.writer().writeAll(expected);
+
+    try expectViewEquals(expected, buffer.view(res.slice));
+}
+
+test "SegmentedStringBuffer SliceWriter fails when exceeding slice length" {
+    var buffer = SegmentedStringBuffer.empty;
+    const allocator = std.testing.allocator;
+    defer buffer.deinit(allocator);
+
+    const initial = "xxxxx";
+    const res = try buffer.append(allocator, initial);
+
+    var writer = res.slice.writer(&buffer);
+    try writer.writer().writeAll("abcde");
+    try std.testing.expectError(error.WriteFailed, writer.writer().writeAll("!"));
+
+    try expectViewEquals("abcde", buffer.view(res.slice));
 }
 
 test "SegmentedStringBuffer concurrent append" {
@@ -712,8 +708,7 @@ test "SegmentedStringBuffer concurrent append" {
     const per_thread = 20;
     const total = thread_count * per_thread;
 
-    const slices = try allocator.alloc(SegmentedStringBuffer.Slice, total);
-    defer allocator.free(slices);
+    var slices: [total]SegmentedStringBuffer.Slice = undefined;
 
     var group = try test_threads.ThreadTestGroup.init(thread_count);
 
@@ -736,48 +731,20 @@ test "SegmentedStringBuffer concurrent append" {
         }
     };
 
-    try group.spawnMany(thread_count, Worker.run, .{ &buffer, allocator, per_thread, slices });
+    try group.spawnMany(
+        thread_count,
+        Worker.run,
+        .{ &buffer, allocator, per_thread, &slices },
+    );
     group.wait();
 
     for (slices, 0..) |slice, idx| {
         var tmp: [32]u8 = undefined;
-        const expected = try std.fmt.bufPrint(&tmp, "t{d}-{d}", .{ idx / per_thread, idx % per_thread });
+        const expected = try std.fmt.bufPrint(
+            &tmp,
+            "t{d}-{d}",
+            .{ idx / per_thread, idx % per_thread },
+        );
         try expectViewEquals(expected, buffer.view(slice));
     }
-}
-
-pub fn main() !void {
-    const tabs = @import("TabWriter.zig");
-
-    const shelf_count: u6 = 32;
-    const base_shifts = [_]u6{ 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
-
-    var stdoutbuf: [4096]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdoutbuf);
-
-    var columns = [_]tabs.Column{
-        .{ .width = 6, .alignment = .right },
-        .{ .width = 8, .alignment = .right },
-    };
-
-    for (base_shifts) |shift| {
-        var table = tabs.TabWriter.init(&stdout.interface, &columns);
-
-        try table.writeHeader(&[2][]const u8{ "shelf", "size" });
-        try table.writeSeparator("─");
-        const base_bytes: usize = @as(usize, 1) << shift;
-
-        for (0..shelf_count) |shelf_index| {
-            const shelf_bytes = base_bytes << @intCast(shelf_index);
-            try table.printRow(
-                .{ "{d}", "{Bi: >6.0}" },
-                .{ shelf_index, shelf_bytes },
-            );
-        }
-
-        try table.finish();
-        try stdout.interface.writeAll("\n");
-    }
-
-    try stdout.interface.flush();
 }

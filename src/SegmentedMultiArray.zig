@@ -30,7 +30,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
                     .decls = &.{},
                 } });
                 pub const Tag = u.tag_type orelse
-                    @compileError("SegmentedMultiArray does not support untagged unions");
+                    @compileError("no untagged unions");
                 tags: Tag,
                 data: Bare,
 
@@ -50,7 +50,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
                     };
                 }
             },
-            else => @compileError("SegmentedMultiArray only supports structs and tagged unions"),
+            else => @compileError("only structs and tagged unions"),
         };
 
         pub const Field = meta.FieldEnum(Elem);
@@ -65,10 +65,10 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
 
         // ----- Storage: per-field shelves (each shelf is a contiguous []FieldType) -----
         const ShelfEntry = struct {
-            addr: usize = 0,
+            addr: usize,
         };
 
-        shelves: [fields.len][MAX_SHELVES]ShelfEntry = mem.zeroes([fields.len][MAX_SHELVES]ShelfEntry),
+        shelves: [fields.len][MAX_SHELVES]ShelfEntry = undefined,
         len: std.atomic.Value(usize) = .init(0), // logical rows used
         cap: usize = 0, // logical rows addressable (only grower mutates)
         shelf_count: std.atomic.Value(usize) = .init(0),
@@ -149,17 +149,6 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
             count: usize,
             endian: std.builtin.Endian,
         ) (Allocator.Error || std.Io.Reader.Error || error{Overflow})!usize {
-            comptime {
-                const info = @typeInfo(T);
-                switch (info) {
-                    .@"struct" => |s| {
-                        if (s.layout == .auto)
-                            @compileError("SegmentedMultiArray.takeFromReader requires a struct with defined layout");
-                    },
-                    else => @compileError("SegmentedMultiArray.takeFromReader only supports struct element types"),
-                }
-            }
-
             if (count == 0) return self.len.load(.acquire);
 
             const base = try self.reserveBlock(alloc, count);
