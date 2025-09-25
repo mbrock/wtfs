@@ -97,10 +97,12 @@ test "SegmentsWriter respects limit shorter than total" {
     try std.testing.expectError(error.WriteFailed, writer.writer().writeByte('x'));
 }
 
-/// Limited writer into a segmented string buffer slice.
+/// Limited reader over segmented shelves.
 ///
-/// Uses existing shelf storage without copying the segment list. The
-/// writer simply walks `shelves` one slice at a time.
+/// The reader exposes `buffer` through the generic `std.Io.Reader` interface
+/// without copying any shelf data. Each call to `stream` performs at most one
+/// write: it drains the pending partial shelf with `write`, or (when perfectly
+/// aligned) batches contiguous whole shelves into a single `writeVec` call.
 pub const SegmentsReader = struct {
     reader: std.Io.Reader,
     tail: []const []const u8,
@@ -109,7 +111,7 @@ pub const SegmentsReader = struct {
 
     pub fn init(
         buffer: []u8,
-        tail: []const []u8,
+        tail: []const []const u8,
         seek: usize,
         limit: std.Io.Limit,
     ) SegmentsReader {
@@ -126,30 +128,245 @@ pub const SegmentsReader = struct {
         };
     }
 
+    /// Streams data out of the segmented slice while respecting both
+    /// the reader's own limit and the caller-provided `limit`. The method
+    /// prefers zero-copy `writeVec` over individual writes whenever the
+    /// request is aligned to whole shelves, falling back to a single
+    /// `write` for partial shelves.
     fn stream(
         r: *std.Io.Reader,
         w: *std.Io.Writer,
         limit: std.Io.Limit,
     ) std.Io.Reader.StreamError!usize {
         var self: *SegmentsReader = @fieldParentPtr("reader", r);
-        var tail = self.tail[0][self.seek..];
-        tail.len = self.limit.minInt(tail.len);
 
-        if (tail.len == 0) return error.EndOfStream;
+        const request_bytes = try self.beginRequest(limit);
 
-        const n = self.limit.min(limit).minInt(tail.len);
-
-        const written = try w.write(tail[0..n]);
-        const remainder = tail.len - written;
-        if (remainder == 0) {
-            self.tail = self.tail[1..];
-            self.seek = 0;
-        } else {
-            self.seek += written;
+        if (self.seek != 0) {
+            return self.emitPartialHead(w, request_bytes);
         }
-        self.limit = self.limit.subtract(written).?;
-        return written;
+
+        const aligned_count = self.countAlignedShelves(request_bytes);
+        if (aligned_count == 0) {
+            return self.emitHeadPrefix(w, request_bytes);
+        }
+
+        return self.emitAlignedShelves(w, aligned_count);
     }
 
     const vtable: std.Io.Reader.VTable = .{ .stream = stream };
+
+    fn prune(self: *SegmentsReader) void {
+        while (self.tail.len != 0) {
+            const shelf_len = self.tail[0].len;
+            if (self.seek < shelf_len) break;
+            self.seek -= shelf_len;
+            self.tail = self.tail[1..];
+        }
+    }
+
+    fn consume(self: *SegmentsReader, amount: usize) void {
+        if (amount == 0) return;
+
+        var remaining = amount;
+        while (remaining != 0 and self.tail.len != 0) {
+            const current = self.tail[0];
+            const available = current.len - self.seek;
+            if (remaining < available) {
+                self.seek += remaining;
+                remaining = 0;
+            } else {
+                remaining -= available;
+                self.seek = 0;
+                self.tail = self.tail[1..];
+            }
+        }
+
+        if (self.limit.subtract(amount)) |next| self.limit = next else self.limit = .nothing;
+    }
+
+    fn finish(self: *SegmentsReader, amount: usize) usize {
+        self.consume(amount);
+        self.prune();
+        return amount;
+    }
+
+    /// Resolve how many bytes the caller may read this turn and ensure the
+    /// head shelf is positioned correctly. Returns `error.EndOfStream` when
+    /// both limits are exhausted.
+    fn beginRequest(self: *SegmentsReader, limit: std.Io.Limit) !usize {
+        self.prune();
+        if (self.tail.len == 0) return error.EndOfStream;
+
+        const merged = self.limit.min(limit);
+        const bytes = merged.minInt(std.math.maxInt(usize));
+        if (bytes == 0) return error.EndOfStream;
+        return bytes;
+    }
+
+    /// Consume a partially-read head shelf using a single `write` call.
+    fn emitPartialHead(
+        self: *SegmentsReader,
+        w: *std.Io.Writer,
+        request_bytes: usize,
+    ) std.Io.Reader.StreamError!usize {
+        const head = self.tail[0];
+        const available = head.len - self.seek;
+        const take = @min(available, request_bytes);
+        if (take == 0) return error.EndOfStream;
+
+        const written = try w.write(head[self.seek .. self.seek + take]);
+        return self.finish(written);
+    }
+
+    /// Emit the required prefix of the head shelf when there are no fully
+    /// aligned shelves to batch.
+    fn emitHeadPrefix(
+        self: *SegmentsReader,
+        w: *std.Io.Writer,
+        request_bytes: usize,
+    ) std.Io.Reader.StreamError!usize {
+        const head = self.tail[0];
+        const take = @min(head.len, request_bytes);
+        if (take == 0) return error.EndOfStream;
+
+        const written = try w.write(head[0..take]);
+        return self.finish(written);
+    }
+
+    /// Batch whole shelves using `writeVec`, enabling downstream vectored I/O.
+    fn emitAlignedShelves(
+        self: *SegmentsReader,
+        w: *std.Io.Writer,
+        aligned_count: usize,
+    ) std.Io.Reader.StreamError!usize {
+        const written = try w.writeVec(self.tail[0..aligned_count]);
+        return self.finish(written);
+    }
+
+    /// Count how many complete shelves fit inside the current request window.
+    fn countAlignedShelves(self: *SegmentsReader, request_bytes: usize) usize {
+        var idx: usize = 0;
+        var total: usize = 0;
+        while (idx < self.tail.len) {
+            const shelf = self.tail[idx];
+            if (shelf.len == 0) {
+                idx += 1;
+                continue;
+            }
+
+            if (total + shelf.len > request_bytes) break;
+            total += shelf.len;
+            idx += 1;
+
+            if (total == request_bytes) break;
+        }
+
+        return idx;
+    }
 };
+
+test "SegmentsReader returns EndOfStream when limit is empty" {
+    var scratch: [4]u8 = undefined;
+    const shelf0 = [_]u8{ 'a', 'b', 'c' };
+    const tail = [_][]const u8{shelf0[0..]};
+    var reader = SegmentsReader.init(scratch[0..], tail[0..], 0, .limited(0));
+
+    var sink_buf: [4]u8 = undefined;
+    var sink = std.Io.Writer.fixed(sink_buf[0..]);
+    const total = try reader.reader.streamRemaining(&sink);
+    try std.testing.expectEqual(@as(usize, 0), total);
+    try std.testing.expectEqual(@as(usize, 0), sink.end);
+}
+
+test "SegmentsReader streams multiple shelves in one call" {
+    var scratch: [8]u8 = undefined;
+    const shelf0 = [_]u8{ 'a', 'b', 'c', 'd' };
+    const shelf1 = [_]u8{ 'e', 'f', 'g', 'h' };
+    const shelf2 = [_]u8{ 'i', 'j' };
+    const tail = [_][]const u8{ shelf0[0..], shelf1[0..], shelf2[0..] };
+    var reader = SegmentsReader.init(scratch[0..], tail[0..], 0, .limited(10));
+
+    var sink_buf: [12]u8 = undefined;
+    var sink = std.Io.Writer.fixed(sink_buf[0..]);
+    const total = try reader.reader.streamRemaining(&sink);
+
+    try std.testing.expectEqual(@as(usize, 10), total);
+    try std.testing.expectEqualSlices(u8, "abcdefghij", sink_buf[0..total]);
+    try std.testing.expectEqual(@as(usize, 0), reader.tail.len);
+    try std.testing.expectEqual(@as(usize, 0), reader.seek);
+    try std.testing.expectEqual(@as(usize, 0), reader.limit.toInt().?);
+}
+
+test "SegmentsReader writeVec stops before partial tail" {
+    var scratch: [8]u8 = undefined;
+    const shelf0 = [_]u8{ 'a', 'b', 'c', 'd' };
+    const shelf1 = [_]u8{ 'e', 'f', 'g', 'h' };
+    const shelf2 = [_]u8{ 'i', 'j' };
+    const tail = [_][]const u8{ shelf0[0..], shelf1[0..], shelf2[0..] };
+    var reader = SegmentsReader.init(scratch[0..], tail[0..], 0, .limited(9));
+
+    var vec_buf: [12]u8 = undefined;
+    var vec_sink = std.Io.Writer.fixed(vec_buf[0..]);
+    const total = try reader.reader.streamRemaining(&vec_sink);
+
+    try std.testing.expectEqual(@as(usize, 9), total);
+    try std.testing.expectEqualSlices(u8, "abcdefghi", vec_buf[0..total]);
+    try std.testing.expectEqual(@as(usize, 1), reader.tail.len);
+    try std.testing.expectEqual(@as(usize, 1), reader.seek);
+    try std.testing.expectEqual(@as(usize, 0), reader.limit.toInt().?);
+}
+
+test "SegmentsReader updates seek after partial slice" {
+    var scratch: [6]u8 = undefined;
+    const shelf0 = [_]u8{ 'a', 'b', 'c', 'd', 'e', 'f' };
+    const tail = [_][]const u8{shelf0[0..]};
+    var reader = SegmentsReader.init(scratch[0..], tail[0..], 0, .limited(6));
+
+    var sink_buf: [6]u8 = undefined;
+    var sink = std.Io.Writer.fixed(sink_buf[0..]);
+    const wrote = try reader.reader.stream(&sink, .limited(5));
+
+    try std.testing.expectEqual(@as(usize, 5), wrote);
+    try std.testing.expectEqualSlices(u8, "abcde", sink_buf[0..5]);
+    try std.testing.expectEqual(@as(usize, 1), reader.limit.toInt().?);
+    try std.testing.expectEqual(@as(usize, 5), reader.seek);
+    try std.testing.expectEqual(@as(usize, 1), reader.tail.len);
+}
+
+test "SegmentsReader respects external limit argument" {
+    var scratch: [8]u8 = undefined;
+    const shelf0 = [_]u8{ 'x', 'y', 'z', 'q' };
+    const shelf1 = [_]u8{ 'r', 's', 't', 'u' };
+    const tail = [_][]const u8{ shelf0[0..], shelf1[0..] };
+    var reader = SegmentsReader.init(scratch[0..], tail[0..], 0, .unlimited);
+
+    var sink_buf: [8]u8 = undefined;
+    var sink = std.Io.Writer.fixed(sink_buf[0..]);
+    const wrote = try reader.reader.stream(&sink, .limited(3));
+
+    try std.testing.expectEqual(@as(usize, 3), wrote);
+    try std.testing.expectEqualSlices(u8, "xyz", sink_buf[0..3]);
+    try std.testing.expect(reader.limit == .unlimited);
+    try std.testing.expectEqual(@as(usize, 3), reader.seek);
+    try std.testing.expectEqual(@as(usize, 2), reader.tail.len);
+}
+
+test "SegmentsReader skips empty shelves and honors seek" {
+    var scratch: [8]u8 = undefined;
+    const empty = [_]u8{};
+    const shelf0 = [_]u8{ 'p', 'q', 'r' };
+    const shelf1 = [_]u8{ 's', 't' };
+    const tail = [_][]const u8{ empty[0..], shelf0[0..], shelf1[0..] };
+    var reader = SegmentsReader.init(scratch[0..], tail[0..], 1, .limited(4));
+
+    var sink_buf: [8]u8 = undefined;
+    var sink = std.Io.Writer.fixed(sink_buf[0..]);
+    const total = try reader.reader.streamRemaining(&sink);
+
+    try std.testing.expectEqual(@as(usize, 4), total);
+    try std.testing.expectEqualSlices(u8, "qrst", sink_buf[0..total]);
+    try std.testing.expectEqual(@as(usize, 0), reader.tail.len);
+    try std.testing.expectEqual(@as(usize, 0), reader.seek);
+    try std.testing.expectEqual(@as(usize, 0), reader.limit.toInt().?);
+}

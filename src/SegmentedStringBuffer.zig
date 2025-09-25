@@ -408,11 +408,6 @@ pub const SegmentedStringBuffer = struct {
         return .{ .shelf_index = shelf_index, .offset = remaining };
     }
 
-    fn toConstShelfSlices(slice: []const []u8) []const []const u8 {
-        const ptr = @as([*]const []const u8, @ptrCast(slice.ptr));
-        return ptr[0..slice.len];
-    }
-
     fn toMutableShelfSlices(slice: [][]u8) [][]u8 {
         const ptr = @as([*][]u8, @ptrCast(slice.ptr));
         return ptr[0..slice.len];
