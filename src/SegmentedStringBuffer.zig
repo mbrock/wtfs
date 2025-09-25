@@ -169,8 +169,15 @@ pub const SegmentedStringBuffer = struct {
             return init(next_index, allowed);
         }
 
-        pub fn reader(self: Slice, buffer: *const Self, scratch: []u8) SliceReader {
-            return SliceReader.init(buffer, self, scratch);
+        pub fn reader(self: Slice, buffer: *const Self, scratch: []u8) segments.SegmentsReader {
+            const i = self.shelfIndex();
+
+            return segments.SegmentsReader.init(
+                scratch,
+                buffer.shelves[i..],
+                self.byteOffset(),
+                .limited(self.len),
+            );
         }
 
         pub fn writer(self: Slice, buffer: *Self) segments.SegmentsWriter {
@@ -201,54 +208,6 @@ pub const SegmentedStringBuffer = struct {
         view: SegmentedView,
     };
 
-    /// Limited writer into a segmented string buffer slice.
-    ///
-    /// Uses existing shelf storage without copying the segment list. The
-    /// writer simply walks `shelves` one slice at a time.
-    pub const SliceReader = struct {
-        reader: std.Io.Reader,
-        buffer: *const Self,
-        slice: Slice,
-        pos: usize,
-
-        pub fn init(buffer: *const Self, slice: Slice, scratch: []u8) SliceReader {
-            return .{
-                .reader = .{ .vtable = &vtable, .buffer = scratch, .seek = 0, .end = 0 },
-                .buffer = buffer,
-                .slice = slice,
-                .pos = 0,
-            };
-        }
-
-        fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-            const self: *SliceReader = @fieldParentPtr("reader", r);
-            if (self.pos >= self.slice.length()) return error.EndOfStream;
-
-            const limited = self.slice.limit(self.pos, limit);
-            if (limited.length() == 0) return 0;
-
-            const seg_view = self.buffer.view(limited);
-            var total: usize = 0;
-
-            if (seg_view.head.len > 0) {
-                total += try w.writeVec(&[_][]const u8{seg_view.head});
-            }
-
-            if (seg_view.body.len > 0) {
-                total += try w.writeVec(seg_view.body);
-            }
-
-            if (seg_view.tail.len > 0) {
-                total += try w.writeVec(&[_][]const u8{seg_view.tail});
-            }
-
-            self.pos += total;
-            return total;
-        }
-
-        const vtable: std.Io.Reader.VTable = .{ .stream = stream };
-    };
-
     shelves: [max_supported_shelves][]u8 = mem.zeroes([max_supported_shelves][]u8),
     shelf_count: u8 = 0,
     latch: CapacityLatch = .{},
@@ -270,12 +229,12 @@ pub const SegmentedStringBuffer = struct {
         self: *Self,
         alloc: Allocator,
         bytes: []const u8,
-    ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!AppendResult {
+    ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!Slice {
         if (bytes.len == 0) {
             _ = try self.reserveRange(alloc, 0);
             const index = Index.init(0, 0);
             const slice = Slice.init(index, 0);
-            return .{ .slice = slice, .view = SegmentedView.empty() };
+            return slice;
         }
 
         const start = try self.reserveRange(alloc, bytes.len);
@@ -302,113 +261,7 @@ pub const SegmentedStringBuffer = struct {
 
         const index = Index.init(start_loc.shelf_index, start_loc.offset);
         const slice = Slice.init(index, bytes.len);
-        return .{ .slice = slice, .view = self.view(slice) };
-    }
-
-    pub fn view(self: *const Self, slice: Slice) SegmentedView {
-        if (slice.length() == 0) return SegmentedView.empty();
-
-        const start_global = slice.byteOffsetFromStart();
-        const start_loc = Self.locateIndex(start_global);
-        const available = @as(usize, @atomicLoad(u8, &self.shelf_count, .acquire));
-        std.debug.assert(start_loc.shelf_index < available);
-
-        const first_shelf = self.shelves[start_loc.shelf_index];
-        const first_available = first_shelf.len - start_loc.offset;
-        const total_len = slice.length();
-
-        if (total_len <= first_available) {
-            return .{
-                .head = first_shelf[start_loc.offset .. start_loc.offset + total_len],
-                .body = SegmentedView.emptyBody(),
-                .tail = &[_]u8{},
-            };
-        }
-
-        var remaining = total_len - first_available;
-        var shelf_index = start_loc.shelf_index + 1;
-
-        while (true) {
-            std.debug.assert(shelf_index < available);
-            const shelf = self.shelves[shelf_index];
-            if (remaining < shelf.len) {
-                const body_slice = if (shelf_index > start_loc.shelf_index + 1)
-                    toConstShelfSlices(self.shelves[start_loc.shelf_index + 1 .. shelf_index])
-                else
-                    SegmentedView.emptyBody();
-
-                return .{
-                    .head = first_shelf[start_loc.offset..],
-                    .body = body_slice,
-                    .tail = shelf[0..remaining],
-                };
-            }
-
-            if (remaining == shelf.len) {
-                const body_slice = toConstShelfSlices(self.shelves[start_loc.shelf_index + 1 .. shelf_index + 1]);
-                return .{
-                    .head = first_shelf[start_loc.offset..],
-                    .body = body_slice,
-                    .tail = &[_]u8{},
-                };
-            }
-
-            remaining -= shelf.len;
-            shelf_index += 1;
-        }
-    }
-
-    pub fn viewMutable(self: *Self, slice: Slice) MutableSegmentedView {
-        if (slice.length() == 0) return MutableSegmentedView.empty();
-
-        const start_global = slice.byteOffsetFromStart();
-        const start_loc = Self.locateIndex(start_global);
-        const available = @as(usize, @atomicLoad(u8, &self.shelf_count, .acquire));
-        std.debug.assert(start_loc.shelf_index < available);
-
-        const first_shelf = self.shelves[start_loc.shelf_index];
-        const first_available = first_shelf.len - start_loc.offset;
-        const total_len = slice.length();
-
-        if (total_len <= first_available) {
-            return .{
-                .head = first_shelf[start_loc.offset .. start_loc.offset + total_len],
-                .body = MutableSegmentedView.emptyBody(),
-                .tail = &[_]u8{},
-            };
-        }
-
-        var remaining = total_len - first_available;
-        var shelf_index = start_loc.shelf_index + 1;
-
-        while (true) {
-            std.debug.assert(shelf_index < available);
-            const shelf = self.shelves[shelf_index];
-            if (remaining < shelf.len) {
-                const body_slice = if (shelf_index > start_loc.shelf_index + 1)
-                    toMutableShelfSlices(self.shelves[start_loc.shelf_index + 1 .. shelf_index])
-                else
-                    MutableSegmentedView.emptyBody();
-
-                return .{
-                    .head = first_shelf[start_loc.offset..],
-                    .body = body_slice,
-                    .tail = shelf[0..remaining],
-                };
-            }
-
-            if (remaining == shelf.len) {
-                const body_slice = toMutableShelfSlices(self.shelves[start_loc.shelf_index + 1 .. shelf_index + 1]);
-                return .{
-                    .head = first_shelf[start_loc.offset..],
-                    .body = body_slice,
-                    .tail = &[_]u8{},
-                };
-            }
-
-            remaining -= shelf.len;
-            shelf_index += 1;
-        }
+        return slice;
     }
 
     pub fn len(self: *const Self) usize {
@@ -566,23 +419,16 @@ pub const SegmentedStringBuffer = struct {
     }
 };
 
-fn expectViewEquals(expected: []const u8, view: SegmentedStringBuffer.SegmentedView) !void {
-    try std.testing.expectEqual(expected.len, view.totalLength());
-    var pos: usize = 0;
-
-    if (view.head.len > 0) {
-        try std.testing.expectEqualSlices(u8, expected[pos .. pos + view.head.len], view.head);
-        pos += view.head.len;
-    }
-
-    for (view.body) |segment| {
-        try std.testing.expectEqualSlices(u8, expected[pos .. pos + segment.len], segment);
-        pos += segment.len;
-    }
-
-    if (view.tail.len > 0) {
-        try std.testing.expectEqualSlices(u8, expected[pos .. pos + view.tail.len], view.tail);
-    }
+fn expectViewEquals(
+    expected: []const u8,
+    buffer: *SegmentedStringBuffer,
+    slice: SegmentedStringBuffer.Slice,
+) !void {
+    var scratch: [4096]u8 = @splat(0);
+    var reader = slice.reader(buffer, &scratch);
+    const buf = try reader.reader.allocRemaining(std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(buf);
+    try std.testing.expectEqualStrings(expected, buf);
 }
 
 test "SegmentedStringBuffer append and view" {
@@ -590,12 +436,12 @@ test "SegmentedStringBuffer append and view" {
     const allocator = std.testing.allocator;
     defer buffer.deinit(allocator);
 
-    const first = try buffer.append(allocator, "hello");
-    const second = try buffer.append(allocator, "world");
+    const first = (try buffer.append(allocator, "hello"));
+    const second = (try buffer.append(allocator, "world"));
 
     try std.testing.expectEqual(@as(usize, 10), buffer.len());
-    try expectViewEquals("hello", first.view);
-    try expectViewEquals("world", buffer.view(second.slice));
+    try expectViewEquals("hello", &buffer, first);
+    try expectViewEquals("world", &buffer, second);
 
     const stats = buffer.debugStats();
     try std.testing.expectEqual(@as(usize, 10), stats.length);
@@ -608,7 +454,7 @@ test "SegmentedStringBuffer spans multiple shelves" {
 
     const first = try buffer.append(allocator, "a" ** SegmentedStringBuffer.first_shelf_bytes);
     try std.testing.expectEqual(@as(usize, 1), buffer.shelfCount());
-    try std.testing.expectEqual(first.slice.length(), SegmentedStringBuffer.first_shelf_bytes);
+    try std.testing.expectEqual(first.length(), SegmentedStringBuffer.first_shelf_bytes);
 
     const second_len = SegmentedStringBuffer.first_shelf_bytes + 128;
     const payload = try allocator.alloc(u8, second_len);
@@ -617,7 +463,7 @@ test "SegmentedStringBuffer spans multiple shelves" {
 
     const second = try buffer.append(allocator, payload);
     try std.testing.expectEqual(@as(usize, 2), buffer.shelfCount());
-    try expectViewEquals(payload, buffer.view(second.slice));
+    try expectViewEquals(payload, &buffer, second);
 }
 
 test "SegmentedStringBuffer SliceReader streams" {
@@ -628,8 +474,7 @@ test "SegmentedStringBuffer SliceReader streams" {
     const text = "The quick brown fox jumps over the lazy dog";
     const res = try buffer.append(allocator, text);
 
-    var scratch: [16]u8 = undefined;
-    var reader = res.slice.reader(&buffer, &scratch);
+    var reader = res.reader(&buffer, &[_]u8{});
 
     var collected = std.Io.Writer.Allocating.init(allocator);
     defer collected.deinit();
@@ -648,13 +493,13 @@ test "SegmentedStringBuffer SliceWriter writes within one shelf" {
     const initial = "........";
     const res = try buffer.append(allocator, initial);
 
-    var writer = res.slice.writer(&buffer);
+    var writer = res.writer(&buffer);
 
     try writer.writer().writeAll("ABC");
     try writer.writer().writeAll("DEF");
     try writer.writer().writeAll("GH");
 
-    try expectViewEquals("ABCDEFGH", buffer.view(res.slice));
+    try expectViewEquals("ABCDEFGH", &buffer, res);
 }
 
 test "SegmentedStringBuffer SliceWriter drains across shelves" {
@@ -675,10 +520,10 @@ test "SegmentedStringBuffer SliceWriter drains across shelves" {
         byte.* = @intCast('a' + (idx % 26));
     }
 
-    var writer = res.slice.writer(&buffer);
+    var writer = res.writer(&buffer);
     try writer.writer().writeAll(expected);
 
-    try expectViewEquals(expected, buffer.view(res.slice));
+    try expectViewEquals(expected, &buffer, res);
 }
 
 test "SegmentedStringBuffer SliceWriter fails when exceeding slice length" {
@@ -689,11 +534,11 @@ test "SegmentedStringBuffer SliceWriter fails when exceeding slice length" {
     const initial = "xxxxx";
     const res = try buffer.append(allocator, initial);
 
-    var writer = res.slice.writer(&buffer);
+    var writer = res.writer(&buffer);
     try writer.writer().writeAll("abcde");
     try std.testing.expectError(error.WriteFailed, writer.writer().writeAll("!"));
 
-    try expectViewEquals("abcde", buffer.view(res.slice));
+    try expectViewEquals("abcde", &buffer, res);
 }
 
 test "SegmentedStringBuffer concurrent append" {
@@ -726,7 +571,7 @@ test "SegmentedStringBuffer concurrent append" {
                 var tmp: [32]u8 = undefined;
                 const payload = try std.fmt.bufPrint(&tmp, "t{d}-{d}", .{ tid, i });
                 const res = try buf.append(alloc, payload);
-                slice_storage[start + i] = res.slice;
+                slice_storage[start + i] = res;
             }
         }
     };
@@ -745,6 +590,6 @@ test "SegmentedStringBuffer concurrent append" {
             "t{d}-{d}",
             .{ idx / per_thread, idx % per_thread },
         );
-        try expectViewEquals(expected, buffer.view(slice));
+        try expectViewEquals(expected, &buffer, slice);
     }
 }

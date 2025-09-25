@@ -96,3 +96,60 @@ test "SegmentsWriter respects limit shorter than total" {
     try std.testing.expectEqual(@as(usize, 0), writer.remainingCapacity());
     try std.testing.expectError(error.WriteFailed, writer.writer().writeByte('x'));
 }
+
+/// Limited writer into a segmented string buffer slice.
+///
+/// Uses existing shelf storage without copying the segment list. The
+/// writer simply walks `shelves` one slice at a time.
+pub const SegmentsReader = struct {
+    reader: std.Io.Reader,
+    tail: []const []const u8,
+    seek: usize,
+    limit: std.Io.Limit,
+
+    pub fn init(
+        buffer: []u8,
+        tail: []const []u8,
+        seek: usize,
+        limit: std.Io.Limit,
+    ) SegmentsReader {
+        return .{
+            .reader = .{
+                .vtable = &vtable,
+                .buffer = buffer,
+                .end = 0,
+                .seek = 0,
+            },
+            .seek = seek,
+            .tail = tail,
+            .limit = limit,
+        };
+    }
+
+    fn stream(
+        r: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
+        var self: *SegmentsReader = @fieldParentPtr("reader", r);
+        var tail = self.tail[0][self.seek..];
+        tail.len = self.limit.minInt(tail.len);
+
+        if (tail.len == 0) return error.EndOfStream;
+
+        const n = self.limit.min(limit).minInt(tail.len);
+
+        const written = try w.write(tail[0..n]);
+        const remainder = tail.len - written;
+        if (remainder == 0) {
+            self.tail = self.tail[1..];
+            self.seek = 0;
+        } else {
+            self.seek += written;
+        }
+        self.limit = self.limit.subtract(written).?;
+        return written;
+    }
+
+    const vtable: std.Io.Reader.VTable = .{ .stream = stream };
+};
