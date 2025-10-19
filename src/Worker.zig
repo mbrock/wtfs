@@ -212,7 +212,7 @@ fn scanDirectory(
         return self.handleScanError(index, err);
     };
     var scanner = Scanner.init(iter_fd, &self.scan_buffer, &self.dispatcher);
-    defer posix.close(scanner.fd);
+    defer scanner.dir.close();
 
     self.ctx.retainParentFd(index);
     defer self.ctx.releaseParentFd(index);
