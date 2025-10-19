@@ -87,13 +87,6 @@ pub const SegmentedStringBuffer = struct {
         alloc: Allocator,
         bytes: []const u8,
     ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!u32 {
-        if (bytes.len == 0) {
-            const start: u32 = @intCast(try self.reserveContiguous(alloc, 1));
-            const start_loc = indexToLocation(start);
-            self.shelves[start_loc.shelf_index][start_loc.offset] = 0;
-            return start;
-        }
-
         const total_len = bytes.len + 1; // +1 for null terminator
         const start: u32 = @intCast(try self.reserveContiguous(alloc, total_len));
         const start_loc = indexToLocation(start);
@@ -142,7 +135,7 @@ pub const SegmentedStringBuffer = struct {
     pub fn get(self: *const Self, index: u32) [:0]const u8 {
         const loc = indexToLocation(index);
         const shelf = self.shelves[loc.shelf_index];
-        const string_len = mem.indexOfScalar(u8, shelf[loc.offset..], 0) orelse 0;
+        const string_len = mem.indexOfScalar(u8, shelf[loc.offset..], 0) orelse unreachable;
         if (string_len == 0)
             return "";
 
@@ -270,26 +263,16 @@ pub const SegmentedStringBuffer = struct {
     }
 
     /// Calculate the capacity of a shelf at the given index.
-    /// Shelves grow exponentially: shelf 0 = 1KB, shelf 1 = 2KB, shelf 2 = 4KB, etc.
-    pub fn shelfCapacity(index: usize) usize {
-        if (index >= max_supported_shelves) return 0;
-        var size: usize = base_unit;
-        var i: usize = 0;
-        while (i < index) : (i += 1) {
-            size = std.math.mul(usize, size, 2) catch return 0;
-        }
-        return size;
+    /// Shelves grow exponentially: shelf 0 = 4KB, shelf 1 = 8KB, shelf 2 = 16KB, etc.
+    pub fn shelfCapacity(s: usize) usize {
+        if (s >= max_supported_shelves) return 0;
+        return base_unit << @intCast(s); // base_unit * 2^s
     }
 
-    fn shelfStartBytes(shelf_index: usize) usize {
-        var total: usize = 0;
-        var size: usize = base_unit;
-        var i: usize = 0;
-        while (i < shelf_index) : (i += 1) {
-            total += size;
-            size = std.math.mul(usize, size, 2) catch return std.math.maxInt(usize);
-        }
-        return total;
+    fn shelfStartBytes(s: usize) usize {
+        if (s == 0) return 0;
+        const pow = @as(usize, 1) << @intCast(s); // 2^s
+        return base_unit * (pow - 1);
     }
 
     fn totalCapacity(self: *const Self) usize {
@@ -300,11 +283,6 @@ pub const SegmentedStringBuffer = struct {
             total += self.shelves[i].len;
         }
         return total;
-    }
-
-    fn toMutableShelfSlices(slice: [][]u8) [][]u8 {
-        const ptr = @as([*][]u8, @ptrCast(slice.ptr));
-        return ptr[0..slice.len];
     }
 };
 
