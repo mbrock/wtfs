@@ -1,12 +1,11 @@
 const std = @import("std");
-
-const strpool = @import("pool.zig");
 const TaskQueue = @import("TaskQueue.zig");
 const SegmentedMultiArray = @import("SegmentedMultiArray.zig").SegmentedMultiArray;
+const SegmentedStringBuffer = @import("SegmentedStringBuffer.zig").SegmentedStringBuffer;
 
 pub const DirectoryNode = struct {
     parent: u32,
-    basename: u32,
+    name_slice: SegmentedStringBuffer.Slice = SegmentedStringBuffer.Slice.fromParts(SegmentedStringBuffer.Index.init(0, 0), 0),
     fd: std.posix.fd_t = invalid_fd,
     fdrefcount: AtomicU16 = .init(0),
     total_size: u64 = 0,
@@ -17,7 +16,7 @@ pub const DirectoryNode = struct {
 
 pub const LargeFile = struct {
     directory_index: usize,
-    basename: u32,
+    name_slice: SegmentedStringBuffer.Slice = SegmentedStringBuffer.Slice.fromParts(SegmentedStringBuffer.Index.init(0, 0), 0),
     size: u64,
 };
 
@@ -34,14 +33,12 @@ allocator: std.mem.Allocator,
 directories_mutex: std.Thread.Mutex = .{},
 directories: *DirectoryTable,
 
-namelock: std.Thread.Mutex = .{},
-namedata: *std.ArrayList(u8),
-idxset: *strpool.IndexSet,
-
 large_files: *std.MultiArrayList(LargeFile),
 
 task_queue: *TaskQueue,
 outstanding: AtomicUsize = AtomicUsize.init(0),
+
+names_buffer: *SegmentedStringBuffer,
 
 pool: *std.Thread.Pool,
 wait_group: *std.Thread.WaitGroup,
@@ -52,11 +49,38 @@ errprogress: std.Progress.Node,
 skip_hidden: bool,
 large_file_threshold: u64,
 
-pub fn internPath(self: *Context, path: []const u8) !u32 {
-    self.namelock.lock();
-    defer self.namelock.unlock();
+pub fn storeName(self: *Context, name: []const u8) !SegmentedStringBuffer.Slice {
+    std.debug.assert(name.len <= std.fs.max_name_bytes);
+    var temp: [std.fs.max_name_bytes + 1]u8 = undefined;
+    @memcpy(temp[0..name.len], name);
+    temp[name.len] = 0;
+    return try self.names_buffer.append(self.allocator, temp[0 .. name.len + 1]);
+}
 
-    return strpool.intern(self.idxset, self.allocator, self.namedata, path);
+pub fn copyNameTo(
+    self: *Context,
+    slice: SegmentedStringBuffer.Slice,
+    dest: []u8,
+) ![:0]const u8 {
+    const required = slice.length();
+    if (dest.len < required) return error.NameBufferTooSmall;
+    var shelf_index = slice.shelfIndex();
+    var offset = slice.byteOffset();
+    var remaining = required;
+    var write_index: usize = 0;
+
+    while (remaining != 0) {
+        const shelf = self.names_buffer.shelves[shelf_index];
+        const available = shelf.len - offset;
+        const take = @min(remaining, available);
+        std.mem.copyForwards(u8, dest[write_index .. write_index + take], shelf[offset .. offset + take]);
+        remaining -= take;
+        write_index += take;
+        shelf_index += 1;
+        offset = 0;
+    }
+
+    return dest[0 .. required - 1 :0];
 }
 
 pub fn setTotals(self: *Context, index: usize, size: u64, files: usize) void {
@@ -81,14 +105,14 @@ pub fn markInaccessible(self: *Context, index: usize) void {
 }
 
 pub fn addRoot(self: *Context, path: []const u8, dir: std.fs.Dir) !usize {
-    const name_copy = try self.internPath(path);
+    const name_slice = try self.storeName(path);
 
     self.directories_mutex.lock();
     defer self.directories_mutex.unlock();
 
     const index = try self.directories.addOne(self.allocator);
     self.directories.ptr(.parent, index).* = 0;
-    self.directories.ptr(.basename, index).* = name_copy;
+    self.directories.ptr(.name_slice, index).* = name_slice;
     self.directories.ptr(.fd, index).* = dir.fd;
     self.directories.ptr(.total_size, index).* = 0;
     self.directories.ptr(.total_files, index).* = 0;
@@ -129,10 +153,11 @@ pub fn recordLargeFileLocked(
     name: []const u8,
     size: u64,
 ) !void {
-    const name_copy = try self.internPath(name);
+    const slice = try self.storeName(name);
+
     try self.large_files.append(self.allocator, .{
         .directory_index = directory_index,
-        .basename = name_copy,
+        .name_slice = slice,
         .size = size,
     });
 }

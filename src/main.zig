@@ -121,6 +121,11 @@ pub fn main() !void {
         .root = root,
         .large_file_threshold = large_file_threshold,
     };
+    defer {
+        diskScan.freeNameBuffers();
+        diskScan.directories.deinit(allocator);
+        diskScan.large_files.deinit(allocator);
+    }
 
     if (binary_output) |path| {
         var binary_file = try std.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
@@ -198,19 +203,7 @@ fn dumpStructLayouts() !void {
     try dumpStruct(stdout, "Context", @import("Context.zig"));
     try dumpStruct(stdout, "Worker", WorkerMod.Worker);
     try dumpStruct(stdout, "Worker.Scanner", WorkerMod.Scanner);
-    if (builtin.target.os.tag == .linux) {
-        const entries_type = @FieldType(WorkerMod.Scanner, "entries");
-        const entries_info = @typeInfo(entries_type);
-        switch (entries_info) {
-            .array => |array_info| {
-                try dumpStruct(stdout, "Scanner.BatchEntry", array_info.child);
-            },
-            else => {},
-        }
-    }
     try dumpStruct(stdout, "SysDispatcher.Config", SysDispatcher.Config);
-    try dumpStruct(stdout, "SysDispatcher.StatRequest", SysDispatcher.StatRequest);
-    try dumpStruct(stdout, "SysDispatcher.LinuxBackend", SysDispatcher.LinuxBackend);
     try dumpStruct(stdout, "fs.Dir.Iterator", std.fs.Dir.Iterator);
 }
 

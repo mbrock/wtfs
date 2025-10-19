@@ -10,8 +10,7 @@ pub const Worker = @This();
 // ===== Configuration =====
 
 /// Scanner configured to read names, object types, and file sizes.
-/// On Linux the provider points at the dispatcher so statx can run via
-/// io_uring, otherwise it collapses to the POSIX defaults.
+/// Metadata lookups are routed through the dispatcher for portability.
 pub const Scanner = dirscan.DirScannerWithProvider(.{
     .common = .{
         .name = true,
@@ -124,15 +123,9 @@ fn processTask(self: *Worker, index: usize) void {
 // ===== Name Management =====
 
 /// Extract a name from the shared name pool (thread-safe)
-fn extractName(self: *Worker, idx: u32) [:0]const u8 {
-    self.ctx.namelock.lock();
-    defer self.ctx.namelock.unlock();
-
-    const slice = std.mem.sliceTo(self.ctx.namedata.items[idx..], 0);
-    @memcpy(self.namebuf[0..slice.len], slice);
-    self.namebuf[slice.len] = 0;
-
-    return self.namebuf[0..slice.len :0];
+fn extractName(self: *Worker, index: usize) [:0]const u8 {
+    const slice = self.ctx.directories.ptr(.name_slice, index).*;
+    return self.ctx.copyNameTo(slice, self.namebuf[0..]) catch unreachable;
 }
 
 // ===== Directory Processing =====
@@ -154,9 +147,7 @@ fn processDirectory(self: *Worker, index: usize) !usize {
 // ===== Directory Opening =====
 
 fn openDirectory(self: *Worker, index: usize) !std.posix.fd_t {
-    const basename = self.extractName(
-        self.ctx.directories.ptr(.basename, index).*,
-    );
+    const basename = self.extractName(index);
 
     if (index != 0) {
         return try self.openChildDirectory(index, basename);
@@ -311,12 +302,13 @@ fn processEntry(
 }
 
 pub fn addChild(self: *Worker, parent_index: usize, name: []const u8) !usize {
-    const name_copy = try self.ctx.internPath(name);
+    const name_slice = try self.ctx.storeName(name);
+
     self.ctx.directories_mutex.lock();
     defer self.ctx.directories_mutex.unlock();
     const index = try self.ctx.directories.addOne(self.allocator);
     self.ctx.directories.ptr(.parent, index).* = @intCast(parent_index);
-    self.ctx.directories.ptr(.basename, index).* = name_copy;
+    self.ctx.directories.ptr(.name_slice, index).* = name_slice;
     self.ctx.directories.ptr(.fd, index).* = Context.invalid_fd;
     self.ctx.directories.ptr(.total_size, index).* = 0;
     self.ctx.directories.ptr(.total_files, index).* = 0;

@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dirscan = @import("DirScanner.zig");
-const strpool = @import("pool.zig");
+const SegmentedStringBuffer = @import("SegmentedStringBuffer.zig").SegmentedStringBuffer;
 
 const TaskQueue = @import("TaskQueue.zig");
 const Context = @import("Context.zig");
@@ -25,12 +25,7 @@ root: []const u8 = ".",
 
 /// Segmented storage for all discovered directory nodes and their metadata
 directories: Context.DirectoryTable = .{},
-
-/// Pool of null-terminated directory names referenced by basename indices
-namedata: std.ArrayList(u8) = .empty,
-
-/// Set tracking unique name indices to avoid duplicates in the name pool
-idxset: strpool.IndexSet = .empty,
+names: SegmentedStringBuffer = SegmentedStringBuffer.empty,
 
 /// Root progress node for tracking scan progress and reporting to the user
 progress_root: std.Progress.Node = undefined,
@@ -138,8 +133,7 @@ fn createScanContext(
         .pool = pool,
         .task_queue = task_queue,
         .directories = &self.directories,
-        .namedata = &self.namedata,
-        .idxset = &self.idxset,
+        .names_buffer = &self.names,
         .wait_group = wait_group,
         .progress_node = queue_progress.*,
         .errprogress = self.progress_root.start("errors", 0),
@@ -206,14 +200,16 @@ fn writeFullPath(
     index: usize,
     writer: *std.Io.Writer,
 ) !void {
-    const basename_off: usize = @intCast(self.directories.ptr(.basename, index).*);
+    var name_tmp: [std.fs.max_name_bytes + 1]u8 = undefined;
+    const name_slice = self.directories.ptr(.name_slice, index).*;
+    const name = try self.sliceToArray(name_slice, name_tmp[0..]);
     const parent_index = self.directories.ptr(.parent, index).*;
 
     if (index != 0) {
         try self.writeFullPath(@intCast(parent_index), writer);
         try writer.writeByte('/');
     }
-    try writer.writeAll(std.mem.sliceTo(self.namedata.items[basename_off..], 0));
+    try writer.writeAll(name);
 }
 
 fn buildPath(self: *Self, index: usize) ![]u8 {
@@ -222,11 +218,12 @@ fn buildPath(self: *Self, index: usize) ![]u8 {
     return try writer.toOwnedSlice();
 }
 
-fn buildFilePath(self: *Self, directory_index: usize, basename_index: u32) ![]u8 {
+fn buildFilePath(self: *Self, directory_index: usize, name_slice: SegmentedStringBuffer.Slice) ![]u8 {
     const directory_path = try self.buildPath(directory_index);
     defer self.allocator.free(directory_path);
 
-    const file_name = std.mem.sliceTo(self.namedata.items[basename_index..], 0);
+    var name_tmp: [std.fs.max_name_bytes + 1]u8 = undefined;
+    const file_name = try self.sliceToArray(name_slice, name_tmp[0..]);
 
     var writer = try std.Io.Writer.Allocating.initCapacity(
         self.allocator,
@@ -241,41 +238,70 @@ fn buildFilePath(self: *Self, directory_index: usize, basename_index: u32) ![]u8
     return try writer.toOwnedSlice();
 }
 
-pub fn directoryName(
-    directories: *Context.DirectoryTable,
-    namedata: *const std.ArrayList(u8),
-    index: usize,
-) []const u8 {
-    const base_index: usize = @intCast(directories.ptr(.basename, index).*);
-    return std.mem.sliceTo(namedata.items[base_index..], 0);
+fn sliceToArray(
+    self: *Self,
+    slice: SegmentedStringBuffer.Slice,
+    dest: []u8,
+) ![]const u8 {
+    if (slice.length() == 0) return "";
+    const total = slice.length();
+    if (dest.len < total) return error.NameBufferTooSmall;
+    var shelf_index = slice.shelfIndex();
+    var offset = slice.byteOffset();
+    var remaining = total;
+    var write_index: usize = 0;
+
+    while (remaining != 0) {
+        const shelf = self.names.shelves[shelf_index];
+        const available = shelf.len - offset;
+        const take = @min(remaining, available);
+        std.mem.copyForwards(u8, dest[write_index .. write_index + take], shelf[offset .. offset + take]);
+        remaining -= take;
+        write_index += take;
+        shelf_index += 1;
+        offset = 0;
+    }
+    return dest[0 .. total - 1];
+}
+
+pub fn freeNameBuffers(self: *Self) void {
+    self.names.deinit(self.allocator);
+    self.names = SegmentedStringBuffer.empty;
 }
 
 test "path helpers use shared directory data" {
     const allocator = std.testing.allocator;
 
     var disk_scan = Self{ .allocator = allocator };
-    defer disk_scan.directories.deinit(allocator);
-    defer disk_scan.namedata.deinit(allocator);
-    defer disk_scan.idxset.deinit(allocator);
+    defer {
+        disk_scan.freeNameBuffers();
+        disk_scan.directories.deinit(allocator);
+        disk_scan.large_files.deinit(allocator);
+    }
 
-    const root_name_offset = disk_scan.namedata.items.len;
-    try disk_scan.namedata.appendSlice(allocator, "root");
-    try disk_scan.namedata.append(allocator, 0);
+    var root_tmp = [_]u8{ 'r', 'o', 'o', 't', 0 };
+    const root_slice = try disk_scan.names.append(allocator, root_tmp[0..]);
 
-    const child_name_offset = disk_scan.namedata.items.len;
-    try disk_scan.namedata.appendSlice(allocator, "child");
-    try disk_scan.namedata.append(allocator, 0);
+    var child_tmp = [_]u8{ 'c', 'h', 'i', 'l', 'd', 0 };
+    const child_slice = try disk_scan.names.append(allocator, child_tmp[0..]);
 
     const root_index = try disk_scan.directories.addOne(allocator);
     disk_scan.directories.ptr(.parent, root_index).* = 0;
-    disk_scan.directories.ptr(.basename, root_index).* = @intCast(root_name_offset);
+    disk_scan.directories.ptr(.name_slice, root_index).* = root_slice;
 
     const child_index = try disk_scan.directories.addOne(allocator);
     disk_scan.directories.ptr(.parent, child_index).* = @intCast(root_index);
-    disk_scan.directories.ptr(.basename, child_index).* = @intCast(child_name_offset);
+    disk_scan.directories.ptr(.name_slice, child_index).* = child_slice;
 
-    try std.testing.expectEqualStrings("root", directoryName(&disk_scan.directories, &disk_scan.namedata, root_index));
-    try std.testing.expectEqualStrings("child", directoryName(&disk_scan.directories, &disk_scan.namedata, child_index));
+    var scratch: [std.fs.max_name_bytes + 1]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "root",
+        try disk_scan.sliceToArray(root_slice, scratch[0..]),
+    );
+    try std.testing.expectEqualStrings(
+        "child",
+        try disk_scan.sliceToArray(child_slice, scratch[0..]),
+    );
 
     var root_buffer: [32]u8 = undefined;
     var root_writer = std.Io.Writer.fixed(&root_buffer);
@@ -294,9 +320,6 @@ test "path helpers use shared directory data" {
     const child_path = try disk_scan.buildPath(child_index);
     defer allocator.free(child_path);
     try std.testing.expectEqualStrings("root/child", child_path);
-
-    const expected_names = [_]u8{ 'r', 'o', 'o', 't', 0, 'c', 'h', 'i', 'l', 'd', 0 };
-    try std.testing.expectEqualSlices(u8, &expected_names, disk_scan.namedata.items);
 }
 
 test "threaded disk scan can repeatedly scan populated directory trees" {
@@ -344,9 +367,8 @@ test "threaded disk scan can repeatedly scan populated directory trees" {
     for (0..20) |_| {
         var disk_scan = Self{ .allocator = allocator, .root = root_path };
         defer {
+            disk_scan.freeNameBuffers();
             disk_scan.directories.deinit(allocator);
-            disk_scan.namedata.deinit(allocator);
-            disk_scan.idxset.deinit(allocator);
             disk_scan.large_files.deinit(allocator);
         }
 
@@ -460,7 +482,7 @@ const SummaryBuilder = struct {
         const slices = self.large_files.slice();
         const sizes = slices.items(.size);
         const directories = slices.items(.directory_index);
-        const basenames = slices.items(.basename);
+        const names = slices.items(.name_slice);
 
         for (sizes, 0..) |size, idx| {
             if (size < self.large_file_threshold) continue;
@@ -472,7 +494,7 @@ const SummaryBuilder = struct {
         try entries.ensureTotalCapacityPrecise(self.allocator, top_indexes.items.len);
 
         for (top_indexes.items) |file_index| {
-            const path = try buildFilePath(self, directories[file_index], basenames[file_index]);
+            const path = try buildFilePath(self, directories[file_index], names[file_index]);
 
             entries.appendAssumeCapacity(.{
                 .size = sizes[file_index],
@@ -612,8 +634,7 @@ fn generateSummary(self: *Self) !Summary {
 fn reportResults(self: *Self, results: ScanResults, summary: Summary) !void {
     const report_data = Reporter.ReportData.init(
         &self.directories,
-        &self.namedata,
-        &self.idxset,
+        &self.names,
         &self.large_files,
         results.totals,
     );
@@ -688,12 +709,39 @@ pub fn writeBinaryResults(
     const magic = "wtfsdumpv0.0   \n";
     const large_slices = self.large_files.slice();
     const large_dirs = large_slices.items(.directory_index);
-    const large_names = large_slices.items(.basename);
+    const large_name_slices = large_slices.items(.name_slice);
     const large_sizes = large_slices.items(.size);
 
     try writer.writeAll(magic);
     try writer.writeStruct(results.totals, .little);
-    try writer.writeAll(self.namedata.items);
+    var name_buffer = std.ArrayListUnmanaged(u8){};
+    defer name_buffer.deinit(self.allocator);
+
+    const dir_len = self.directories.len();
+    var idx: usize = 0;
+    while (idx < dir_len) : (idx += 1) {
+        const slice = self.directories.ptr(.name_slice, idx).*;
+        if (slice.length() == 0) continue;
+        var tmp: [std.fs.max_name_bytes + 1]u8 = undefined;
+        _ = try self.sliceToArray(slice, tmp[0..]);
+        try name_buffer.appendSlice(self.allocator, tmp[0..slice.length()]);
+    }
+
+    var large_name_offsets = std.ArrayListUnmanaged(u32){};
+    defer large_name_offsets.deinit(self.allocator);
+    try large_name_offsets.ensureTotalCapacityPrecise(self.allocator, large_name_slices.len);
+
+    for (large_name_slices) |slice| {
+        const offset = name_buffer.items.len;
+        if (slice.length() != 0) {
+            var tmp: [std.fs.max_name_bytes + 1]u8 = undefined;
+            _ = try self.sliceToArray(slice, tmp[0..]);
+            try name_buffer.appendSlice(self.allocator, tmp[0..slice.length()]);
+        }
+        try large_name_offsets.append(self.allocator, @intCast(offset));
+    }
+
+    try writer.writeAll(name_buffer.items);
 
     // const len_snapshot = self.directories.len.load(.acquire);
     // const snapshot = self.directories.slices();
@@ -734,7 +782,7 @@ pub fn writeBinaryResults(
     // }
 
     try writer.writeSliceEndian(usize, large_dirs, .little);
-    try writer.writeSliceEndian(u32, large_names, .little);
+    try writer.writeSliceEndian(u32, large_name_offsets.items, .little);
     try writer.writeSliceEndian(u64, large_sizes, .little);
     try writer.flush();
 }
