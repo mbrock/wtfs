@@ -201,7 +201,7 @@ fn writeFullPath(
     writer: *std.Io.Writer,
 ) !void {
     const name_slice = self.directories.ptr(.name_slice, index).*;
-    const name = self.names.sliceValue(name_slice);
+    const name = self.names.get(name_slice);
     const parent_index = self.directories.ptr(.parent, index).*;
 
     if (index != 0) {
@@ -217,11 +217,11 @@ fn buildPath(self: *Self, index: usize) ![]u8 {
     return try writer.toOwnedSlice();
 }
 
-fn buildFilePath(self: *Self, directory_index: usize, name_slice: SegmentedStringBuffer.Slice) ![]u8 {
+fn buildFilePath(self: *Self, directory_index: usize, name_slice: u32) ![]u8 {
     const directory_path = try self.buildPath(directory_index);
     defer self.allocator.free(directory_path);
 
-    const file_name = self.names.sliceValue(name_slice);
+    const file_name = self.names.get(name_slice);
 
     var writer = try std.Io.Writer.Allocating.initCapacity(
         self.allocator,
@@ -262,8 +262,8 @@ test "path helpers use shared directory data" {
     disk_scan.directories.ptr(.parent, child_index).* = @intCast(root_index);
     disk_scan.directories.ptr(.name_slice, child_index).* = child_slice;
 
-    try std.testing.expectEqualStrings("root", disk_scan.names.sliceValue(root_slice));
-    try std.testing.expectEqualStrings("child", disk_scan.names.sliceValue(child_slice));
+    try std.testing.expectEqualStrings("root", disk_scan.names.get(root_slice));
+    try std.testing.expectEqualStrings("child", disk_scan.names.get(child_slice));
 
     var root_buffer: [32]u8 = undefined;
     var root_writer = std.Io.Writer.fixed(&root_buffer);
@@ -683,9 +683,11 @@ pub fn writeBinaryResults(
     var idx: usize = 0;
     while (idx < dir_len) : (idx += 1) {
         const slice = self.directories.ptr(.name_slice, idx).*;
-        const bytes = self.names.sliceBytes(slice);
-        if (bytes.len == 0) continue;
-        try name_buffer.appendSlice(self.allocator, bytes);
+        const str = self.names.get(slice);
+        if (str.len == 0) continue;
+        // Include the null terminator in serialization
+        try name_buffer.appendSlice(self.allocator, str);
+        try name_buffer.append(self.allocator, 0);
     }
 
     var large_name_offsets = std.ArrayListUnmanaged(u32){};
@@ -694,9 +696,10 @@ pub fn writeBinaryResults(
 
     for (large_name_slices) |slice| {
         const offset = name_buffer.items.len;
-        const bytes = self.names.sliceBytes(slice);
-        if (bytes.len != 0) {
-            try name_buffer.appendSlice(self.allocator, bytes);
+        const str = self.names.get(slice);
+        if (str.len != 0) {
+            try name_buffer.appendSlice(self.allocator, str);
+            try name_buffer.append(self.allocator, 0);
         }
         try large_name_offsets.append(self.allocator, @intCast(offset));
     }

@@ -4,28 +4,31 @@ const Allocator = std.mem.Allocator;
 const CapacityLatch = @import("CapacityLatch.zig");
 const test_threads = @import("test_threading.zig");
 
-/// A lock-free, append-only buffer for storing strings in exponentially-sized shelves.
+/// An append-only buffer for storing null-terminated strings in exponentially-sized shelves.
 ///
-/// Designed for efficient concurrent appends without requiring a global lock. Multiple threads
-/// can append simultaneously using atomic reservations coordinated by a capacity latch that
-/// serializes growth operations while allowing concurrent appends to proceed independently.
+/// Designed for efficient concurrent appends. Multiple threads can append simultaneously using
+/// atomic reservations. Only growth operations (allocating new shelves) are serialized with a
+/// mutex via the capacity latch; appends to existing capacity proceed concurrently without locks.
 ///
 /// Strings are stored contiguously within individual shelves (never straddling boundaries).
 /// This wastes some space when a string would cross a shelf boundary, but the waste is
-/// negligible since shelves grow exponentially (1KB, 2KB, 4KB, 8KB, ...) and strings are
-/// typically short.
+/// negligible since shelves grow exponentially (4KB, 8KB, 16KB, 32KB, ...) and strings are
+/// typically short (filenames, etc).
+///
+/// **String references**: Returned as u32 indices (byte offsets). Maximum capacity is 4GB.
 ///
 /// **Stability guarantee**: Pointers to appended data remain valid for the lifetime of the
 /// buffer. Shelves are never reallocated or moved once created.
 pub const SegmentedStringBuffer = struct {
     const Self = @This();
 
-    const base_shift: comptime_int = 10; // 1024 bytes
+    const base_shift: comptime_int = 12; // 4096 bytes (one page)
     const base_unit: usize = @as(usize, 1) << base_shift;
-    const max_supported_shelves: usize = 32; // 32 shelves supports up to ~4GB
+    // 20 shelves needed to reach 4GB
+    const max_supported_shelves: usize = 20;
     const ShiftInt = std.math.Log2Int(usize);
 
-    /// Size of the first shelf in bytes (1024).
+    /// Size of the first shelf in bytes (4096).
     pub const first_shelf_bytes = base_unit;
 
     /// Statistics about buffer usage.
@@ -36,43 +39,24 @@ pub const SegmentedStringBuffer = struct {
         capacity_bytes: usize,
     };
 
-    const Location = struct {
-        shelf_index: usize,
-        offset: usize,
-    };
-
-    /// A 32-bit byte offset into the buffer, supporting up to 4GB of string data.
-    /// The shelf index and offset within the shelf are computed dynamically using bit math.
-    pub const Index = u32;
-
-    inline fn indexToLocation(idx: Index) Location {
+    inline fn indexToLocation(idx: u32) struct { shelf_index: usize, offset: usize } {
         const global_offset = @as(usize, idx);
         // Given geometrically-sized shelves starting at base_unit:
         // Shelf 0: base_unit bytes (offset 0 to base_unit-1)
         // Shelf 1: 2*base_unit bytes (offset base_unit to 3*base_unit-1)
         // Shelf N: 2^N * base_unit bytes
         // Total bytes before shelf N: base_unit * (2^N - 1)
-        
+
         // Find shelf: floor(log2((global_offset / base_unit) + 1))
         const units = (global_offset >> base_shift) + 1;
         const shelf_index = std.math.log2_int(usize, units);
-        
+
         // Find offset within shelf
         const shelf_start = shelfStartBytes(shelf_index);
         const offset = global_offset - shelf_start;
-        
+
         return .{ .shelf_index = shelf_index, .offset = offset };
     }
-
-    inline fn locationToIndex(loc: Location) Index {
-        const global_offset = shelfStartBytes(loc.shelf_index) + loc.offset;
-        return @intCast(global_offset);
-    }
-
-    /// A reference to a null-terminated contiguous string in the buffer.
-    /// Only stores the 32-bit byte offset; length is computed by scanning for the null terminator.
-    /// This reduces memory usage from 128 bits to 32 bits per reference.
-    pub const Slice = Index;
 
     shelves: [max_supported_shelves][]u8 = mem.zeroes([max_supported_shelves][]u8),
     shelf_count: u8 = 0,
@@ -92,17 +76,17 @@ pub const SegmentedStringBuffer = struct {
         self.* = undefined;
     }
 
-    /// Append a string to the buffer with a null terminator and return a slice pointing to it.
+    /// Append a string to the buffer with a null terminator and return its index.
     ///
     /// A null byte is automatically appended after the string data.
-    /// The slice points to stable memory; subsequent appends do not invalidate it.
+    /// The returned index points to stable memory; subsequent appends do not invalidate it.
     ///
     /// Thread-safe: can be called concurrently from multiple threads.
     pub fn append(
         self: *Self,
         alloc: Allocator,
         bytes: []const u8,
-    ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!Slice {
+    ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!u32 {
         if (bytes.len == 0) {
             const start: u32 = @intCast(try self.reserveContiguous(alloc, 1));
             const start_loc = indexToLocation(start);
@@ -154,33 +138,14 @@ pub const SegmentedStringBuffer = struct {
         };
     }
 
-    const empty_cstring = [_:0]u8{0};
-
-    /// Get the raw bytes for a slice (including the null terminator).
-    /// Scans for the null terminator to determine length.
-    pub fn sliceBytes(self: *const Self, slice: Slice) []const u8 {
-        const loc = indexToLocation(slice);
+    /// Get the null-terminated string at the given index.
+    pub fn get(self: *const Self, index: u32) [:0]const u8 {
+        const loc = indexToLocation(index);
         const shelf = self.shelves[loc.shelf_index];
         const string_len = mem.indexOfScalar(u8, shelf[loc.offset..], 0) orelse 0;
-        return shelf[loc.offset .. loc.offset + string_len + 1];
-    }
+        if (string_len == 0)
+            return "";
 
-    /// Get the value bytes for a slice (excluding the null terminator).
-    /// Scans for the null terminator to determine length.
-    pub fn sliceValue(self: *const Self, slice: Slice) []const u8 {
-        const loc = indexToLocation(slice);
-        const shelf = self.shelves[loc.shelf_index];
-        const string_len = mem.indexOfScalar(u8, shelf[loc.offset..], 0) orelse 0;
-        return shelf[loc.offset .. loc.offset + string_len];
-    }
-
-    /// Get the bytes as a null-terminated C string.
-    /// Scans for the null terminator to determine length.
-    pub fn sliceCString(self: *const Self, slice: Slice) [:0]const u8 {
-        const loc = indexToLocation(slice);
-        const shelf = self.shelves[loc.shelf_index];
-        const string_len = mem.indexOfScalar(u8, shelf[loc.offset..], 0) orelse 0;
-        if (string_len == 0) return empty_cstring[0..1 :0];
         return shelf[loc.offset .. loc.offset + string_len :0];
     }
 
@@ -337,8 +302,6 @@ pub const SegmentedStringBuffer = struct {
         return total;
     }
 
-
-
     fn toMutableShelfSlices(slice: [][]u8) [][]u8 {
         const ptr = @as([*][]u8, @ptrCast(slice.ptr));
         return ptr[0..slice.len];
@@ -348,9 +311,9 @@ pub const SegmentedStringBuffer = struct {
 fn expectViewEquals(
     expected: []const u8,
     buffer: *SegmentedStringBuffer,
-    slice: SegmentedStringBuffer.Slice,
+    index: u32,
 ) !void {
-    try std.testing.expectEqualStrings(expected, buffer.sliceValue(slice));
+    try std.testing.expectEqualStrings(expected, buffer.get(index));
 }
 
 test "SegmentedStringBuffer append and view" {
@@ -377,7 +340,7 @@ test "SegmentedStringBuffer spans multiple shelves" {
     const first_data = "a" ** (SegmentedStringBuffer.first_shelf_bytes - 1); // Leave room for null
     const first = try buffer.append(allocator, first_data);
     try std.testing.expectEqual(@as(usize, 1), buffer.shelfCount());
-    try std.testing.expectEqualStrings(first_data, buffer.sliceValue(first));
+    try std.testing.expectEqualStrings(first_data, buffer.get(first));
 
     const second_len = SegmentedStringBuffer.first_shelf_bytes + 128;
     const payload = try allocator.alloc(u8, second_len);
@@ -404,7 +367,7 @@ test "SegmentedStringBuffer append keeps entries within shelf" {
     // Check that it was placed on shelf 1 (second shelf) due to straddling
     const loc = SegmentedStringBuffer.indexToLocation(slice);
     try std.testing.expectEqual(@as(usize, 1), loc.shelf_index);
-    try std.testing.expectEqualStrings("name", buffer.sliceValue(slice));
+    try std.testing.expectEqualStrings("name", buffer.get(slice));
 }
 
 test "SegmentedStringBuffer concurrent append" {
@@ -419,7 +382,7 @@ test "SegmentedStringBuffer concurrent append" {
     const per_thread = 20;
     const total = thread_count * per_thread;
 
-    var slices: [total]SegmentedStringBuffer.Slice = undefined;
+    var slices: [total]u32 = undefined;
 
     var group = try test_threads.ThreadTestGroup.init(thread_count);
 
@@ -429,7 +392,7 @@ test "SegmentedStringBuffer concurrent append" {
             buf: *SegmentedStringBuffer,
             alloc: Allocator,
             per: usize,
-            slice_storage: []SegmentedStringBuffer.Slice,
+            slice_storage: []u32,
         ) !void {
             const start = tid * per;
             var i: usize = 0;

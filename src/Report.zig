@@ -250,7 +250,7 @@ pub fn printHeaviestDirectories(stdout: *Writer, data: ReportData, summary: Heav
         var indent = row.depth * 2;
         const indent_cap = if (max_width == 0 or max_width == 1) 0 else max_width - 1;
         if (indent > indent_cap) indent = indent_cap;
-        const raw_name = if (row.index == 0) "." else data.names.sliceValue(data.directories.ptr(.name_slice, row.index).*);
+        const raw_name = if (row.index == 0) "." else data.names.get(data.directories.ptr(.name_slice, row.index).*);
         const remaining = max_width - indent;
         const name_take = if (remaining == 0) 0 else @min(raw_name.len, remaining);
         const total = indent + name_take;
@@ -382,7 +382,7 @@ fn formatDirectoryLabel(
         buffer[i] = ' ';
     }
 
-    const raw_name = if (index == 0) "." else data.names.sliceValue(data.directories.ptr(.name_slice, index).*);
+    const raw_name = if (index == 0) "." else data.names.get(data.directories.ptr(.name_slice, index).*);
     const remaining = limit - indent_len;
     if (remaining == 0) return buffer[0..indent_len];
 

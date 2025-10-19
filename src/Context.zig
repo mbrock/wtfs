@@ -5,7 +5,7 @@ const SegmentedStringBuffer = @import("SegmentedStringBuffer.zig").SegmentedStri
 
 pub const DirectoryNode = struct {
     parent: u32,
-    name_slice: SegmentedStringBuffer.Slice = 0,
+    name_slice: u32 = 0,
     fd: std.posix.fd_t = invalid_fd,
     fdrefcount: AtomicU16 = .init(0),
     total_size: u64 = 0,
@@ -16,7 +16,7 @@ pub const DirectoryNode = struct {
 
 pub const LargeFile = struct {
     directory_index: usize,
-    name_slice: SegmentedStringBuffer.Slice = 0,
+    name_slice: u32 = 0,
     size: u64,
 };
 
@@ -49,20 +49,20 @@ errprogress: std.Progress.Node,
 skip_hidden: bool,
 large_file_threshold: u64,
 
-pub fn storeName(self: *Context, name: []const u8) !SegmentedStringBuffer.Slice {
+pub fn storeName(self: *Context, name: []const u8) !u32 {
     std.debug.assert(name.len <= std.fs.max_name_bytes);
     return try self.names_buffer.append(self.allocator, name);
 }
 
 pub fn nameCString(
     self: *const Context,
-    slice: SegmentedStringBuffer.Slice,
+    slice: u32,
 ) [:0]const u8 {
-    return self.names_buffer.sliceCString(slice);
+    return self.names_buffer.get(slice);
 }
 
 pub fn directoryCString(self: *const Context, index: usize) [:0]const u8 {
-    return self.names_buffer.sliceCString(self.directories.ptr(.name_slice, index).*);
+    return self.names_buffer.get(self.directories.ptr(.name_slice, index).*);
 }
 
 pub fn setTotals(self: *Context, index: usize, size: u64, files: usize) void {
