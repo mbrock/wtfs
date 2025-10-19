@@ -5,7 +5,7 @@ const SegmentedStringBuffer = @import("SegmentedStringBuffer.zig").SegmentedStri
 
 pub const DirectoryNode = struct {
     parent: u32,
-    name_slice: SegmentedStringBuffer.Slice = SegmentedStringBuffer.Slice.fromParts(SegmentedStringBuffer.Index.init(0, 0), 0),
+    name_slice: SegmentedStringBuffer.Slice = 0,
     fd: std.posix.fd_t = invalid_fd,
     fdrefcount: AtomicU16 = .init(0),
     total_size: u64 = 0,
@@ -16,7 +16,7 @@ pub const DirectoryNode = struct {
 
 pub const LargeFile = struct {
     directory_index: usize,
-    name_slice: SegmentedStringBuffer.Slice = SegmentedStringBuffer.Slice.fromParts(SegmentedStringBuffer.Index.init(0, 0), 0),
+    name_slice: SegmentedStringBuffer.Slice = 0,
     size: u64,
 };
 
@@ -51,10 +51,7 @@ large_file_threshold: u64,
 
 pub fn storeName(self: *Context, name: []const u8) !SegmentedStringBuffer.Slice {
     std.debug.assert(name.len <= std.fs.max_name_bytes);
-    var temp: [std.fs.max_name_bytes + 1]u8 = undefined;
-    @memcpy(temp[0..name.len], name);
-    temp[name.len] = 0;
-    return try self.names_buffer.appendContiguous(self.allocator, temp[0 .. name.len + 1]);
+    return try self.names_buffer.append(self.allocator, name);
 }
 
 pub fn nameCString(

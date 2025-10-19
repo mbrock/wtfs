@@ -3,25 +3,32 @@ const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const CapacityLatch = @import("CapacityLatch.zig");
 const test_threads = @import("test_threading.zig");
-const segments = @import("segments.zig");
 
+/// A lock-free, append-only buffer for storing strings in exponentially-sized shelves.
+///
+/// Designed for efficient concurrent appends without requiring a global lock. Multiple threads
+/// can append simultaneously using atomic reservations coordinated by a capacity latch that
+/// serializes growth operations while allowing concurrent appends to proceed independently.
+///
+/// Strings are stored contiguously within individual shelves (never straddling boundaries).
+/// This wastes some space when a string would cross a shelf boundary, but the waste is
+/// negligible since shelves grow exponentially (1KB, 2KB, 4KB, 8KB, ...) and strings are
+/// typically short.
+///
+/// **Stability guarantee**: Pointers to appended data remain valid for the lifetime of the
+/// buffer. Shelves are never reallocated or moved once created.
 pub const SegmentedStringBuffer = struct {
     const Self = @This();
 
     const base_shift: comptime_int = 10; // 1024 bytes
     const base_unit: usize = @as(usize, 1) << base_shift;
-    const max_supported_shelves: usize = 32;
-    const shelf_bit_count: comptime_int = 6;
-    const offset_bit_count: comptime_int = @bitSizeOf(usize) - shelf_bit_count;
-    const OffsetInt = std.meta.Int(.unsigned, offset_bit_count);
+    const max_supported_shelves: usize = 32; // 32 shelves supports up to ~4GB
+    const ShiftInt = std.math.Log2Int(usize);
 
-    comptime {
-        std.debug.assert(offset_bit_count > 0);
-        std.debug.assert(max_supported_shelves <= (1 << shelf_bit_count));
-    }
-
+    /// Size of the first shelf in bytes (1024).
     pub const first_shelf_bytes = base_unit;
 
+    /// Statistics about buffer usage.
     pub const DebugStats = struct {
         shelf_count: usize,
         length: usize,
@@ -29,184 +36,43 @@ pub const SegmentedStringBuffer = struct {
         capacity_bytes: usize,
     };
 
-    pub const SegmentedView = struct {
-        head: []const u8,
-        body: []const []const u8,
-        tail: []const u8,
-
-        pub fn totalLength(self: *const SegmentedView) usize {
-            var total: usize = self.head.len + self.tail.len;
-            for (self.body) |chunk| total += chunk.len;
-            return total;
-        }
-
-        pub fn bodySlices(self: *const SegmentedView) []const []const u8 {
-            return self.body;
-        }
-
-        pub fn emptyBody() []const []const u8 {
-            return &[_][]const u8{};
-        }
-
-        pub fn empty() SegmentedView {
-            return .{
-                .head = &[_]u8{},
-                .body = emptyBody(),
-                .tail = &[_]u8{},
-            };
-        }
-    };
-
-    pub const MutableSegmentedView = struct {
-        head: []u8,
-        body: [][]u8,
-        tail: []u8,
-
-        pub fn totalLength(self: *const MutableSegmentedView) usize {
-            var total: usize = self.head.len + self.tail.len;
-            for (self.body) |chunk| total += chunk.len;
-            return total;
-        }
-
-        pub fn bodySlices(self: *const MutableSegmentedView) [][]u8 {
-            return self.body;
-        }
-
-        pub fn emptyBody() [][]u8 {
-            return &[_][]u8{};
-        }
-
-        pub fn empty() MutableSegmentedView {
-            return .{
-                .head = &[_]u8{},
-                .body = emptyBody(),
-                .tail = &[_]u8{},
-            };
-        }
-    };
-
     const Location = struct {
         shelf_index: usize,
         offset: usize,
     };
 
-    pub const Index = packed union {
-        word: usize,
-        parts: packed struct {
-            shelf: u6,
-            offset: OffsetInt,
-        },
+    /// A 32-bit byte offset into the buffer, supporting up to 4GB of string data.
+    /// The shelf index and offset within the shelf are computed dynamically using bit math.
+    pub const Index = u32;
 
-        pub fn init(shelf_index: usize, offset: usize) Index {
-            std.debug.assert(shelf_index < (1 << shelf_bit_count));
-            std.debug.assert(offset <= shelfCapacity(shelf_index));
-            return .{
-                .parts = .{
-                    .shelf = @intCast(shelf_index),
-                    .offset = @intCast(offset),
-                },
-            };
-        }
+    inline fn indexToLocation(idx: Index) Location {
+        const global_offset = @as(usize, idx);
+        // Given geometrically-sized shelves starting at base_unit:
+        // Shelf 0: base_unit bytes (offset 0 to base_unit-1)
+        // Shelf 1: 2*base_unit bytes (offset base_unit to 3*base_unit-1)
+        // Shelf N: 2^N * base_unit bytes
+        // Total bytes before shelf N: base_unit * (2^N - 1)
+        
+        // Find shelf: floor(log2((global_offset / base_unit) + 1))
+        const units = (global_offset >> base_shift) + 1;
+        const shelf_index = std.math.log2_int(usize, units);
+        
+        // Find offset within shelf
+        const shelf_start = shelfStartBytes(shelf_index);
+        const offset = global_offset - shelf_start;
+        
+        return .{ .shelf_index = shelf_index, .offset = offset };
+    }
 
-        pub fn shelfIndex(self: Index) usize {
-            return @as(usize, self.parts.shelf);
-        }
+    inline fn locationToIndex(loc: Location) Index {
+        const global_offset = shelfStartBytes(loc.shelf_index) + loc.offset;
+        return @intCast(global_offset);
+    }
 
-        pub fn byteOffset(self: Index) usize {
-            return @as(usize, self.parts.offset);
-        }
-
-        pub fn byteOffsetFromStart(self: Index) usize {
-            return shelfStartBytes(self.shelfIndex()) + self.byteOffset();
-        }
-
-        pub fn raw(self: Index) usize {
-            return self.word;
-        }
-
-        pub fn fromRaw(raw_word: usize) Index {
-            return .{ .word = raw_word };
-        }
-    };
-
-    pub const Slice = struct {
-        index: Index,
-        len: usize,
-
-        pub fn startIndex(self: Slice) Index {
-            return self.index;
-        }
-
-        pub fn shelfIndex(self: Slice) usize {
-            return self.index.shelfIndex();
-        }
-
-        pub fn byteOffset(self: Slice) usize {
-            return self.index.byteOffset();
-        }
-
-        pub fn length(self: Slice) usize {
-            return self.len;
-        }
-
-        pub fn byteOffsetFromStart(self: Slice) usize {
-            return self.index.byteOffsetFromStart();
-        }
-
-        pub fn skip(self: Slice, n: usize) Slice {
-            return self.limit(n, .unlimited);
-        }
-
-        pub fn limit(self: Slice, pos: usize, io_limit: std.Io.Limit) Slice {
-            const remaining = self.length() -| pos;
-            const allowed = switch (io_limit) {
-                .unlimited => remaining,
-                else => @min(@intFromEnum(io_limit), remaining),
-            };
-            const global_start = self.byteOffsetFromStart() + pos;
-            const next_loc = Self.locateIndex(global_start);
-            const next_index = Index.init(next_loc.shelf_index, next_loc.offset);
-            return init(next_index, allowed);
-        }
-
-        pub fn reader(self: Slice, buffer: *const Self, scratch: []u8) segments.SegmentsReader {
-            const i = self.shelfIndex();
-
-            return segments.SegmentsReader.init(
-                scratch,
-                buffer.shelves[i..],
-                self.byteOffset(),
-                .limited(self.len),
-            );
-        }
-
-        pub fn writer(self: Slice, buffer: *Self) segments.SegmentsWriter {
-            const i = self.shelfIndex();
-            const j = buffer.shelfCount();
-            var head = buffer.shelves[i][self.byteOffset()..];
-            head.len = @min(head.len, self.len);
-
-            const body = if (i < j) buffer.shelves[i + 1 .. j] else &.{};
-            return segments.SegmentsWriter.init(
-                head,
-                body,
-                .limited(self.len),
-            );
-        }
-
-        pub fn fromParts(index: Index, slice_len: usize) Slice {
-            return init(index, slice_len);
-        }
-
-        fn init(index: Index, slice_len: usize) Slice {
-            return .{ .index = index, .len = slice_len };
-        }
-    };
-
-    pub const AppendResult = struct {
-        slice: Slice,
-        view: SegmentedView,
-    };
+    /// A reference to a null-terminated contiguous string in the buffer.
+    /// Only stores the 32-bit byte offset; length is computed by scanning for the null terminator.
+    /// This reduces memory usage from 128 bits to 32 bits per reference.
+    pub const Slice = Index;
 
     shelves: [max_supported_shelves][]u8 = mem.zeroes([max_supported_shelves][]u8),
     shelf_count: u8 = 0,
@@ -214,6 +80,7 @@ pub const SegmentedStringBuffer = struct {
 
     pub const empty: Self = .{};
 
+    /// Free all allocated shelves.
     pub fn deinit(self: *Self, alloc: Allocator) void {
         const count = @as(usize, @atomicLoad(u8, &self.shelf_count, .acquire));
         var i: usize = 0;
@@ -225,79 +92,59 @@ pub const SegmentedStringBuffer = struct {
         self.* = undefined;
     }
 
+    /// Append a string to the buffer with a null terminator and return a slice pointing to it.
+    ///
+    /// A null byte is automatically appended after the string data.
+    /// The slice points to stable memory; subsequent appends do not invalidate it.
+    ///
+    /// Thread-safe: can be called concurrently from multiple threads.
     pub fn append(
         self: *Self,
         alloc: Allocator,
         bytes: []const u8,
     ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!Slice {
         if (bytes.len == 0) {
-            _ = try self.reserveRange(alloc, 0);
-            return Slice.fromParts(Index.init(0, 0), 0);
+            const start: u32 = @intCast(try self.reserveContiguous(alloc, 1));
+            const start_loc = indexToLocation(start);
+            self.shelves[start_loc.shelf_index][start_loc.offset] = 0;
+            return start;
         }
 
-        const start = try self.reserveRange(alloc, bytes.len);
-        const start_loc = Self.locateIndex(start);
-        self.writeRange(start_loc, bytes);
-        return Slice.fromParts(Index.init(start_loc.shelf_index, start_loc.offset), bytes.len);
+        const total_len = bytes.len + 1; // +1 for null terminator
+        const start: u32 = @intCast(try self.reserveContiguous(alloc, total_len));
+        const start_loc = indexToLocation(start);
+        const dest = self.shelves[start_loc.shelf_index][start_loc.offset .. start_loc.offset + total_len];
+        @memcpy(dest[0..bytes.len], bytes);
+        dest[bytes.len] = 0; // Add null terminator
+        return start;
     }
 
-    pub fn appendContiguous(
-        self: *Self,
-        alloc: Allocator,
-        bytes: []const u8,
-    ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!Slice {
-        if (bytes.len == 0) {
-            _ = try self.reserveRange(alloc, 0);
-            return Slice.fromParts(Index.init(0, 0), 0);
-        }
-
-        while (true) {
-            const len_snapshot = self.len();
-            try self.ensureCapacityTo(alloc, len_snapshot + bytes.len);
-            const loc = Self.locateIndex(len_snapshot);
-            const shelf = self.shelves[loc.shelf_index];
-            const available = shelf.len - loc.offset;
-
-            if (available > 0 and available < bytes.len) {
-                const start_pad = try self.reserveRange(alloc, available);
-                const pad_loc = Self.locateIndex(start_pad);
-                self.fillZeros(pad_loc, available);
-                continue;
-            }
-
-            const start = try self.reserveRange(alloc, bytes.len);
-            const start_loc = Self.locateIndex(start);
-            const start_shelf = self.shelves[start_loc.shelf_index];
-            if (start_shelf.len - start_loc.offset < bytes.len) {
-                self.fillZeros(start_loc, bytes.len);
-                continue;
-            }
-
-            self.writeRange(start_loc, bytes);
-            return Slice.fromParts(Index.init(start_loc.shelf_index, start_loc.offset), bytes.len);
-        }
-    }
-
+    /// Total bytes occupied (including padding/waste from straddling).
     pub fn len(self: *const Self) usize {
         return self.latch.len.load(.acquire);
     }
 
+    /// Alias for len().
     pub fn occupiedBytes(self: *const Self) usize {
         return self.len();
     }
 
+    /// Total bytes of allocated shelf space.
     pub fn capacityBytes(self: *const Self) usize {
         return self.latch.cap.load(.acquire);
     }
 
+    /// Number of shelves currently allocated.
     pub fn shelfCount(self: *const Self) usize {
         return @as(usize, @atomicLoad(u8, &self.shelf_count, .acquire));
     }
 
+    /// Check if the buffer is empty.
     pub fn isEmpty(self: *const Self) bool {
         return self.len() == 0;
     }
 
+    /// Get detailed statistics about buffer usage.
     pub fn debugStats(self: *const Self) DebugStats {
         return .{
             .shelf_count = @as(usize, @atomicLoad(u8, &self.shelf_count, .acquire)),
@@ -309,24 +156,71 @@ pub const SegmentedStringBuffer = struct {
 
     const empty_cstring = [_:0]u8{0};
 
+    /// Get the raw bytes for a slice (including the null terminator).
+    /// Scans for the null terminator to determine length.
     pub fn sliceBytes(self: *const Self, slice: Slice) []const u8 {
-        if (slice.len == 0) return &[_]u8{};
-        const shelf = self.shelves[slice.shelfIndex()];
-        const start = slice.byteOffset();
-        return shelf[start .. start + slice.len];
+        const loc = indexToLocation(slice);
+        const shelf = self.shelves[loc.shelf_index];
+        const string_len = mem.indexOfScalar(u8, shelf[loc.offset..], 0) orelse 0;
+        return shelf[loc.offset .. loc.offset + string_len + 1];
     }
 
+    /// Get the value bytes for a slice (excluding the null terminator).
+    /// Scans for the null terminator to determine length.
     pub fn sliceValue(self: *const Self, slice: Slice) []const u8 {
-        if (slice.len == 0) return &[_]u8{};
-        const range = self.sliceBytes(slice);
-        return range[0 .. range.len - 1];
+        const loc = indexToLocation(slice);
+        const shelf = self.shelves[loc.shelf_index];
+        const string_len = mem.indexOfScalar(u8, shelf[loc.offset..], 0) orelse 0;
+        return shelf[loc.offset .. loc.offset + string_len];
     }
 
+    /// Get the bytes as a null-terminated C string.
+    /// Scans for the null terminator to determine length.
     pub fn sliceCString(self: *const Self, slice: Slice) [:0]const u8 {
-        if (slice.len == 0) return empty_cstring[0..1 :0];
-        const shelf = self.shelves[slice.shelfIndex()];
-        const start = slice.byteOffset();
-        return shelf[start .. start + slice.len :0];
+        const loc = indexToLocation(slice);
+        const shelf = self.shelves[loc.shelf_index];
+        const string_len = mem.indexOfScalar(u8, shelf[loc.offset..], 0) orelse 0;
+        if (string_len == 0) return empty_cstring[0..1 :0];
+        return shelf[loc.offset .. loc.offset + string_len :0];
+    }
+
+    fn reserveContiguous(
+        self: *Self,
+        alloc: Allocator,
+        reserve_len: usize,
+    ) (Allocator.Error || error{ Overflow, ShelfLimitReached })!usize {
+        // Retry loop handles race conditions with concurrent appends:
+        // Between checking if we'd straddle and actually reserving, another thread
+        // might move the cursor forward. We recheck after each reservation.
+        while (true) {
+            const len_snapshot = self.len();
+            const loc = indexToLocation(@intCast(len_snapshot));
+            const shelf = self.shelves[loc.shelf_index];
+            const available_contiguously = shelf.len - loc.offset;
+
+            // Strings must be contiguous within a single shelf. If this append
+            // would straddle shelf boundaries, skip the remaining space on the
+            // current shelf. This waste is negligible since strings are short and
+            // shelves grow exponentially.
+            if (available_contiguously > 0 and available_contiguously < reserve_len) {
+                _ = try self.reserveRange(alloc, available_contiguously);
+                continue;
+            }
+
+            // Atomically reserve space for the string.
+            const start = try self.reserveRange(alloc, reserve_len);
+            const start_loc = indexToLocation(@intCast(start));
+            const start_shelf = self.shelves[start_loc.shelf_index];
+
+            // Race check: another thread may have moved us forward while we were
+            // reserving. Verify we still have contiguous space, retry if not.
+            if (start_shelf.len - start_loc.offset < reserve_len) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+
+            return start;
+        }
     }
 
     fn reserveRange(
@@ -338,9 +232,14 @@ pub const SegmentedStringBuffer = struct {
             return self.latch.len.load(.acquire);
         }
 
+        // The latch coordinates concurrent reservations atomically. Each thread
+        // gets a unique range of bytes that won't overlap with other threads.
         var reservation = try self.latch.reservation(reserve_len);
         while (true) {
+            // Ensure we have physical capacity for the reservation
             try self.ensureCapacityTo(alloc, reservation.len);
+
+            // Atomically claim the reservation if still valid, otherwise retry
             if (reservation.take()) |base| {
                 return base;
             }
@@ -354,10 +253,13 @@ pub const SegmentedStringBuffer = struct {
         alloc: Allocator,
         target: usize,
     ) (Allocator.Error || error{ShelfLimitReached})!void {
+        // Fast path: already have enough capacity
         while (true) {
             const snap = self.latch.snapshot();
             if (snap.cap >= target) return;
 
+            // The latch ensures only one thread grows at a time. Other threads
+            // wait for the grower to publish the new capacity.
             if (self.latch.acquireOrWaitFor(target)) |growth_value| {
                 var g = growth_value;
                 defer g.unlock();
@@ -368,40 +270,9 @@ pub const SegmentedStringBuffer = struct {
                 std.debug.assert(new_cap >= g.start_cap);
                 g.publishTo(new_cap);
             } else {
+                // Another thread grew the buffer, loop to recheck
                 return;
             }
-        }
-    }
-
-    fn writeRange(self: *Self, start_loc: Location, bytes: []const u8) void {
-        var remaining = bytes.len;
-        var written: usize = 0;
-        var shelf_index = start_loc.shelf_index;
-        var shelf_offset = start_loc.offset;
-
-        while (remaining != 0) {
-            const shelf = self.shelves[shelf_index];
-            const take = @min(remaining, shelf.len - shelf_offset);
-            @memcpy(shelf[shelf_offset .. shelf_offset + take], bytes[written .. written + take]);
-            remaining -= take;
-            written += take;
-            shelf_index += 1;
-            shelf_offset = 0;
-        }
-    }
-
-    fn fillZeros(self: *Self, start_loc: Location, count: usize) void {
-        var remaining = count;
-        var shelf_index = start_loc.shelf_index;
-        var shelf_offset = start_loc.offset;
-
-        while (remaining != 0) {
-            const shelf = self.shelves[shelf_index];
-            const take = @min(remaining, shelf.len - shelf_offset);
-            @memset(shelf[shelf_offset .. shelf_offset + take], 0);
-            remaining -= take;
-            shelf_index += 1;
-            shelf_offset = 0;
         }
     }
 
@@ -433,6 +304,8 @@ pub const SegmentedStringBuffer = struct {
         @atomicStore(u8, &self.shelf_count, @intCast(index + 1), .release);
     }
 
+    /// Calculate the capacity of a shelf at the given index.
+    /// Shelves grow exponentially: shelf 0 = 1KB, shelf 1 = 2KB, shelf 2 = 4KB, etc.
     pub fn shelfCapacity(index: usize) usize {
         if (index >= max_supported_shelves) return 0;
         var size: usize = base_unit;
@@ -464,17 +337,7 @@ pub const SegmentedStringBuffer = struct {
         return total;
     }
 
-    fn locateIndex(index: usize) Location {
-        var remaining = index;
-        var size: usize = base_unit;
-        var shelf_index: usize = 0;
-        while (remaining >= size) {
-            remaining -= size;
-            shelf_index += 1;
-            size = std.math.mul(usize, size, 2) catch break;
-        }
-        return .{ .shelf_index = shelf_index, .offset = remaining };
-    }
+
 
     fn toMutableShelfSlices(slice: [][]u8) [][]u8 {
         const ptr = @as([*][]u8, @ptrCast(slice.ptr));
@@ -487,11 +350,7 @@ fn expectViewEquals(
     buffer: *SegmentedStringBuffer,
     slice: SegmentedStringBuffer.Slice,
 ) !void {
-    var scratch: [4096]u8 = @splat(0);
-    var reader = slice.reader(buffer, &scratch);
-    const buf = try reader.reader.allocRemaining(std.testing.allocator, .unlimited);
-    defer std.testing.allocator.free(buf);
-    try std.testing.expectEqualStrings(expected, buf);
+    try std.testing.expectEqualStrings(expected, buffer.sliceValue(slice));
 }
 
 test "SegmentedStringBuffer append and view" {
@@ -502,12 +361,12 @@ test "SegmentedStringBuffer append and view" {
     const first = (try buffer.append(allocator, "hello"));
     const second = (try buffer.append(allocator, "world"));
 
-    try std.testing.expectEqual(@as(usize, 10), buffer.len());
+    try std.testing.expectEqual(@as(usize, 12), buffer.len()); // 5 + 1 + 5 + 1 (null terminators)
     try expectViewEquals("hello", &buffer, first);
     try expectViewEquals("world", &buffer, second);
 
     const stats = buffer.debugStats();
-    try std.testing.expectEqual(@as(usize, 10), stats.length);
+    try std.testing.expectEqual(@as(usize, 12), stats.length);
 }
 
 test "SegmentedStringBuffer spans multiple shelves" {
@@ -515,9 +374,10 @@ test "SegmentedStringBuffer spans multiple shelves" {
     const allocator = std.testing.allocator;
     defer buffer.deinit(allocator);
 
-    const first = try buffer.append(allocator, "a" ** SegmentedStringBuffer.first_shelf_bytes);
+    const first_data = "a" ** (SegmentedStringBuffer.first_shelf_bytes - 1); // Leave room for null
+    const first = try buffer.append(allocator, first_data);
     try std.testing.expectEqual(@as(usize, 1), buffer.shelfCount());
-    try std.testing.expectEqual(first.length(), SegmentedStringBuffer.first_shelf_bytes);
+    try std.testing.expectEqualStrings(first_data, buffer.sliceValue(first));
 
     const second_len = SegmentedStringBuffer.first_shelf_bytes + 128;
     const payload = try allocator.alloc(u8, second_len);
@@ -525,30 +385,11 @@ test "SegmentedStringBuffer spans multiple shelves" {
     @memset(payload, 'b');
 
     const second = try buffer.append(allocator, payload);
-    try std.testing.expectEqual(@as(usize, 2), buffer.shelfCount());
+    try std.testing.expectEqual(@as(usize, 2), buffer.shelfCount()); // Spans 2 shelves
     try expectViewEquals(payload, &buffer, second);
 }
 
-test "SegmentedStringBuffer SliceReader streams" {
-    var buffer = SegmentedStringBuffer.empty;
-    const allocator = std.testing.allocator;
-    defer buffer.deinit(allocator);
-
-    const text = "The quick brown fox jumps over the lazy dog";
-    const res = try buffer.append(allocator, text);
-
-    var reader = res.reader(&buffer, &[_]u8{});
-
-    var collected = std.Io.Writer.Allocating.init(allocator);
-    defer collected.deinit();
-
-    const wrote = try reader.reader.streamRemaining(&collected.writer);
-
-    try std.testing.expectEqual(text.len, wrote);
-    try std.testing.expectEqualSlices(u8, text, collected.written());
-}
-
-test "SegmentedStringBuffer appendContiguous keeps entries within shelf" {
+test "SegmentedStringBuffer append keeps entries within shelf" {
     var buffer = SegmentedStringBuffer.empty;
     const allocator = std.testing.allocator;
     defer buffer.deinit(allocator);
@@ -559,65 +400,11 @@ test "SegmentedStringBuffer appendContiguous keeps entries within shelf" {
     @memset(filler, 'x');
     _ = try buffer.append(allocator, filler);
 
-    const slice = try buffer.appendContiguous(allocator, &[_]u8{ 'n', 'a', 'm', 'e', 0 });
-    try std.testing.expectEqual(@as(usize, 1), slice.shelfIndex());
+    const slice = try buffer.append(allocator, "name");
+    // Check that it was placed on shelf 1 (second shelf) due to straddling
+    const loc = SegmentedStringBuffer.indexToLocation(slice);
+    try std.testing.expectEqual(@as(usize, 1), loc.shelf_index);
     try std.testing.expectEqualStrings("name", buffer.sliceValue(slice));
-}
-
-test "SegmentedStringBuffer SliceWriter writes within one shelf" {
-    var buffer = SegmentedStringBuffer.empty;
-    const allocator = std.testing.allocator;
-    defer buffer.deinit(allocator);
-
-    const initial = "........";
-    const res = try buffer.append(allocator, initial);
-
-    var writer = res.writer(&buffer);
-
-    try writer.writer().writeAll("ABC");
-    try writer.writer().writeAll("DEF");
-    try writer.writer().writeAll("GH");
-
-    try expectViewEquals("ABCDEFGH", &buffer, res);
-}
-
-test "SegmentedStringBuffer SliceWriter drains across shelves" {
-    var buffer = SegmentedStringBuffer.empty;
-    const allocator = std.testing.allocator;
-    defer buffer.deinit(allocator);
-
-    const total_len = SegmentedStringBuffer.first_shelf_bytes + 256;
-
-    const placeholder = try allocator.alloc(u8, total_len);
-    defer allocator.free(placeholder);
-    @memset(placeholder, '.');
-    const res = try buffer.append(allocator, placeholder);
-
-    const expected = try allocator.alloc(u8, total_len);
-    defer allocator.free(expected);
-    for (expected, 0..) |*byte, idx| {
-        byte.* = @intCast('a' + (idx % 26));
-    }
-
-    var writer = res.writer(&buffer);
-    try writer.writer().writeAll(expected);
-
-    try expectViewEquals(expected, &buffer, res);
-}
-
-test "SegmentedStringBuffer SliceWriter fails when exceeding slice length" {
-    var buffer = SegmentedStringBuffer.empty;
-    const allocator = std.testing.allocator;
-    defer buffer.deinit(allocator);
-
-    const initial = "xxxxx";
-    const res = try buffer.append(allocator, initial);
-
-    var writer = res.writer(&buffer);
-    try writer.writer().writeAll("abcde");
-    try std.testing.expectError(error.WriteFailed, writer.writer().writeAll("!"));
-
-    try expectViewEquals("abcde", &buffer, res);
 }
 
 test "SegmentedStringBuffer concurrent append" {

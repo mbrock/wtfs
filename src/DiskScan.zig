@@ -251,11 +251,8 @@ test "path helpers use shared directory data" {
         disk_scan.large_files.deinit(allocator);
     }
 
-    var root_tmp = [_]u8{ 'r', 'o', 'o', 't', 0 };
-    const root_slice = try disk_scan.names.appendContiguous(allocator, root_tmp[0..]);
-
-    var child_tmp = [_]u8{ 'c', 'h', 'i', 'l', 'd', 0 };
-    const child_slice = try disk_scan.names.appendContiguous(allocator, child_tmp[0..]);
+    const root_slice = try disk_scan.names.append(allocator, "root");
+    const child_slice = try disk_scan.names.append(allocator, "child");
 
     const root_index = try disk_scan.directories.addOne(allocator);
     disk_scan.directories.ptr(.parent, root_index).* = 0;
@@ -686,8 +683,8 @@ pub fn writeBinaryResults(
     var idx: usize = 0;
     while (idx < dir_len) : (idx += 1) {
         const slice = self.directories.ptr(.name_slice, idx).*;
-        if (slice.length() == 0) continue;
         const bytes = self.names.sliceBytes(slice);
+        if (bytes.len == 0) continue;
         try name_buffer.appendSlice(self.allocator, bytes);
     }
 
@@ -697,8 +694,8 @@ pub fn writeBinaryResults(
 
     for (large_name_slices) |slice| {
         const offset = name_buffer.items.len;
-        if (slice.length() != 0) {
-            const bytes = self.names.sliceBytes(slice);
+        const bytes = self.names.sliceBytes(slice);
+        if (bytes.len != 0) {
             try name_buffer.appendSlice(self.allocator, bytes);
         }
         try large_name_offsets.append(self.allocator, @intCast(offset));
