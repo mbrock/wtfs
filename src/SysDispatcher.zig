@@ -28,7 +28,7 @@ pub const Backend = switch (builtin.target.os.tag) {
 };
 
 const SyncBackend = struct {
-    pub fn init(_: *@This(), config: Config) !void {
+    pub fn init(_: *SyncBackend, config: Config) !void {
         _ = config;
     }
 
