@@ -54,33 +54,18 @@ pub fn storeName(self: *Context, name: []const u8) !SegmentedStringBuffer.Slice 
     var temp: [std.fs.max_name_bytes + 1]u8 = undefined;
     @memcpy(temp[0..name.len], name);
     temp[name.len] = 0;
-    return try self.names_buffer.append(self.allocator, temp[0 .. name.len + 1]);
+    return try self.names_buffer.appendContiguous(self.allocator, temp[0 .. name.len + 1]);
 }
 
-pub fn copyNameTo(
-    self: *Context,
+pub fn nameCString(
+    self: *const Context,
     slice: SegmentedStringBuffer.Slice,
-    dest: []u8,
-) ![:0]const u8 {
-    const required = slice.length();
-    if (dest.len < required) return error.NameBufferTooSmall;
-    var shelf_index = slice.shelfIndex();
-    var offset = slice.byteOffset();
-    var remaining = required;
-    var write_index: usize = 0;
+) [:0]const u8 {
+    return self.names_buffer.sliceCString(slice);
+}
 
-    while (remaining != 0) {
-        const shelf = self.names_buffer.shelves[shelf_index];
-        const available = shelf.len - offset;
-        const take = @min(remaining, available);
-        std.mem.copyForwards(u8, dest[write_index .. write_index + take], shelf[offset .. offset + take]);
-        remaining -= take;
-        write_index += take;
-        shelf_index += 1;
-        offset = 0;
-    }
-
-    return dest[0 .. required - 1 :0];
+pub fn directoryCString(self: *const Context, index: usize) [:0]const u8 {
+    return self.names_buffer.sliceCString(self.directories.ptr(.name_slice, index).*);
 }
 
 pub fn setTotals(self: *Context, index: usize, size: u64, files: usize) void {

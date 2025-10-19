@@ -200,9 +200,8 @@ fn writeFullPath(
     index: usize,
     writer: *std.Io.Writer,
 ) !void {
-    var name_tmp: [std.fs.max_name_bytes + 1]u8 = undefined;
     const name_slice = self.directories.ptr(.name_slice, index).*;
-    const name = try self.sliceToArray(name_slice, name_tmp[0..]);
+    const name = self.names.sliceValue(name_slice);
     const parent_index = self.directories.ptr(.parent, index).*;
 
     if (index != 0) {
@@ -222,8 +221,7 @@ fn buildFilePath(self: *Self, directory_index: usize, name_slice: SegmentedStrin
     const directory_path = try self.buildPath(directory_index);
     defer self.allocator.free(directory_path);
 
-    var name_tmp: [std.fs.max_name_bytes + 1]u8 = undefined;
-    const file_name = try self.sliceToArray(name_slice, name_tmp[0..]);
+    const file_name = self.names.sliceValue(name_slice);
 
     var writer = try std.Io.Writer.Allocating.initCapacity(
         self.allocator,
@@ -236,32 +234,6 @@ fn buildFilePath(self: *Self, directory_index: usize, name_slice: SegmentedStrin
     try writer.writer.writeAll(file_name);
 
     return try writer.toOwnedSlice();
-}
-
-fn sliceToArray(
-    self: *Self,
-    slice: SegmentedStringBuffer.Slice,
-    dest: []u8,
-) ![]const u8 {
-    if (slice.length() == 0) return "";
-    const total = slice.length();
-    if (dest.len < total) return error.NameBufferTooSmall;
-    var shelf_index = slice.shelfIndex();
-    var offset = slice.byteOffset();
-    var remaining = total;
-    var write_index: usize = 0;
-
-    while (remaining != 0) {
-        const shelf = self.names.shelves[shelf_index];
-        const available = shelf.len - offset;
-        const take = @min(remaining, available);
-        std.mem.copyForwards(u8, dest[write_index .. write_index + take], shelf[offset .. offset + take]);
-        remaining -= take;
-        write_index += take;
-        shelf_index += 1;
-        offset = 0;
-    }
-    return dest[0 .. total - 1];
 }
 
 pub fn freeNameBuffers(self: *Self) void {
@@ -280,10 +252,10 @@ test "path helpers use shared directory data" {
     }
 
     var root_tmp = [_]u8{ 'r', 'o', 'o', 't', 0 };
-    const root_slice = try disk_scan.names.append(allocator, root_tmp[0..]);
+    const root_slice = try disk_scan.names.appendContiguous(allocator, root_tmp[0..]);
 
     var child_tmp = [_]u8{ 'c', 'h', 'i', 'l', 'd', 0 };
-    const child_slice = try disk_scan.names.append(allocator, child_tmp[0..]);
+    const child_slice = try disk_scan.names.appendContiguous(allocator, child_tmp[0..]);
 
     const root_index = try disk_scan.directories.addOne(allocator);
     disk_scan.directories.ptr(.parent, root_index).* = 0;
@@ -293,15 +265,8 @@ test "path helpers use shared directory data" {
     disk_scan.directories.ptr(.parent, child_index).* = @intCast(root_index);
     disk_scan.directories.ptr(.name_slice, child_index).* = child_slice;
 
-    var scratch: [std.fs.max_name_bytes + 1]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "root",
-        try disk_scan.sliceToArray(root_slice, scratch[0..]),
-    );
-    try std.testing.expectEqualStrings(
-        "child",
-        try disk_scan.sliceToArray(child_slice, scratch[0..]),
-    );
+    try std.testing.expectEqualStrings("root", disk_scan.names.sliceValue(root_slice));
+    try std.testing.expectEqualStrings("child", disk_scan.names.sliceValue(child_slice));
 
     var root_buffer: [32]u8 = undefined;
     var root_writer = std.Io.Writer.fixed(&root_buffer);
@@ -722,9 +687,8 @@ pub fn writeBinaryResults(
     while (idx < dir_len) : (idx += 1) {
         const slice = self.directories.ptr(.name_slice, idx).*;
         if (slice.length() == 0) continue;
-        var tmp: [std.fs.max_name_bytes + 1]u8 = undefined;
-        _ = try self.sliceToArray(slice, tmp[0..]);
-        try name_buffer.appendSlice(self.allocator, tmp[0..slice.length()]);
+        const bytes = self.names.sliceBytes(slice);
+        try name_buffer.appendSlice(self.allocator, bytes);
     }
 
     var large_name_offsets = std.ArrayListUnmanaged(u32){};
@@ -734,9 +698,8 @@ pub fn writeBinaryResults(
     for (large_name_slices) |slice| {
         const offset = name_buffer.items.len;
         if (slice.length() != 0) {
-            var tmp: [std.fs.max_name_bytes + 1]u8 = undefined;
-            _ = try self.sliceToArray(slice, tmp[0..]);
-            try name_buffer.appendSlice(self.allocator, tmp[0..slice.length()]);
+            const bytes = self.names.sliceBytes(slice);
+            try name_buffer.appendSlice(self.allocator, bytes);
         }
         try large_name_offsets.append(self.allocator, @intCast(offset));
     }

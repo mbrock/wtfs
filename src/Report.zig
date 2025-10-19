@@ -250,8 +250,7 @@ pub fn printHeaviestDirectories(stdout: *Writer, data: ReportData, summary: Heav
         var indent = row.depth * 2;
         const indent_cap = if (max_width == 0 or max_width == 1) 0 else max_width - 1;
         if (indent > indent_cap) indent = indent_cap;
-        var name_tmp: [std.fs.max_name_bytes + 1]u8 = undefined;
-        const raw_name = try copyDirectoryName(data, row.index, name_tmp[0..]);
+        const raw_name = if (row.index == 0) "." else data.names.sliceValue(data.directories.ptr(.name_slice, row.index).*);
         const remaining = max_width - indent;
         const name_take = if (remaining == 0) 0 else @min(raw_name.len, remaining);
         const total = indent + name_take;
@@ -383,8 +382,7 @@ fn formatDirectoryLabel(
         buffer[i] = ' ';
     }
 
-    var name_tmp: [std.fs.max_name_bytes + 1]u8 = undefined;
-    const raw_name = try copyDirectoryName(data, index, name_tmp[0..]);
+    const raw_name = if (index == 0) "." else data.names.sliceValue(data.directories.ptr(.name_slice, index).*);
     const remaining = limit - indent_len;
     if (remaining == 0) return buffer[0..indent_len];
 
@@ -405,33 +403,6 @@ fn formatPercent(buf: []u8, value: u64, total: u64) ![]const u8 {
         (@as(f64, @floatFromInt(value)) / @as(f64, @floatFromInt(total))) * 100.0,
     );
     return try std.fmt.bufPrint(buf, "{d:.1}%", .{percent});
-}
-
-fn copyDirectoryName(
-    data: ReportData,
-    index: usize,
-    dest: []u8,
-) ![]const u8 {
-    const slice = data.directories.ptr(.name_slice, index).*;
-    if (slice.length() == 0) return "";
-    const total = slice.length();
-    if (dest.len < total) return error.NameBufferTooSmall;
-    var shelf_index = slice.shelfIndex();
-    var offset = slice.byteOffset();
-    var remaining = total;
-    var write_index: usize = 0;
-
-    while (remaining != 0) {
-        const shelf = data.names.shelves[shelf_index];
-        const available = shelf.len - offset;
-        const take = @min(remaining, available);
-        std.mem.copyForwards(u8, dest[write_index .. write_index + take], shelf[offset .. offset + take]);
-        remaining -= take;
-        write_index += take;
-        shelf_index += 1;
-        offset = 0;
-    }
-    return dest[0 .. total - 1];
 }
 
 pub fn formatBytes(buf: []u8, bytes: u64) ![]const u8 {

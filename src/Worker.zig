@@ -62,7 +62,6 @@ dispatcher: SysDispatcher.Backend,
 path_buffer: std.ArrayList(u8),
 progress_buffer: [256]u8,
 progress_writer: std.Io.Writer,
-namebuf: [std.fs.max_name_bytes]u8,
 scan_buffer: [1024 * 1024]u8,
 
 /// Performance tracking
@@ -84,7 +83,6 @@ pub fn directoryWorker(ctx: *Context) void {
         .path_buffer = std.ArrayList(u8).empty,
         .progress_buffer = undefined,
         .progress_writer = undefined,
-        .namebuf = undefined,
         .scan_buffer = undefined,
         .timer = std.time.Timer.start() catch |e| {
             std.debug.panic("timer start failed {t}", .{e});
@@ -124,8 +122,7 @@ fn processTask(self: *Worker, index: usize) void {
 
 /// Extract a name from the shared name pool (thread-safe)
 fn extractName(self: *Worker, index: usize) [:0]const u8 {
-    const slice = self.ctx.directories.ptr(.name_slice, index).*;
-    return self.ctx.copyNameTo(slice, self.namebuf[0..]) catch unreachable;
+    return self.ctx.directoryCString(index);
 }
 
 // ===== Directory Processing =====
