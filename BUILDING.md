@@ -11,7 +11,7 @@ zig build python
 This leverages Zig's excellent cross-compilation to build for all platforms:
 - `wtfs-linux-x86_64` (3.1 MB)
 - `wtfs-linux-aarch64` (3.3 MB)
-- `wtfs-macos-x86_64` (372 KB) 
+- `wtfs-macos-x86_64` (372 KB)
 - `wtfs-macos-aarch64` (358 KB)
 
 ### 2. Build one universal wheel

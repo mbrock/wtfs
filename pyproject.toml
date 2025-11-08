@@ -9,6 +9,7 @@ dependencies = [
 ]
 
 [project.scripts]
+wtfs = "wtfs.cli:main"
 wtfsdump = "wtfs.dump:main"
 
 [build-system]

@@ -125,7 +125,7 @@ pub fn build(b: *std.Build) !void {
 
     inline for (python_targets) |target_query| {
         const cross_target = b.resolveTargetQuery(target_query);
-        
+
         const cross_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = cross_target,
@@ -142,12 +142,12 @@ pub fn build(b: *std.Build) !void {
         const os_name = @tagName(target_query.os_tag.?);
         const arch_name = @tagName(target_query.cpu_arch.?);
         const platform_name = b.fmt("wtfs-{s}-{s}", .{ os_name, arch_name });
-        
+
         const install_bin = b.addInstallBinFile(
             cross_exe.getEmittedBin(),
             platform_name,
         );
-        
+
         python_step.dependOn(&install_bin.step);
     }
 }
