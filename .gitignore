@@ -5,4 +5,12 @@ zig-out
 # Nix outputs
 result
 result-*
+
+# Python
 __pycache__/
+.venv/
+*.egg-info/
+dist/
+build/
+uv.lock
+test-scan.bin

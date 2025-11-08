@@ -116,12 +116,28 @@ Save scan results to a compact binary format for later analysis:
 ```
 
 Binary format is `wtfsdumpv1` - a compact representation that preserves:
-- Complete directory tree structure
-- File and directory counts
+- Complete directory tree structure with **aggregated totals**
+- File and directory counts per directory
 - Size information
-- Large file tracking
+- Large file tracking (>= 100 MB by default)
 
 Typical compression: 200+ directories → ~9 KB binary file.
+
+**Python package available**: Uses [`uv`](https://docs.astral.sh/uv/) for fast, reliable package management. See [`tools/README.md`](tools/README.md) for details.
+
+```bash
+# Install dependencies
+uv sync
+
+# CLI usage (with beautiful rich output!)
+uv run wtfsdump scan.bin --top 50
+uv run wtfsdump scan.bin --find docker
+
+# Python library
+from wtfs import dump
+data = dump.load('scan.bin')
+print(f"{data.totals.directories:,} dirs, {data.totals.files:,} files")
+```
 
 
 ## Library API Usage
@@ -140,15 +156,15 @@ defer dir.close();
 
 // Configure which attributes to retrieve at compile time
 const mask = wtfs.AttrGroupMask{
-    .common = .{ 
+    .common = .{
         .name = true,        // File/directory name
         .obj_type = true,    // Object type (file/dir/symlink)
         .file_id = true,     // inode number
     },
-    .dir = .{ 
+    .dir = .{
         .entry_count = true,  // Number of entries in directory
     },
-    .file = .{ 
+    .file = .{
         .total_size = true,   // Logical file size
         .alloc_size = true,   // Allocated size on disk
     },
@@ -204,18 +220,18 @@ const MinimalEntry = wtfs.EntryFor(minimal_mask);
 
 // Request everything
 const full_mask = wtfs.AttrGroupMask{
-    .common = .{ 
-        .name = true, 
+    .common = .{
+        .name = true,
         .obj_type = true,
         .file_id = true,
         .fsid = true,
     },
-    .dir = .{ 
+    .dir = .{
         .linkcount = true,
         .entrycount = true,
         .allocsize = true,
     },
-    .file = .{ 
+    .file = .{
         .linkcount = true,
         .totalsize = true,
         .allocsize = true,

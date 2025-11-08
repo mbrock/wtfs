@@ -1,16 +1,22 @@
-# wtfsdump.py - Python Loader for wtfs Binary Dumps
+# wtfsdump - Python Loader for wtfs Binary Dumps
 
-Python library and CLI tool for reading wtfs binary dumps.
+Python library and CLI tool for reading wtfs binary dumps with beautiful output.
 
 ## Installation
 
-No dependencies required - just Python 3.7+
+Requires Python 3.11+ and uses [`uv`](https://docs.astral.sh/uv/) for package management.
 
 ```bash
-# Copy to your project
-cp tools/wtfsdump.py your_project/
+# Install the wtfs package (from repo root)
+uv sync
 
-# Or use directly
+# Activate the virtual environment
+source .venv/bin/activate
+
+# Or run directly without activating
+uv run wtfsdump scan.bin
+
+# Or use the standalone script (no dependencies)
 python3 tools/wtfsdump.py scan.bin
 ```
 
@@ -18,56 +24,72 @@ python3 tools/wtfsdump.py scan.bin
 
 ```bash
 # Show top 20 largest directories
-python3 wtfsdump.py scan.bin
+wtfsdump scan.bin
 
 # Show top 50
-python3 wtfsdump.py scan.bin --top 50
+wtfsdump scan.bin --top 50
 
 # Inspect specific directory
-python3 wtfsdump.py scan.bin --path ./home/user
+wtfsdump scan.bin --path ./home/user
 
 # Find directories matching pattern
-python3 wtfsdump.py scan.bin --find docker
+wtfsdump scan.bin --find docker
 ```
+
+### Example Output
+
+The tool provides beautiful, color-coded tables with:
+
+- **Scan Summary Panel**: Shows total directories, files, and size at a glance
+- **Largest Directories Table**: Lists directories sorted by size with columns for:
+  - Path (cyan)
+  - Size (yellow, human-readable)
+  - File count (green)
+  - Subdirectory count (blue)
+  - Share percentage (magenta)
+- **Large Files Table**: Shows individual large files (≥100 MB)
+- **Directory Details**: When using `--path`, shows a clean summary with children
+
+All output uses Rich for beautiful formatting with colors, borders, and proper alignment.
 
 ## Library Usage
 
 ```python
-import wtfsdump
+from wtfs import dump
 
 # Load dump
-dump = wtfsdump.load('scan.bin')
+data = dump.load('scan.bin')
 
 # Access totals
-print(f"Total: {dump.totals.directories} dirs, {dump.totals.files} files")
-print(f"Size: {wtfsdump.format_size(dump.totals.bytes)}")
+print(f"Total: {data.totals.directories} dirs, {data.totals.files} files")
+print(f"Size: {dump.format_size(data.totals.bytes)}")
 
 # Iterate all directories
-for dir in dump.directories:
+for dir in data.directories:
     print(f"{dir.path}: {dir.total_size} bytes, {dir.total_files} files")
 
 # Get specific directory
-home = dump.get_directory('/home/user')
+home = data.get_directory('/home/user')
 if home:
     print(f"Home size: {home.total_size}")
 
 # Get children
-children = dump.get_children('/home/user')
+children = data.get_children('/home/user')
 for child in children:
     print(f"  {child.name}: {child.total_size} bytes")
 
 # Find directories
-docker_dirs = dump.find_directories('docker')
+docker_dirs = data.find_directories('docker')
 for dir in docker_dirs:
     print(f"{dir.path}: {dir.total_size} bytes")
 
 # Access large files
-for lf in dump.large_files:
+for lf in data.large_files:
     print(f"{lf.path}: {lf.size} bytes")
 
 # Find biggest directory (excluding root)
-biggest = max(dump.directories, key=lambda d: d.total_size if d.index != 0 else 0)
-print(f"Biggest: {biggest.path} - {wtfsdump.format_size(biggest.total_size)}")
+biggest = max(data.directories, key=lambda d: d.total_size if d.index != 0 else 0)
+print(f"Biggest: {biggest.path} - {dump.format_size(biggest.total_size)}")
 ```
 
 ## Data Model
@@ -111,46 +133,52 @@ print(f"Biggest: {biggest.path} - {wtfsdump.format_size(biggest.total_size)}")
 ### Find space hogs in /var
 
 ```python
-dump = wtfsdump.load('root.bin')
-var = dump.get_directory('./var')
-children = sorted(dump.get_children('./var'), key=lambda d: d.total_size, reverse=True)
+from wtfs import dump
 
-print(f"/var: {wtfsdump.format_size(var.total_size)}")
+data = dump.load('root.bin')
+var = data.get_directory('./var')
+children = sorted(data.get_children('./var'), key=lambda d: d.total_size, reverse=True)
+
+print(f"/var: {dump.format_size(var.total_size)}")
 for child in children[:10]:
     pct = 100 * child.total_size / var.total_size
-    print(f"  {child.name:20} {wtfsdump.format_size(child.total_size):>10} ({pct:4.1f}%)")
+    print(f"  {child.name:20} {dump.format_size(child.total_size):>10} ({pct:4.1f}%)")
 ```
 
 ### Analyze Docker overlay directories
 
 ```python
-dump = wtfsdump.load('root.bin')
-docker_dirs = dump.find_directories('overlay2')
+from wtfs import dump
+
+data = dump.load('root.bin')
+docker_dirs = data.find_directories('overlay2')
 
 total = sum(d.total_size for d in docker_dirs)
-print(f"Docker overlay2 total: {wtfsdump.format_size(total)}")
+print(f"Docker overlay2 total: {dump.format_size(total)}")
 print(f"Found {len(docker_dirs)} overlay directories")
 
 # Top 10 largest
 for dir in sorted(docker_dirs, key=lambda d: d.total_size, reverse=True)[:10]:
-    print(f"  {wtfsdump.format_size(dir.total_size):>10} {dir.path}")
+    print(f"  {dump.format_size(dir.total_size):>10} {dir.path}")
 ```
 
 ### Compare snapshots
 
 ```python
-old = wtfsdump.load('scan-2024-01.bin')
-new = wtfsdump.load('scan-2024-02.bin')
+from wtfs import dump
+
+old = dump.load('scan-2024-01.bin')
+new = dump.load('scan-2024-02.bin')
 
 print(f"Files: {old.totals.files:,} → {new.totals.files:,} ({new.totals.files - old.totals.files:+,})")
-print(f"Size: {wtfsdump.format_size(old.totals.bytes)} → {wtfsdump.format_size(new.totals.bytes)}")
+print(f"Size: {dump.format_size(old.totals.bytes)} → {dump.format_size(new.totals.bytes)}")
 
 # Find directories that grew
 for old_dir, new_dir in zip(old.directories, new.directories):
     if old_dir.path == new_dir.path:
         growth = new_dir.total_size - old_dir.total_size
         if growth > 1024 * 1024 * 100:  # > 100 MB
-            print(f"  {old_dir.path}: +{wtfsdump.format_size(growth)}")
+            print(f"  {old_dir.path}: +{dump.format_size(growth)}")
 ```
 
 ## Binary Format
