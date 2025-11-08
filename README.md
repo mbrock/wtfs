@@ -145,6 +145,38 @@ uv run wtfsdump scan.bin --top 50
 uv run wtfsdump scan.bin --find docker
 ```
 
+### Interactive TUI Mode
+
+The Python package includes a beautiful interactive terminal UI powered by [Textual](https://github.com/Textualize/textual):
+
+```bash
+# Scan and launch interactive browser
+uv run wtfs -i .
+
+# Or load an existing scan
+uv run wtfs --load scan.bin -i
+
+# Or use the dedicated TUI command
+uv run wtfs-tui scan.bin
+```
+
+**Features:**
+- 📊 **Real-time filtering** - Type to filter directories as you browse
+- 🔄 **Multiple sort modes** - Sort by size (`s`), name (`n`), or file count (`f`)
+- 📑 **Tabbed interface** - Switch between directories and large files views
+- ⌨️ **Keyboard shortcuts** - Full keyboard navigation (arrow keys, Tab, etc.)
+- 🎨 **Beautiful UI** - Clean, modern interface with colors and formatting
+
+**Keyboard Shortcuts:**
+- `s` - Sort by size
+- `n` - Sort by name
+- `f` - Sort by file count
+- `Tab` - Switch between Directories and Large Files tabs
+- `q` - Quit
+- `Ctrl+P` - Command palette
+
+The interactive mode makes it easy to explore large directory structures and quickly find what's taking up space!
+
 
 ## Library API Usage
 

@@ -16,14 +16,17 @@ def main():
         description='Fast directory scanner with beautiful output',
         epilog='Examples:\n'
                '  wtfs /home/user              # Scan and show results\n'
+               '  wtfs -i .                    # Scan and launch interactive browser\n'
                '  wtfs --save scan.bin ~       # Scan and save to file\n'
-               '  wtfs --load scan.bin         # Load and display saved scan\n',
+               '  wtfs --load scan.bin -i      # Load and browse interactively\n',
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     parser.add_argument('path', nargs='?', default='.', help='Directory to scan (default: current)')
     parser.add_argument('--save', metavar='FILE', help='Save binary dump to file')
     parser.add_argument('--load', metavar='FILE', help='Load and display existing dump')
+    parser.add_argument('--interactive', '-i', action='store_true',
+                       help='Launch interactive TUI browser')
     parser.add_argument('--skip-hidden', action='store_true', help='Skip hidden files/directories')
     parser.add_argument('--threshold', type=str, default='100M',
                        help='Large file threshold (default: 100M)')
@@ -35,8 +38,12 @@ def main():
     try:
         if args.load:
             # Load existing dump
-            data = dump.load(args.load)
-            show_results(console, data, args.top)
+            if args.interactive:
+                from .tui import run_interactive
+                run_interactive(args.load)
+            else:
+                data = dump.load(args.load)
+                show_results(console, data, args.top)
         else:
             # Scan directory
             threshold = parse_size(args.threshold)
@@ -48,12 +55,17 @@ def main():
             with console.status(f"[bold cyan]Scanning {args.path}..."):
                 results = scanner.scan(args.path, output_file=args.save)
 
-            # Load and display
-            data = dump.load(results['dump_file'])
-            show_results(console, data, args.top)
+            # Launch interactive or display results
+            if args.interactive:
+                from .tui import run_interactive
+                run_interactive(results['dump_file'])
+            else:
+                # Load and display
+                data = dump.load(results['dump_file'])
+                show_results(console, data, args.top)
 
-            if args.save:
-                console.print(f"\n[dim]Saved to: {args.save}[/dim]")
+                if args.save:
+                    console.print(f"\n[dim]Saved to: {args.save}[/dim]")
 
     except Exception as e:
         console.print(f"[bold red]Error:[/bold red] {e}", file=sys.stderr)
