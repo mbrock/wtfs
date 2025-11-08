@@ -2,3 +2,6 @@
 zig-out
 *.log
 
+# Nix outputs
+result
+result-*

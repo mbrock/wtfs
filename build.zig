@@ -77,5 +77,4 @@ pub fn build(b: *std.Build) !void {
     mac_step.dependOn(&mac_exe.step);
 
     b.installArtifact(exe_wtfscan);
-    b.installArtifact(exe_tests);
 }
