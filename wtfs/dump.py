@@ -206,10 +206,13 @@ def main():
     import sys
     import argparse
     from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich.text import Text
-    from rich import box
+
+    from .display import (
+        display_totals_panel,
+        display_top_directories,
+        display_large_files,
+        display_directory_info,
+    )
 
     parser = argparse.ArgumentParser(description='Inspect wtfs binary dumps')
     parser.add_argument('dump', help='Binary dump file')
@@ -225,110 +228,40 @@ def main():
         dump = load(args.dump)
 
     # Show totals in a nice panel
-    totals_text = Text()
-    totals_text.append(f"{dump.totals.directories:,}", style="bold cyan")
-    totals_text.append(" directories  ")
-    totals_text.append(f"{dump.totals.files:,}", style="bold green")
-    totals_text.append(" files  ")
-    totals_text.append(f"{format_size(dump.totals.bytes)}", style="bold yellow")
-
-    console.print(Panel(totals_text, title="[bold]Scan Summary", border_style="blue"))
+    display_totals_panel(console, dump.totals, title="Scan Summary")
 
     if args.path:
         dir = dump.get_directory(args.path)
         if dir:
-            # Show directory details
-            info_table = Table(show_header=False, box=box.SIMPLE, padding=(0, 2))
-            info_table.add_column("Property", style="cyan")
-            info_table.add_column("Value", style="yellow")
-
-            info_table.add_row("Path", dir.path)
-            info_table.add_row("Size", format_size(dir.total_size))
-            info_table.add_row("Files", f"{dir.total_files:,}")
-            info_table.add_row("Subdirectories", f"{dir.total_dirs:,}")
-
-            console.print(f"\n[bold]Directory Info[/bold]")
-            console.print(info_table)
-
             children = dump.get_children(args.path)
-            if children:
-                children_table = Table(title="Top Children", box=box.ROUNDED)
-                children_table.add_column("Name", style="cyan", no_wrap=False)
-                children_table.add_column("Size", justify="right", style="yellow")
-                children_table.add_column("Files", justify="right", style="green")
-
-                for child in sorted(children, key=lambda d: d.total_size, reverse=True)[:10]:
-                    children_table.add_row(
-                        child.name,
-                        format_size(child.total_size),
-                        f"{child.total_files:,}",
-                    )
-
-                console.print(children_table)
+            display_directory_info(console, dir, children)
         else:
             console.print(f'[bold red]Directory not found:[/bold red] {args.path}')
 
     elif args.find:
         dirs = dump.find_directories(args.find)
-
-        table = Table(
-            title=f'Found {len(dirs)} directories matching "{args.find}"',
-            box=box.ROUNDED,
+        title = f'Found {len(dirs)} directories matching "{args.find}"'
+        display_top_directories(
+            console,
+            dirs,
+            dump.totals.bytes,
+            limit=args.top,
+            title=title,
         )
-        table.add_column("Path", style="cyan", no_wrap=False)
-        table.add_column("Size", justify="right", style="yellow")
-        table.add_column("Files", justify="right", style="green")
-        table.add_column("Share", justify="right", style="magenta")
-
-        for dir in sorted(dirs, key=lambda d: d.total_size, reverse=True)[:args.top]:
-            pct = 100 * dir.total_size / dump.totals.bytes if dump.totals.bytes else 0
-            table.add_row(
-                dir.path,
-                format_size(dir.total_size),
-                f"{dir.total_files:,}",
-                f"{pct:.1f}%",
-            )
-
-        console.print(table)
 
     else:
         # Show top directories
-        top_dirs = sorted(dump.directories, key=lambda d: d.total_size, reverse=True)
-
-        table = Table(
+        display_top_directories(
+            console,
+            dump.directories,
+            dump.totals.bytes,
+            limit=args.top,
             title=f"Top {args.top} Largest Directories",
-            box=box.ROUNDED,
+            show_subdirs=True,
         )
-        table.add_column("Path", style="cyan", no_wrap=False)
-        table.add_column("Size", justify="right", style="yellow")
-        table.add_column("Files", justify="right", style="green")
-        table.add_column("Subdirs", justify="right", style="blue")
-        table.add_column("Share", justify="right", style="magenta")
 
-        for dir in top_dirs[:args.top]:
-            pct = 100 * dir.total_size / dump.totals.bytes if dump.totals.bytes else 0
-            table.add_row(
-                dir.path,
-                format_size(dir.total_size),
-                f"{dir.total_files:,}",
-                f"{dir.total_dirs:,}",
-                f"{pct:.1f}%",
-            )
-
-        console.print(table)
-
-    if dump.large_files:
-        lf_table = Table(
-            title=f"Large Files ({len(dump.large_files)} total, showing top 10)",
-            box=box.ROUNDED,
-        )
-        lf_table.add_column("Path", style="cyan", no_wrap=False)
-        lf_table.add_column("Size", justify="right", style="yellow")
-
-        for lf in sorted(dump.large_files, key=lambda f: f.size, reverse=True)[:10]:
-            lf_table.add_row(lf.path, format_size(lf.size))
-
-        console.print(lf_table)
+    # Always show large files if available
+    display_large_files(console, dump.large_files, limit=10)
 
 
 if __name__ == '__main__':
