@@ -43,10 +43,12 @@ pub fn main() !void {
     var root_arg: ?[]const u8 = null;
     var large_file_threshold = DiskScan.default_large_file_threshold;
     var binary_output: ?[]const u8 = null;
+    var binary_input: ?[]const u8 = null;
     var dump_structs = false;
 
     const threshold_prefix = "--large-file-threshold=";
-    const binary_prefix = "--binary-output=";
+    const binary_output_prefix = "--binary-output=";
+    const binary_input_prefix = "--binary-input=";
 
     defer stderr.flush() catch {};
 
@@ -66,6 +68,15 @@ pub fn main() !void {
             binary_output = std.mem.sliceTo(args[arg_index], 0);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--binary-input")) {
+            arg_index += 1;
+            if (arg_index >= args.len) {
+                try printUsage(exe_name);
+                return;
+            }
+            binary_input = std.mem.sliceTo(args[arg_index], 0);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--large-file-threshold")) {
             arg_index += 1;
             if (arg_index >= args.len) {
@@ -80,8 +91,12 @@ pub fn main() !void {
             };
             continue;
         }
-        if (std.mem.startsWith(u8, arg, binary_prefix)) {
-            binary_output = arg[binary_prefix.len..];
+        if (std.mem.startsWith(u8, arg, binary_output_prefix)) {
+            binary_output = arg[binary_output_prefix.len..];
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, binary_input_prefix)) {
+            binary_input = arg[binary_input_prefix.len..];
             continue;
         }
         if (std.mem.startsWith(u8, arg, threshold_prefix)) {
@@ -127,7 +142,25 @@ pub fn main() !void {
         diskScan.large_files.deinit(allocator);
     }
 
-    if (binary_output) |path| {
+    if (binary_input) |path| {
+        // Load from binary dump
+        var binary_file = try std.fs.cwd().openFile(path, .{});
+        defer binary_file.close();
+
+        var binary_buffer: [16 * 1024]u8 = undefined;
+        var file_reader = binary_file.reader(binary_buffer[0..]);
+
+        const results = try diskScan.readBinaryResults(&file_reader.interface);
+
+        // Show all loaded large files regardless of threshold
+        diskScan.large_file_threshold = 0;
+
+        // Generate and display summary
+        var summary = try diskScan.generateSummary();
+        defer summary.deinit(allocator);
+
+        try diskScan.reportResults(results, summary);
+    } else if (binary_output) |path| {
         var binary_file = try std.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
         defer binary_file.close();
 
@@ -188,10 +221,11 @@ fn parseSize(value: []const u8) !u64 {
 
 fn printUsage(exe_name: []const u8) !void {
     try stderr.print(
-        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [--dump-structs] [dir]\n",
+        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [--binary-input PATH] [--dump-structs] [dir]\n",
         .{exe_name},
     );
     try stderr.print("       SIZE accepts optional K/M/G/T suffix (base 1024)\n", .{});
+    try stderr.print("       --binary-input: load scan results from file instead of scanning\n", .{});
 }
 
 fn dumpStructLayouts() !void {

@@ -51,7 +51,7 @@ const Summary = struct {
     heaviest: std.ArrayList(SummaryEntry),
     large_files: std.ArrayList(FileSummaryEntry),
 
-    fn deinit(self: *Summary, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Summary, allocator: std.mem.Allocator) void {
         freeEntryList(allocator, &self.top_level);
         freeEntryList(allocator, &self.heaviest);
         freeFileEntryList(allocator, &self.large_files);
@@ -576,7 +576,7 @@ fn performScan(self: *Self) !ScanResults {
     };
 }
 
-fn generateSummary(self: *Self) !Summary {
+pub fn generateSummary(self: *Self) !Summary {
     var summary = Summary{
         .top_level = std.ArrayList(SummaryEntry){},
         .heaviest = std.ArrayList(SummaryEntry){},
@@ -593,7 +593,7 @@ fn generateSummary(self: *Self) !Summary {
     return summary;
 }
 
-fn reportResults(self: *Self, results: ScanResults, summary: Summary) !void {
+pub fn reportResults(self: *Self, results: ScanResults, summary: Summary) !void {
     const report_data = Reporter.ReportData.init(
         &self.directories,
         &self.names,
@@ -668,14 +668,13 @@ pub fn writeBinaryResults(
     results: ScanResults,
     writer: *std.Io.Writer,
 ) !void {
-    const magic = "wtfsdumpv0.0   \n";
-    const large_slices = self.large_files.slice();
-    const large_dirs = large_slices.items(.directory_index);
-    const large_name_slices = large_slices.items(.name_slice);
-    const large_sizes = large_slices.items(.size);
+    const magic = "wtfsdumpv1     \n";
 
+    // Write header
     try writer.writeAll(magic);
     try writer.writeStruct(results.totals, .little);
+
+    // Build name buffer from segmented storage
     var name_buffer = std.ArrayListUnmanaged(u8){};
     defer name_buffer.deinit(self.allocator);
 
@@ -684,68 +683,203 @@ pub fn writeBinaryResults(
     while (idx < dir_len) : (idx += 1) {
         const slice = self.directories.ptr(.name_slice, idx).*;
         const str = self.names.get(slice);
-        if (str.len == 0) continue;
-        // Include the null terminator in serialization
         try name_buffer.appendSlice(self.allocator, str);
         try name_buffer.append(self.allocator, 0);
     }
 
-    var large_name_offsets = std.ArrayListUnmanaged(u32){};
-    defer large_name_offsets.deinit(self.allocator);
-    try large_name_offsets.ensureTotalCapacityPrecise(self.allocator, large_name_slices.len);
-
-    for (large_name_slices) |slice| {
-        const offset = name_buffer.items.len;
+    // Append large file names after directory names
+    const large_slices = self.large_files.slice();
+    idx = 0;
+    while (idx < large_slices.len) : (idx += 1) {
+        const slice = large_slices.items(.name_slice)[idx];
         const str = self.names.get(slice);
-        if (str.len != 0) {
-            try name_buffer.appendSlice(self.allocator, str);
-            try name_buffer.append(self.allocator, 0);
-        }
-        try large_name_offsets.append(self.allocator, @intCast(offset));
+        try name_buffer.appendSlice(self.allocator, str);
+        try name_buffer.append(self.allocator, 0);
     }
 
+    // Write name buffer
+    const name_len: u64 = @intCast(name_buffer.items.len);
+    try writer.writeInt(u64, name_len, .little);
     try writer.writeAll(name_buffer.items);
 
-    // const len_snapshot = self.directories.len.load(.acquire);
-    // const snapshot = self.directories.slices();
+    // Write directory count and data
+    const dir_count: u64 = @intCast(dir_len);
+    try writer.writeInt(u64, dir_count, .little);
 
-    // var buf32: [4]u8 = undefined;
-    // var buf64: [8]u8 = undefined;
+    idx = 0;
+    while (idx < dir_len) : (idx += 1) {
+        const parent = self.directories.ptr(.parent, idx).*;
+        try writer.writeInt(u32, parent, .little);
+    }
 
-    // var idx: usize = 0;
-    // while (idx < len_snapshot) : (idx += 1) {
-    //     std.mem.writeIntLittle(u32, buf32[0..], self.directories.ptr(.parent, idx).*);
-    //     try writer.writeAll(buf32[0..]);
-    // }
+    idx = 0;
+    while (idx < dir_len) : (idx += 1) {
+        const name_slice = self.directories.ptr(.name_slice, idx).*;
+        try writer.writeInt(u32, name_slice, .little);
+    }
 
-    // idx = 0;
-    // while (idx < len_snapshot) : (idx += 1) {
-    //     std.mem.writeIntLittle(u32, buf32[0..], self.directories.ptr(.basename, idx).*);
-    //     try writer.writeAll(buf32[0..]);
-    // }
+    idx = 0;
+    while (idx < dir_len) : (idx += 1) {
+        const total_size = self.directories.ptr(.total_size, idx).*;
+        try writer.writeInt(u64, total_size, .little);
+    }
 
-    // idx = 0;
-    // while (idx < len_snapshot) : (idx += 1) {
-    //     std.mem.writeIntLittle(u64, buf64[0..], self.directories.ptr(.total_size, idx).*);
-    //     try writer.writeAll(buf64[0..]);
-    // }
+    idx = 0;
+    while (idx < dir_len) : (idx += 1) {
+        const total_files: u64 = @intCast(self.directories.ptr(.total_files, idx).*);
+        try writer.writeInt(u64, total_files, .little);
+    }
 
-    // idx = 0;
-    // while (idx < len_snapshot) : (idx += 1) {
-    //     const value: u64 = @intCast(self.directories.ptr(.total_files, idx).*);
-    //     std.mem.writeIntLittle(u64, buf64[0..], value);
-    //     try writer.writeAll(buf64[0..]);
-    // }
+    idx = 0;
+    while (idx < dir_len) : (idx += 1) {
+        const total_dirs: u64 = @intCast(self.directories.ptr(.total_dirs, idx).*);
+        try writer.writeInt(u64, total_dirs, .little);
+    }
 
-    // idx = 0;
-    // while (idx < len_snapshot) : (idx += 1) {
-    //     const value: u64 = @intCast(self.directories.ptr(.total_dirs, idx).*);
-    //     std.mem.writeIntLittle(u64, buf64[0..], value);
-    //     try writer.writeAll(buf64[0..]);
-    // }
+    // Write large files
+    const large_count: u64 = @intCast(large_slices.len);
+    try writer.writeInt(u64, large_count, .little);
 
-    try writer.writeSliceEndian(usize, large_dirs, .little);
-    try writer.writeSliceEndian(u32, large_name_offsets.items, .little);
-    try writer.writeSliceEndian(u64, large_sizes, .little);
+    idx = 0;
+    while (idx < large_slices.len) : (idx += 1) {
+        const dir_index: u64 = @intCast(large_slices.items(.directory_index)[idx]);
+        try writer.writeInt(u64, dir_index, .little);
+    }
+
+    idx = 0;
+    while (idx < large_slices.len) : (idx += 1) {
+        const name_slice = large_slices.items(.name_slice)[idx];
+        try writer.writeInt(u32, name_slice, .little);
+    }
+
+    idx = 0;
+    while (idx < large_slices.len) : (idx += 1) {
+        const size = large_slices.items(.size)[idx];
+        try writer.writeInt(u64, size, .little);
+    }
+
     try writer.flush();
+}
+
+pub fn readBinaryResults(
+    self: *Self,
+    reader: *std.Io.Reader,
+) !ScanResults {
+    // Read and verify magic header
+    var magic_buf: [16]u8 = undefined;
+    try reader.readSliceAll(&magic_buf);
+
+    if (!std.mem.eql(u8, magic_buf[0..10], "wtfsdumpv1")) {
+        // Try old formats
+        if (std.mem.eql(u8, magic_buf[0..13], "wtfsdumpv0.1 ") or
+            std.mem.eql(u8, magic_buf[0..13], "wtfsdumpv0.0 "))
+        {
+            return error.OldFormatNotSupported;
+        }
+        return error.InvalidMagicHeader;
+    }
+
+    // Read totals
+    const totals = try reader.takeStruct(DirectoryTotals, .little);
+
+    // Read name buffer
+    const name_len = try reader.takeInt(u64, .little);
+    var name_buffer = try self.allocator.alloc(u8, @intCast(name_len));
+    defer self.allocator.free(name_buffer);
+    try reader.readSliceAll(name_buffer);
+
+    // Store names in segmented buffer and collect slice indices
+    var name_slices = std.ArrayList(u32){};
+    defer name_slices.deinit(self.allocator);
+
+    var name_offset: usize = 0;
+    while (name_offset < name_buffer.len) {
+        const str_start = name_offset;
+        while (name_offset < name_buffer.len and name_buffer[name_offset] != 0) {
+            name_offset += 1;
+        }
+        const str = name_buffer[str_start..name_offset];
+        const slice_idx = try self.names.append(self.allocator, str);
+        try name_slices.append(self.allocator, slice_idx);
+        name_offset += 1; // Skip null terminator
+    }
+
+    // Read directory count and data
+    const dir_count = try reader.takeInt(u64, .little);
+    const dir_len: usize = @intCast(dir_count);
+
+    // Pre-allocate directories
+    try self.directories.ensureTotalCapacity(self.allocator, dir_len);
+
+    // Read parents
+    var idx: usize = 0;
+    while (idx < dir_len) : (idx += 1) {
+        _ = try self.directories.addOne(self.allocator);
+        const parent = try reader.takeInt(u32, .little);
+        self.directories.ptr(.parent, idx).* = parent;
+    }
+
+    // Read name slices (but ignore them - we use our collected slices)
+    idx = 0;
+    while (idx < dir_len) : (idx += 1) {
+        _ = try reader.takeInt(u32, .little); // Read and discard old slice
+        // Use the slice we got from appending to the segmented buffer
+        self.directories.ptr(.name_slice, idx).* = name_slices.items[idx];
+    }
+
+    // Read total sizes
+    idx = 0;
+    while (idx < dir_len) : (idx += 1) {
+        const total_size = try reader.takeInt(u64, .little);
+        self.directories.ptr(.total_size, idx).* = total_size;
+    }
+
+    // Read total files
+    idx = 0;
+    while (idx < dir_len) : (idx += 1) {
+        const total_files = try reader.takeInt(u64, .little);
+        self.directories.ptr(.total_files, idx).* = @intCast(total_files);
+    }
+
+    // Read total dirs
+    idx = 0;
+    while (idx < dir_len) : (idx += 1) {
+        const total_dirs = try reader.takeInt(u64, .little);
+        self.directories.ptr(.total_dirs, idx).* = @intCast(total_dirs);
+    }
+
+    // Read large files
+    const large_count = try reader.takeInt(u64, .little);
+    const large_len: usize = @intCast(large_count);
+
+    try self.large_files.ensureTotalCapacity(self.allocator, large_len);
+
+    idx = 0;
+    while (idx < large_len) : (idx += 1) {
+        const dir_index = try reader.takeInt(u64, .little);
+        try self.large_files.append(self.allocator, .{
+            .directory_index = @intCast(dir_index),
+            .name_slice = 0,
+            .size = 0,
+        });
+    }
+
+    idx = 0;
+    while (idx < large_len) : (idx += 1) {
+        _ = try reader.takeInt(u32, .little); // Read and discard old slice
+        // Large file names come after directory names in the slice array
+        const slice_idx = dir_len + idx;
+        self.large_files.items(.name_slice)[idx] = name_slices.items[slice_idx];
+    }
+
+    idx = 0;
+    while (idx < large_len) : (idx += 1) {
+        const size = try reader.takeInt(u64, .little);
+        self.large_files.items(.size)[idx] = size;
+    }
+
+    return .{
+        .elapsed_ns = 0,
+        .totals = totals,
+    };
 }

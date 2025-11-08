@@ -1,18 +1,61 @@
 # wtfs
 
-Zig bindings for the `getattrlistbulk` syscall on macOS (and potentially FreeBSD).
+Fast disk usage analyzer with beautiful output and efficient file scanning.
 
 **Status**: Early stage, not well-tested. API subject to change.
 
 ## What is this?
 
-A library that provides efficient bulk retrieval of file attributes using the native `getattrlistbulk` syscall. This allows fetching multiple file attributes for directory entries in a single system call, which is significantly more efficient than individual `stat` calls.
+`wtfs` is a fast directory tree analyzer that shows disk usage with a clean, tabular interface. It includes:
 
-The library uses Zig's comptime features to generate type-safe structs based on the attributes you request, ensuring you only pay for what you use.
+- **Fast scanning**: Uses efficient bulk attribute retrieval (`getattrlistbulk` on macOS, optimized fallbacks on Linux)
+- **Beautiful output**: Formatted tables showing directory sizes, file counts, and largest files
+- **Binary snapshots**: Save and load scan results for later analysis or comparison
+- **Zig library**: The underlying library provides type-safe, efficient file attribute scanning
+
+## Quick Start
+
+```bash
+# Build
+zig build
+
+# Scan current directory
+./zig-out/bin/wtfs .
+
+# Save scan to file
+./zig-out/bin/wtfs --binary-output scan.bin .
+
+# Load and view saved scan
+./zig-out/bin/wtfs --binary-input scan.bin
+
+# Show files larger than 1MB
+./zig-out/bin/wtfs --large-file-threshold 1M .
+```
 
 ## Installation
 
 Requires Zig 0.15.1 or later.
+
+### With Nix (recommended)
+
+```bash
+# Run directly
+nix run github:mbrock/wtfs -- ~
+
+# Install to profile
+nix profile install github:mbrock/wtfs
+```
+
+### Build from source
+
+```bash
+git clone https://github.com/mbrock/wtfs
+cd wtfs
+zig build
+./zig-out/bin/wtfs --help
+```
+
+### Use as a library
 
 ```bash
 zig fetch --save git+https://github.com/mbrock/wtfs
@@ -24,7 +67,66 @@ const wtfs = b.dependency("wtfs", .{});
 exe.root_module.addImport("wtfs", wtfs.module("wtfs"));
 ```
 
-## API Usage
+## Command Line Usage
+
+```
+usage: wtfs [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [--binary-input PATH] [--dump-structs] [dir]
+       SIZE accepts optional K/M/G/T suffix (base 1024)
+       --binary-input: load scan results from file instead of scanning
+```
+
+### Example Output
+
+```
+.: 243 dirs, 497 files, 113.6MiB total
+
+Top-level directories by total size:
+
+┌──────────────┬─────────────┬─────────┬──────────────┬─────────────┐
+│ Directory    │        Size │   Share │        Files │        Dirs │
+├──────────────┼─────────────┼─────────┼──────────────┼─────────────┤
+│ ./.zig-cache │    92.0 MiB │   81.0% │           42 │          20 │
+│ ./zig-out    │    14.6 MiB │   12.9% │            3 │           1 │
+│ ./.git       │     5.5 MiB │    4.9% │          411 │         215 │
+│ ./src        │   200.0 KiB │    0.2% │           14 │           0 │
+└──────────────┴─────────────┴─────────┴──────────────┴─────────────┘
+
+Heaviest directories in tree:
+
+┌────────────────────────────────────────┬─────────────┬─────────┐
+│ Directory                              │        Size │   Share │
+├────────────────────────────────────────┼─────────────┼─────────┤
+│ .                                      │   113.6 MiB │  100.0% │
+│   .zig-cache                           │    92.0 MiB │   81.0% │
+│     o                                  │    91.3 MiB │   80.4% │
+│       6463279db290e53d329669813725e8cb │    21.6 MiB │   19.0% │
+└────────────────────────────────────────┴─────────────┴─────────┘
+```
+
+### Binary Snapshots
+
+Save scan results to a compact binary format for later analysis:
+
+```bash
+# Save snapshot
+./zig-out/bin/wtfs --binary-output snapshot.bin /large/directory
+
+# Load and analyze later (instant - no rescanning)
+./zig-out/bin/wtfs --binary-input snapshot.bin
+```
+
+Binary format is `wtfsdumpv1` - a compact representation that preserves:
+- Complete directory tree structure
+- File and directory counts
+- Size information
+- Large file tracking
+
+Typical compression: 200+ directories → ~9 KB binary file.
+
+
+## Library API Usage
+
+For advanced users who want to use wtfs as a library for custom file scanning:
 
 ### Basic Example
 
@@ -122,50 +224,6 @@ const full_mask = wtfs.AttrGroupMask{
 
 // Entry will have all requested fields
 const FullEntry = wtfs.EntryFor(full_mask);
-```
-
-### Re-iterating a Directory
-
-If you need to iterate the same directory again, you must seek back to the beginning:
-
-```zig
-const dir = try std.fs.cwd().openDir(".", .{ .iterate = true });
-defer dir.close();
-
-var scanner = Scanner.init(dir.handle, &buffer);
-
-// First iteration
-while (try scanner.next()) |entry| {
-    // process entries
-}
-
-// Seek back to start for another iteration
-try std.posix.lseek_SET(dir.handle, 0);
-
-// Re-initialize scanner
-scanner = Scanner.init(dir.handle, &buffer);
-
-// Second iteration
-while (try scanner.next()) |entry| {
-    // process entries again
-}
-```
-
-## Example Program
-
-A basic example program is included that demonstrates the library:
-
-```bash
-zig build
-./zig-out/bin/wtfs .
-```
-
-Output:
-```
-* .zig-cache                        x192
-- LICENSE                           1.05KiB       (4.00KiB)
-- build.zig                         8.28KiB       (12.00KiB)
-* src                               x96
 ```
 
 ## License
