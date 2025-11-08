@@ -560,7 +560,7 @@ const SummaryBuilder = struct {
 
 // ===== Main Entry Point =====
 
-fn performScan(self: *Self) !ScanResults {
+pub fn performScan(self: *Self) !ScanResults {
     self.large_files.clearRetainingCapacity();
 
     var timer = try std.time.Timer.start();

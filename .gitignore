@@ -13,4 +13,9 @@ __pycache__/
 dist/
 build/
 uv.lock
-test-scan.bin
+wtfs/_bin/
+
+# Test outputs
+*.bin
+*.wtfs
+test_*.py

@@ -14,3 +14,12 @@ wtfsdump = "wtfs.dump:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["wtfs"]
+artifacts = ["wtfs/_bin/*"]
+# Platform-specific wheel since we bundle a native binary
+pure-python = false

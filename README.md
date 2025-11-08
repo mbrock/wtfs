@@ -129,14 +129,20 @@ Typical compression: 200+ directories → ~9 KB binary file.
 # Install dependencies
 uv sync
 
-# CLI usage (with beautiful rich output!)
+# Use the Scanner to scan and analyze
+from wtfs import Scanner, dump
+
+scanner = Scanner()
+results = scanner.scan('.')  # Uses wtfs binary with full threading
+print(f"Found {results['directories']} directories")
+
+# Analyze the results with rich output
+data = dump.load(results['dump_file'])
+# ... beautiful tables and analysis ...
+
+# Or use the CLI directly
 uv run wtfsdump scan.bin --top 50
 uv run wtfsdump scan.bin --find docker
-
-# Python library
-from wtfs import dump
-data = dump.load('scan.bin')
-print(f"{data.totals.directories:,} dirs, {data.totals.files:,} files")
 ```
 
 

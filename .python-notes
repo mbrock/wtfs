@@ -1,0 +1,5 @@
+# Python integration exploration notes:
+# - src/hello_lib.zig: Phase 0 C ABI test (works!)
+# - src/scanner_lib.zig: Phase 1 native scanner (threading issues in .so)
+# - docs/DESIGN_NOTES.md: Documents why we chose subprocess over native lib
+# These are kept for reference but not used in production.
