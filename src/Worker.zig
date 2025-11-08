@@ -277,6 +277,7 @@ fn processEntry(
     switch (entry.kind) {
         .dir => {
             if (self.ctx.skip_hidden and name[0] == '.') return;
+            if (self.ctx.shouldExcludeDir(index, name)) return;
             // Keep parent fd open until child task can openat() from it
             self.ctx.retainParentFd(index);
             const child_index = try self.addChild(index, name);

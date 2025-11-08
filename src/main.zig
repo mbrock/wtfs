@@ -45,6 +45,7 @@ pub fn main() !void {
     var binary_output: ?[]const u8 = null;
     var binary_input: ?[]const u8 = null;
     var dump_structs = false;
+    var force = false;
 
     const threshold_prefix = "--large-file-threshold=";
     const binary_output_prefix = "--binary-output=";
@@ -116,6 +117,10 @@ pub fn main() !void {
             dump_structs = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--force")) {
+            force = true;
+            continue;
+        }
         if (root_arg != null) {
             try printUsage(exe_name);
             return;
@@ -130,11 +135,34 @@ pub fn main() !void {
 
     const root = root_arg orelse ".";
 
+    // When scanning filesystem root, exclude problematic pseudo-filesystems
+    // On macOS, you probably want /System/Volumes/Data or /Volumes instead of /
+    const root_excludes = [_][]const u8{ "proc", "sys", "dev" };
+    const exclude_dirs = if (std.mem.eql(u8, root, "/"))
+        root_excludes[0..]
+    else
+        &[_][]const u8{};
+
+    // Prevent scanning / on macOS unless --force is used
+    if (builtin.os.tag == .macos and std.mem.eql(u8, root, "/") and !force) {
+        try stderr.print("error: Scanning / on macOS is not recommended.\n", .{});
+        try stderr.print("\n", .{});
+        try stderr.print("On macOS, the root filesystem contains system files and virtual mounts.\n", .{});
+        try stderr.print("Consider scanning one of these instead:\n", .{});
+        try stderr.print("  - /System/Volumes/Data (main filesystem)\n", .{});
+        try stderr.print("  - /Volumes (mounted drives)\n", .{});
+        try stderr.print("  - /Users (user home directories)\n", .{});
+        try stderr.print("\n", .{});
+        try stderr.print("To scan / anyway, use --force\n", .{});
+        return;
+    }
+
     var diskScan = DiskScan{
         .allocator = allocator,
         .skip_hidden = skip_hidden,
         .root = root,
         .large_file_threshold = large_file_threshold,
+        .exclude_root_dirs = exclude_dirs,
     };
     defer {
         diskScan.freeNameBuffers();
@@ -221,11 +249,12 @@ fn parseSize(value: []const u8) !u64 {
 
 fn printUsage(exe_name: []const u8) !void {
     try stderr.print(
-        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [--binary-input PATH] [--dump-structs] [dir]\n",
+        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [--binary-input PATH] [--force] [--dump-structs] [dir]\n",
         .{exe_name},
     );
     try stderr.print("       SIZE accepts optional K/M/G/T suffix (base 1024)\n", .{});
     try stderr.print("       --binary-input: load scan results from file instead of scanning\n", .{});
+    try stderr.print("       --force: bypass safety checks (e.g., scanning / on macOS)\n", .{});
 }
 
 fn dumpStructLayouts() !void {

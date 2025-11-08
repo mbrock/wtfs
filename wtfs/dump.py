@@ -25,6 +25,7 @@ Usage:
 import struct
 from dataclasses import dataclass
 from typing import List, Optional, Dict
+from pathlib import Path
 
 
 @dataclass
@@ -68,6 +69,7 @@ class WtfsDump:
         self.directories: List[Directory] = []
         self.large_files: List[LargeFile] = []
         self._dir_by_path: Dict[str, Directory] = {}
+        self.root_path: Optional[Path] = None  # Absolute path of scanned root
 
     def _build_paths(self):
         """Build full paths for all directories."""

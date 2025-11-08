@@ -18,10 +18,13 @@ const Self = @This();
 allocator: std.mem.Allocator,
 
 /// Whether to skip hidden files and directories (starting with '.')
-skip_hidden: bool = true,
+skip_hidden: bool = false,
 
 /// Root directory path to scan
 root: []const u8 = ".",
+
+/// Root-level directories to exclude (e.g. ["proc", "sys", "dev"] on Linux)
+exclude_root_dirs: []const []const u8 = &.{},
 
 /// Segmented storage for all discovered directory nodes and their metadata
 directories: Context.DirectoryTable = .{},
@@ -140,6 +143,7 @@ fn createScanContext(
         .skip_hidden = self.skip_hidden,
         .large_files = &self.large_files,
         .large_file_threshold = self.large_file_threshold,
+        .exclude_root_dirs = self.exclude_root_dirs,
     };
 }
 

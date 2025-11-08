@@ -27,10 +27,13 @@ def main():
     parser.add_argument('--load', metavar='FILE', help='Load and display existing dump')
     parser.add_argument('--interactive', '-i', action='store_true',
                        help='Launch interactive TUI browser')
-    parser.add_argument('--skip-hidden', action='store_true', help='Skip hidden files/directories')
+    parser.add_argument('--skip-hidden', action='store_true',
+                       help='Skip hidden files/directories (default: include them)')
     parser.add_argument('--threshold', type=str, default='100M',
                        help='Large file threshold (default: 100M)')
     parser.add_argument('--top', type=int, default=10, help='Show top N directories (default: 10)')
+    parser.add_argument('--force', action='store_true',
+                       help='Bypass safety checks (e.g., scanning / on macOS)')
 
     args = parser.parse_args()
     console = Console()
@@ -53,12 +56,12 @@ def main():
             )
 
             with console.status(f"[bold cyan]Scanning {args.path}..."):
-                results = scanner.scan(args.path, output_file=args.save)
+                results = scanner.scan(args.path, output_file=args.save, force=args.force)
 
             # Launch interactive or display results
             if args.interactive:
                 from .tui import run_interactive
-                run_interactive(results['dump_file'])
+                run_interactive(results['dump_file'], root_path=args.path)
             else:
                 # Load and display
                 data = dump.load(results['dump_file'])
@@ -68,7 +71,7 @@ def main():
                     console.print(f"\n[dim]Saved to: {args.save}[/dim]")
 
     except Exception as e:
-        console.print(f"[bold red]Error:[/bold red] {e}", file=sys.stderr)
+        console.print(f"[bold red]Error:[/bold red] {e}", stderr=True)
         sys.exit(1)
 
 

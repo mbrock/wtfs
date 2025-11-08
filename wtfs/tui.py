@@ -75,7 +75,11 @@ class DirectoryTreeView(Tree):
 
     def _format_label(self, directory: Directory) -> str:
         """Format a directory label with aligned columns."""
-        name = directory.name or '.'
+        # Show absolute path for root if available
+        if directory.index == 0 and self.data.root_path:
+            name = str(self.data.root_path)
+        else:
+            name = directory.name or '.'
         size_str = format_size(directory.total_size)
         files = directory.total_files
 
@@ -125,12 +129,16 @@ class WtfsApp(App):
         yield DirectoryTreeView(self.data)
 
 
-def run_interactive(dump_file: str) -> None:
+def run_interactive(dump_file: str, root_path: str = None) -> None:
     """Run the interactive TUI application."""
     from . import dump
 
     # Load data before starting the app
     data = dump.load(dump_file)
+
+    # Set the root path if provided
+    if root_path:
+        data.root_path = Path(root_path).resolve()
 
     app = WtfsApp(data)
     app.run()

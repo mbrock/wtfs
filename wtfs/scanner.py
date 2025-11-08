@@ -6,9 +6,26 @@ located. This provides full threading support and process isolation.
 """
 
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
+
+
+def _set_fd_limit_linux():
+    """Set high file descriptor limit on Linux (called in child process)."""
+    if sys.platform == 'linux':
+        try:
+            import resource
+            # Get current limits
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            # Try to set soft limit to hard limit (or 100k, whichever is lower)
+            # This doesn't require root and uses the system's configured hard limit
+            target = min(hard, 100_000)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        except (ImportError, ValueError, OSError):
+            # If we can't set it, that's okay - just use system defaults
+            pass
 
 
 class Scanner:
@@ -25,7 +42,7 @@ class Scanner:
 
     def __init__(
         self,
-        skip_hidden: bool = True,
+        skip_hidden: bool = False,
         large_file_threshold: int = 100 * 1024 * 1024,  # 100 MB
     ):
         """
@@ -86,6 +103,7 @@ class Scanner:
         self,
         path: str = '.',
         output_file: Optional[str] = None,
+        force: bool = False,
     ) -> dict:
         """
         Scan a directory and return results.
@@ -114,6 +132,9 @@ class Scanner:
             else:
                 cmd.append('--skip-hidden')
 
+            if force:
+                cmd.append('--force')
+
             cmd.extend([
                 '--large-file-threshold',
                 self._format_size(self.large_file_threshold),
@@ -122,12 +143,13 @@ class Scanner:
                 str(path),
             ])
 
-            # Run wtfs binary
+            # Run wtfs binary with high fd limit on Linux
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 check=True,
+                preexec_fn=_set_fd_limit_linux if sys.platform == 'linux' else None,
             )
 
             # Load the dump to extract totals

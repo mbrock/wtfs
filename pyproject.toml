@@ -5,7 +5,7 @@ description = "Fast directory scanning utility with beautiful Python analysis to
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "rich>=14.2.0",
+    "rich>=14.0.0",
     "textual>=6.5.0",
 ]
 

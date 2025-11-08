@@ -48,6 +48,7 @@ errprogress: std.Progress.Node,
 
 skip_hidden: bool,
 large_file_threshold: u64,
+exclude_root_dirs: []const []const u8,
 
 pub fn storeName(self: *Context, name: []const u8) !u32 {
     std.debug.assert(name.len <= std.fs.max_name_bytes);
@@ -154,6 +155,27 @@ pub fn recordLargeFile(
     defer self.directories_mutex.unlock();
 
     try self.recordLargeFileLocked(directory_index, name, size);
+}
+
+/// Check if a directory should be excluded (only checks direct children of root)
+pub fn shouldExcludeDir(
+    self: *const Context,
+    parent_index: usize,
+    child_name: []const u8,
+) bool {
+    if (self.exclude_root_dirs.len == 0) return false;
+    
+    // Only check exclusions for direct children of root (parent_index == 0)
+    if (parent_index != 0) return false;
+    
+    // Check if child_name matches any excluded directory
+    for (self.exclude_root_dirs) |excluded| {
+        if (std.mem.eql(u8, child_name, excluded)) {
+            return true;
+        }
+    }
+    
+    return false;
 }
 
 /// Decrement reference count and close fd if no longer needed (thread-safe)
