@@ -10,8 +10,15 @@ project('wtfs-cpp', 'cpp',
 # Include directories
 inc_dirs = include_directories('include')
 
-# Source files
-sources = [
+# Source files for binary-only scanner (primary)
+sources_binary = [
+  'src/main_binary.cpp',
+  'src/scanner.cpp',
+  'src/binary_writer.cpp',
+]
+
+# Source files for text-output version (kept for reference)
+sources_text = [
   'src/main.cpp',
   'src/disk_scan.cpp',
   'src/dir_scanner.cpp',
@@ -27,13 +34,22 @@ endif
 # Dependencies
 thread_dep = dependency('threads')
 
-# Executable
-executable('wtfs-cpp',
-  sources,
+# Primary executable - binary-only scanner
+executable('wtfs-scan',
+  sources_binary,
   include_directories: inc_dirs,
   cpp_args: cpp_args,
   dependencies: [thread_dep],
   install: true
+)
+
+# Secondary executable - text output (kept for compatibility)
+executable('wtfs-text',
+  sources_text,
+  include_directories: inc_dirs,
+  cpp_args: cpp_args,
+  dependencies: [thread_dep],
+  install: false
 )
 
 # Tests (to be added later)
