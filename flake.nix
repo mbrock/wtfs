@@ -54,6 +54,41 @@
           };
         };
 
+        # Build tagflow (not yet in nixpkgs)
+        tagflow = pkgs.python3Packages.buildPythonPackage rec {
+          pname = "tagflow";
+          version = "0.12.0";
+          format = "pyproject";
+
+          src = pkgs.fetchPypi {
+            inherit pname version;
+            hash = "sha256-+Ooje+SUwKG55A44AdY5wjQo3ly/mAQxYHiHo065J5A=";
+          };
+
+          nativeBuildInputs = with pkgs.python3Packages; [
+            hatchling
+          ];
+
+          propagatedBuildInputs = with pkgs.python3Packages; [
+            fastapi
+            pydantic
+            beautifulsoup4
+            anyio
+            hypercorn
+            rich
+            trio
+          ];
+
+          # Disable tests if they require network or special setup
+          doCheck = false;
+
+          meta = with pkgs.lib; {
+            description = "Block-oriented HTML generation for Python";
+            homepage = "https://github.com/lessrest/tagflow";
+            license = licenses.mit;
+          };
+        };
+
         # Build the Python package with bundled Zig binaries
         wtfs-python = pkgs.python3Packages.buildPythonApplication {
           pname = "wtfs";
@@ -71,6 +106,11 @@
           propagatedBuildInputs = with pkgs.python3Packages; [
             rich
             textual
+            tagflow
+            fastapi
+            uvicorn
+            pydantic
+            starlette
           ];
 
           # Build the Zig binaries before building the Python package
@@ -110,7 +150,11 @@
             pkgs.python3
             pkgs.python3Packages.rich
             pkgs.python3Packages.textual
+            pkgs.python3Packages.fastapi
+            pkgs.python3Packages.uvicorn
             pkgs.python3Packages.hatchling
+            pkgs.python3Packages.pip
+            pkgs.uv
           ];
 
           shellHook = ''
@@ -122,6 +166,9 @@
             echo "  - Build Zig core: zig build"
             echo "  - Run Python tool: python -m wtfs.cli"
             echo "  - Run TUI: python -m wtfs.tui"
+            echo "  - Run web UI: python -m wtfs.cli --webui"
+            echo ""
+            echo "Note: Install additional Python deps with: uv sync"
           '';
         };
 
