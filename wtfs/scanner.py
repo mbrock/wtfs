@@ -93,10 +93,16 @@ class Scanner:
         if dev_plain.exists():
             return dev_plain
 
+        # Fallback: try C++ implementation (wtfs-scan)
+        cpp_binary = package_dir.parent / 'cpp' / 'build' / 'wtfs-scan'
+        if cpp_binary.exists():
+            return cpp_binary
+
         raise RuntimeError(
             f"wtfs binary not found for {system}-{arch}. "
             f"Expected: {platform_binary}\n"
-            f"Run 'zig build python' to build all platform binaries."
+            f"Run 'zig build python' to build platform binaries, or\n"
+            f"Build C++ version: cd cpp && meson compile -C build"
         )
 
     def scan(
