@@ -7,23 +7,21 @@ using namespace wtfs;
 
 void print_usage(const char* program_name) {
     std::cerr << "wtfs-cpp: Fast disk scanner with binary dump output\n\n";
-    std::cerr << "Usage: " << program_name << " [OPTIONS] <directory> <output.bin>\n\n";
+    std::cerr << "Usage: " << program_name << " [OPTIONS] <directory>\n\n";
     std::cerr << "Arguments:\n";
-    std::cerr << "  <directory>    Directory to scan\n";
-    std::cerr << "  <output.bin>   Output file for binary dump (wtfsdumpv1 format)\n\n";
+    std::cerr << "  <directory>    Directory to scan\n\n";
     std::cerr << "Options:\n";
-    std::cerr << "  --skip-hidden              Skip hidden files (default)\n";
-    std::cerr << "  --no-skip-hidden           Include hidden files\n";
+    std::cerr << "  --skip-hidden              Skip hidden files (default: false)\n";
     std::cerr << "  --large-file-threshold N   Track files larger than N (default: 100M)\n";
     std::cerr << "                             Accepts K/M/G/T suffix (e.g., 1G, 500M)\n";
+    std::cerr << "  --binary-output PATH       Output file for binary dump (required)\n";
     std::cerr << "  --help                     Show this help\n\n";
     std::cerr << "Examples:\n";
-    std::cerr << "  " << program_name << " /home/user scan.bin\n";
-    std::cerr << "  " << program_name << " --large-file-threshold 1G . output.bin\n";
-    std::cerr << "  " << program_name << " --no-skip-hidden /data dump.bin\n\n";
+    std::cerr << "  " << program_name << " --binary-output scan.bin /home/user\n";
+    std::cerr << "  " << program_name << " --large-file-threshold 1G --binary-output out.bin .\n\n";
     std::cerr << "Output format:\n";
     std::cerr << "  The binary dump uses the wtfsdumpv1 format and can be analyzed using:\n";
-    std::cerr << "    python3 tools/wtfsdump.py output.bin\n";
+    std::cerr << "    python3 -m wtfs.dump output.bin\n";
 }
 
 uint64_t parse_size(const std::string& value) {
@@ -58,7 +56,7 @@ uint64_t parse_size(const std::string& value) {
 }
 
 int main(int argc, char* argv[]) {
-    bool skip_hidden = true;
+    bool skip_hidden = false;  // Default: scan hidden files (like Zig version)
     uint64_t large_file_threshold = 100 * 1024 * 1024; // 100 MB
     std::string directory;
     std::string output_file;
@@ -73,9 +71,6 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--skip-hidden") {
             skip_hidden = true;
-        }
-        else if (arg == "--no-skip-hidden") {
-            skip_hidden = false;
         }
         else if (arg == "--large-file-threshold") {
             if (i + 1 >= argc) {
@@ -97,19 +92,30 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         }
+        else if (arg == "--binary-output") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --binary-output requires a value\n";
+                return 1;
+            }
+            output_file = argv[++i];
+        }
+        else if (arg.rfind("--binary-output=", 0) == 0) {
+            output_file = arg.substr(16);
+        }
+        else if (arg == "--force") {
+            // Accepted for compatibility but ignored (always overwrites)
+        }
         else if (arg[0] == '-') {
             std::cerr << "Error: Unknown option: " << arg << "\n";
             print_usage(argv[0]);
             return 1;
         }
         else {
-            // Positional arguments
+            // Positional argument - the directory
             if (directory.empty()) {
                 directory = arg;
-            } else if (output_file.empty()) {
-                output_file = arg;
             } else {
-                std::cerr << "Error: Too many arguments\n";
+                std::cerr << "Error: Too many positional arguments\n";
                 print_usage(argv[0]);
                 return 1;
             }
@@ -117,8 +123,14 @@ int main(int argc, char* argv[]) {
     }
 
     // Validate arguments
-    if (directory.empty() || output_file.empty()) {
-        std::cerr << "Error: Missing required arguments\n\n";
+    if (directory.empty()) {
+        std::cerr << "Error: Missing directory argument\n\n";
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    if (output_file.empty()) {
+        std::cerr << "Error: Missing --binary-output option\n\n";
         print_usage(argv[0]);
         return 1;
     }

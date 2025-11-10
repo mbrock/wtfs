@@ -1,0 +1,31 @@
+[project]
+name = "wtfs"
+version = "0.1.0"
+description = "Fast directory scanning utility with beautiful Python analysis tools"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.116.0",
+    "uvicorn>=0.30.0",
+    "rich>=14.0.0",
+    "tagflow>=0.12.0",
+    "textual>=6.5.0",
+]
+
+[project.scripts]
+wtfs = "wtfs.cli:main"
+wtfsdump = "wtfs.dump:main"
+wtfs-tui = "wtfs.tui:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["wtfs"]
+artifacts = ["wtfs/_bin/*"]
+# Platform-specific wheel since we bundle a native binary
+pure-python = false
