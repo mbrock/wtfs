@@ -23,16 +23,14 @@ pub fn build(b: *std.Build) !void {
     });
 
     const run_cmd = b.addRunArtifact(exe_wtfscan);
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
     const run_dumpstruct = b.addRunArtifact(exe_wtfscan);
     run_dumpstruct.addArg("--dump-structs");
-    const structfile = run_dumpstruct.captureStdOut();
+    const structfile = run_dumpstruct.captureStdOut(.{});
     const install_structfile = b.addInstallFile(structfile, "wtfstructs.txt");
 
     b.getInstallStep().dependOn(&install_structfile.step);

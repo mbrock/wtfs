@@ -11,14 +11,14 @@
 ///
 /// Growth path (rare):
 ///  - Call `acquireOrWaitFor(target_cap)`:
-///     * returns **Growth** (mutex held) if work is needed — you initialize backing
+///     * returns **Growth** (growth lock held) if work is needed — you initialize backing
 ///       storage up to `target_cap`, then `publishTo(target_cap)` (release) and unlock
 ///     * returns **null** if another thread already brought `cap` to `target_cap`
-///       (this function waited on a condvar if necessary)
+///       (no wait is needed: the check happens under the growth lock)
 
 // Memory ordering (why it’s correct):
 //  - Writers grow: **initialize memory first**, then `publishTo()` does a **release**
-//    store to `cap` and wakes waiters. This guarantees visibility of all initialized
+//    store to `cap`. This guarantees visibility of all initialized
 //    bytes to threads that subsequently **acquire**-load `cap` (via `snapshot()`).
 //  - Appenders: `Reservation.take()` CASes `len` with **acq_rel**, which linearizes
 //    append; the **acquire** in readers’ `snapshot()` must precede any deref into
@@ -35,9 +35,28 @@ len: std.atomic.Value(usize) = .init(0),
 /// Logical rows published/initialized (upper bound safe for readers).
 cap: std.atomic.Value(usize) = .init(0),
 
-/// Serialized growth; waiters sleep here until `_cap` advances.
-mu: std.Thread.Mutex = .{},
-cv: std.Thread.Condition = .{},
+/// Serialized growth. A spin lock rather than a blocking mutex: blocking
+/// primitives now need an `Io` instance, and threading one through every
+/// container API would be a lot of plumbing for a lock that is taken O(log n)
+/// times per scan and held only for a single shelf allocation.
+growing: std.atomic.Value(bool) = .init(false),
+
+fn lockGrowth(self: *CapacityLatch) void {
+    var spins: usize = 0;
+    while (self.growing.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+        spins += 1;
+        if (spins < 64) {
+            std.atomic.spinLoopHint();
+        } else {
+            spins = 0;
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+    }
+}
+
+fn unlockGrowth(self: *CapacityLatch) void {
+    self.growing.store(false, .release);
+}
 
 /// Snapshot of `{ len, cap }` with **acquire** semantics on both.
 ///
@@ -105,7 +124,7 @@ pub fn reservation(self: *CapacityLatch, count: usize) error{Overflow}!Reservati
     return .{ .latch = self, .base = base, .len = len };
 }
 
-/// Growth guard: owning the mutex while preparing capacity.
+/// Growth guard: owning the growth lock while preparing capacity.
 ///
 /// Invariants while held:
 ///  - Caller must initialize all storage for rows in `[start_cap .. target_cap)`
@@ -115,8 +134,8 @@ pub const Growth = struct {
     start_cap: usize,
     held: bool = true,
 
-    /// Publish all rows up to `target_cap` (exclusive upper bound), with **release**,
-    /// then wake all waiters. This is the *only* place `_cap` advances.
+    /// Publish all rows up to `target_cap` (exclusive upper bound), with **release**.
+    /// This is the *only* place `_cap` advances.
     ///
     /// Precondition: the caller has fully initialized every byte required
     /// for rows `[start_cap .. target_cap)`.
@@ -126,20 +145,18 @@ pub const Growth = struct {
     /// will also observe the initialization that happened-before this call.
     pub fn publishTo(self: *Growth, target_cap: usize) void {
         self.l.cap.store(target_cap, .release);
-        // Wake all waiters; Condition requires holding the mutex.
-        self.l.cv.broadcast();
     }
 
-    /// Release the growth mutex. Prefer `defer g.unlock()`.
+    /// Release the growth lock. Prefer `defer g.unlock()`.
     pub fn unlock(self: *Growth) void {
         if (!self.held) return;
-        self.l.mu.unlock();
+        self.l.unlockGrowth();
         self.held = false;
     }
 };
 
 /// Ensure `cap >= target_cap`: either become the grower (return a Growth guard
-/// with the mutex held) or, if another thread can/does grow, wait until the
+/// with the growth lock held) or, if another thread can/does grow, wait until the
 /// condition is satisfied and return `null`.
 ///
 /// Typical usage in your container:
@@ -152,17 +169,16 @@ pub const Growth = struct {
 ///   } // else: target already satisfied (this waited if needed)
 /// ```
 pub fn acquireOrWaitFor(self: *CapacityLatch, target_cap: usize) ?Growth {
-    self.mu.lock();
+    self.lockGrowth();
 
     // Fast path: nothing to do (also covers spurious wakeups in callers).
     const now = self.cap.load(.acquire);
     if (now >= target_cap) {
-        self.mu.unlock();
+        self.unlockGrowth();
         return null;
     }
 
-    // Policy: caller grows immediately (holds the mutex).
-    // If you prefer to *always* wait instead, replace this with a loop on _cv.wait.
+    // Policy: caller grows immediately (holds the lock).
     return .{ .l = self, .start_cap = now };
 }
 

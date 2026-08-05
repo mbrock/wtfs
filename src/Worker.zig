@@ -65,7 +65,7 @@ progress_writer: std.Io.Writer,
 scan_buffer: [1024 * 1024]u8,
 
 /// Performance tracking
-timer: std.time.Timer,
+started_at: std.Io.Timestamp,
 items_processed: usize,
 
 // ===== Main Worker Loop =====
@@ -84,9 +84,7 @@ pub fn directoryWorker(ctx: *Context) void {
         .progress_buffer = undefined,
         .progress_writer = undefined,
         .scan_buffer = undefined,
-        .timer = std.time.Timer.start() catch |e| {
-            std.debug.panic("timer start failed {t}", .{e});
-        },
+        .started_at = std.Io.Clock.awake.now(ctx.io),
         .items_processed = 0,
     };
     defer worker.path_buffer.deinit(worker.allocator);
@@ -205,11 +203,11 @@ fn scanDirectory(
     metrics: *ScanMetrics,
 ) !void {
     // Iterate using a duplicate so the context can safely close the original fd.
-    const iter_fd = posix.dup(dir_fd) catch |err| {
+    const iter_fd = dirscan.dupFd(dir_fd) catch |err| {
         return self.handleScanError(index, err);
     };
-    var scanner = Scanner.init(iter_fd, &self.scan_buffer, &self.dispatcher);
-    defer scanner.dir.close();
+    var scanner = Scanner.init(self.ctx.io, iter_fd, &self.scan_buffer, &self.dispatcher);
+    defer scanner.dir.close(self.ctx.io);
 
     self.ctx.retainParentFd(index);
     defer self.ctx.releaseParentFd(index);
@@ -302,8 +300,8 @@ fn processEntry(
 pub fn addChild(self: *Worker, parent_index: usize, name: []const u8) !usize {
     const name_slice = try self.ctx.storeName(name);
 
-    self.ctx.directories_mutex.lock();
-    defer self.ctx.directories_mutex.unlock();
+    self.ctx.directories_mutex.lockUncancelable(self.ctx.io);
+    defer self.ctx.directories_mutex.unlock(self.ctx.io);
     const index = try self.ctx.directories.addOne(self.allocator);
     self.ctx.directories.ptr(.parent, index).* = @intCast(parent_index);
     self.ctx.directories.ptr(.name_slice, index).* = name_slice;

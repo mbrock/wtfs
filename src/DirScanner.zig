@@ -134,6 +134,14 @@ pub const IoPolicyScope = enum(c_int) {
     darwin_bg = 2,
 };
 
+/// `std.posix` no longer wraps `dup`, and the scanner needs a second fd so the
+/// context can close the original while iteration is still in flight.
+pub fn dupFd(fd: std.posix.fd_t) std.posix.UnexpectedError!std.posix.fd_t {
+    const rc = std.c.dup(fd);
+    if (rc >= 0) return rc;
+    return std.posix.unexpectedErrno(std.posix.errno(rc));
+}
+
 /// Set an I/O policy for the current process or thread
 pub extern "c" fn setiopolicy_np(
     iotype: IoPolicyType,
@@ -224,6 +232,17 @@ pub fn EntryFor(mask: AttrGroupMask) type {
     };
 }
 
+/// Read a packed struct using its exact bit width.
+///
+/// `Reader.takeStruct` advances by `@sizeOf`, which for a packed struct rounds
+/// up to the type's alignment — 48 bytes for a 36-byte `Payload`, for instance.
+/// The kernel packs `getattrlistbulk` records with no such padding, so reading
+/// by `@sizeOf` would desynchronize everything after the first field group.
+fn takePacked(r: *std.Io.Reader, comptime T: type) !T {
+    const n = comptime @divExact(@bitSizeOf(T), 8);
+    return @bitCast((try r.takeArray(n)).*);
+}
+
 // ===== Directory Scanner =====
 
 /// Creates a directory scanner type that efficiently iterates over directory entries
@@ -232,15 +251,15 @@ pub fn EntryFor(mask: AttrGroupMask) type {
 const DefaultStatProvider = struct {
     pub const ContextType = void;
 
-    pub fn statAt(_: ContextType, dir_fd: std.posix.fd_t, name: [:0]const u8) posix.FStatAtError!posix.Stat {
-        return posix.fstatat(dir_fd, name, 0);
+    pub fn statAt(_: ContextType, dir_fd: std.posix.fd_t, name: [:0]const u8) SysDispatcher.StatError!SysDispatcher.Stat {
+        return SysDispatcher.statPath(dir_fd, name);
     }
 };
 
 pub const DispatcherStatProvider = struct {
     pub const ContextType = *SysDispatcher.Backend;
 
-    pub fn statAt(dispatcher: ContextType, dir_fd: std.posix.fd_t, name: [:0]const u8) posix.FStatAtError!posix.Stat {
+    pub fn statAt(dispatcher: ContextType, dir_fd: std.posix.fd_t, name: [:0]const u8) SysDispatcher.StatError!SysDispatcher.Stat {
         return dispatcher.statAt(dir_fd, name);
     }
 };
@@ -265,20 +284,22 @@ fn MacOSDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
         pub const Entry = EntryFor(mask);
         pub const Mask = mask;
 
+        io: std.Io,
         fd: std.posix.fd_t,
-        dir: std.fs.Dir,
-        reader: std.io.Reader,
+        dir: std.Io.Dir,
+        reader: std.Io.Reader,
         buf: []u8,
         provider_ctx: Provider.ContextType,
         n: usize = 0, // Number of entries in current batch
 
         /// Initialize a new scanner with a directory file descriptor and buffer
         /// The buffer will be used for storing the bulk attribute results
-        pub fn init(fd: std.posix.fd_t, buf: []u8, provider_ctx: Provider.ContextType) @This() {
+        pub fn init(io: std.Io, fd: std.posix.fd_t, buf: []u8, provider_ctx: Provider.ContextType) @This() {
             return .{
+                .io = io,
                 .fd = fd,
-                .dir = .{ .fd = fd },
-                .reader = std.io.Reader.fixed(buf),
+                .dir = .{ .handle = fd },
+                .reader = std.Io.Reader.fixed(buf),
                 .buf = buf,
                 .provider_ctx = provider_ctx,
             };
@@ -318,7 +339,7 @@ fn MacOSDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
                 }
 
                 self.n = @abs(n);
-                self.reader = std.io.Reader.fixed(self.buf);
+                self.reader = std.Io.Reader.fixed(self.buf);
                 return;
             }
         }
@@ -342,18 +363,17 @@ fn MacOSDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
             // Read record length and prepare reader for this record
             const reclen = try self.reader.peekInt(u32, .little);
             const recbuf = try self.reader.peek(reclen);
-            var rec = std.io.Reader.fixed(recbuf);
+            var rec = std.Io.Reader.fixed(recbuf);
             try self.reader.discardAll(@as(usize, reclen));
             self.n -= 1;
 
             // Parse the payload structure
-            // We use peekStructPointer to get the address for name calculation,
-            // then takeStruct to advance the reader
-            const payload = try rec.peekStructPointer(Payload);
-            _ = try rec.takeStruct(Payload, .little);
+            const payload = try takePacked(&rec, Payload);
 
-            // Extract the name using pointer arithmetic
-            const namerefptr = @as([*]u8, @ptrCast(&payload.name_ref));
+            // An `attrreference_t` offset is relative to the address of the
+            // reference itself, which sits at a fixed offset into the record.
+            const nameref_offset = comptime @divExact(@bitOffsetOf(Payload, "name_ref"), 8);
+            const namerefptr = recbuf.ptr + nameref_offset;
             const namestart = if (payload.name_ref.off < 0)
                 namerefptr - @abs(payload.name_ref.off)
             else
@@ -372,7 +392,7 @@ fn MacOSDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
             // Parse type-specific attributes
             switch (payload.objtype) {
                 VDIR => {
-                    const dir = try rec.takeStruct(DirPayloadFor(mask.dir), .little);
+                    const dir = try takePacked(&rec, DirPayloadFor(mask.dir));
                     entry.details = .{
                         .dir = .{
                             .linkcount = dir.linkcount,
@@ -385,7 +405,7 @@ fn MacOSDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
                     };
                 },
                 VREG => {
-                    const file = try rec.takeStruct(FilePayloadFor(mask.file), .little);
+                    const file = try takePacked(&rec, FilePayloadFor(mask.file));
                     entry.details = .{
                         .file = .{
                             .linkcount = file.linkcount,
@@ -421,21 +441,18 @@ fn PosixDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
         const DirPayload = @FieldType(EntryDetails, "dir");
         const FilePayload = @FieldType(EntryDetails, "file");
 
-        // Check which stat fields are available on this platform
-        const stat_has_nlink = @hasField(posix.Stat, "nlink");
-        const stat_has_blocks = @hasField(posix.Stat, "blocks");
-        const stat_has_blksize = @hasField(posix.Stat, "blksize");
-
-        dir: std.fs.Dir,
-        iterator: std.fs.Dir.Iterator,
+        io: std.Io,
+        dir: std.Io.Dir,
+        iterator: std.Io.Dir.Iterator,
         buf: []u8,
         provider_ctx: Provider.ContextType,
         pending_entry: ?Entry = null,
 
         /// Initialize a new scanner with a directory file descriptor and buffer
-        pub fn init(fd: std.posix.fd_t, buf: []u8, provider_ctx: Provider.ContextType) @This() {
+        pub fn init(io: std.Io, fd: std.posix.fd_t, buf: []u8, provider_ctx: Provider.ContextType) @This() {
             var scanner = @This(){
-                .dir = .{ .fd = fd },
+                .io = io,
+                .dir = .{ .handle = fd },
                 .iterator = undefined,
                 .buf = buf,
                 .provider_ctx = provider_ctx,
@@ -457,13 +474,13 @@ fn PosixDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
         }
 
         /// Stat a file relative to our directory
-        fn statAt(self: *@This(), name: [:0]const u8) !posix.Stat {
-            return try Provider.statAt(self.provider_ctx, self.dir.fd, name);
+        fn statAt(self: *@This(), name: [:0]const u8) !SysDispatcher.Stat {
+            return try Provider.statAt(self.provider_ctx, self.dir.handle, name);
         }
 
         /// Fetch the next directory entry from the iterator
         fn fetchNext(self: *@This()) !?Entry {
-            const dir_entry = (try self.iterator.next()) orelse return null;
+            const dir_entry = (try self.iterator.next(self.io)) orelse return null;
 
             const raw_name = dir_entry.name;
             const name_z = try self.copyName(raw_name);
@@ -495,29 +512,16 @@ fn PosixDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
                     if (needs_dir_stat) {
                         const stat = try self.statAt(name_z);
                         if (comptime mask.dir.linkcount) {
-                            if (stat_has_nlink) {
-                                payload.linkcount = @intCast(stat.nlink);
-                            } else {
-                                payload.linkcount = 0;
-                            }
+                            payload.linkcount = @intCast(stat.nlink);
                         }
                         if (comptime mask.dir.allocsize) {
-                            if (stat_has_blocks) {
-                                const blocks: u64 = @intCast(stat.blocks);
-                                payload.allocsize = blocks * 512;
-                            } else {
-                                payload.allocsize = 0;
-                            }
+                            payload.allocsize = stat.blocks * 512;
                         }
                         if (comptime mask.dir.ioblocksize) {
-                            if (stat_has_blksize) {
-                                payload.ioblocksize = @intCast(stat.blksize);
-                            } else {
-                                payload.ioblocksize = 0;
-                            }
+                            payload.ioblocksize = @intCast(stat.blksize);
                         }
                         if (comptime mask.dir.datalength) {
-                            payload.datalength = @intCast(stat.size);
+                            payload.datalength = stat.size;
                         }
                     }
                     // These aren't available via standard POSIX APIs
@@ -530,22 +534,13 @@ fn PosixDirScanner(mask: AttrGroupMask, comptime Provider: type) type {
                     if (needs_file_stat) {
                         const stat = try self.statAt(name_z);
                         if (comptime mask.file.linkcount) {
-                            if (stat_has_nlink) {
-                                payload.linkcount = @intCast(stat.nlink);
-                            } else {
-                                payload.linkcount = 0;
-                            }
+                            payload.linkcount = @intCast(stat.nlink);
                         }
                         if (comptime mask.file.totalsize) {
-                            payload.totalsize = @intCast(stat.size);
+                            payload.totalsize = stat.size;
                         }
                         if (comptime mask.file.allocsize) {
-                            if (stat_has_blocks) {
-                                const blocks: u64 = @intCast(stat.blocks);
-                                payload.allocsize = blocks * 512;
-                            } else {
-                                payload.allocsize = @intCast(stat.size);
-                            }
+                            payload.allocsize = stat.blocks * 512;
                         }
                     }
                     break :blk .{ .file = payload };
@@ -601,11 +596,11 @@ test "POSIX DirScanner iterates entries with requested metadata" {
 
     const Scanner = DirScanner(mask);
     var name_buf: [256]u8 = undefined;
-    var iterable_dir = try tmp.dir.openDir(".", .{ .iterate = true });
-    const dup_fd = try std.posix.dup(iterable_dir.fd);
-    iterable_dir.close();
-    var scanner = Scanner.init(dup_fd, name_buf[0..], @as(void, {}));
-    defer scanner.dir.close();
+    var iterable_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    const dup_fd = try dupFd(iterable_dir.handle);
+    iterable_dir.close(std.testing.io);
+    var scanner = Scanner.init(std.testing.io, dup_fd, name_buf[0..], @as(void, {}));
+    defer scanner.dir.close(std.testing.io);
 
     var saw_file = false;
     var saw_dir = false;
@@ -645,11 +640,11 @@ test "POSIX DirScanner copyName reports buffer exhaustion" {
     const Scanner = DirScanner(mask);
 
     var tiny_buf: [3]u8 = undefined;
-    var iterable_dir = try tmp.dir.openDir(".", .{ .iterate = true });
-    const dup_fd = try std.posix.dup(iterable_dir.fd);
-    iterable_dir.close();
-    var scanner = Scanner.init(dup_fd, tiny_buf[0..], @as(void, {}));
-    defer scanner.dir.close();
+    var iterable_dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true });
+    const dup_fd = try dupFd(iterable_dir.handle);
+    iterable_dir.close(std.testing.io);
+    var scanner = Scanner.init(std.testing.io, dup_fd, tiny_buf[0..], @as(void, {}));
+    defer scanner.dir.close(std.testing.io);
 
     try std.testing.expectError(error.BufferTooSmall, scanner.copyName("long"));
     const short_name = try scanner.copyName("ok");

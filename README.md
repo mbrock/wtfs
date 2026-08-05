@@ -174,6 +174,15 @@ uv run wtfs-tui scan.bin
 - `Tab` - Switch between Directories and Large Files tabs
 - `q` - Quit
 - `Ctrl+P` - Command palette
+- `m` - Mark or unmark the selected directory for deletion
+- `d` - Review and permanently delete marked directories
+
+Deletion is enabled automatically after a fresh scan. When opening a saved
+dump directly, provide its original scan root:
+
+```bash
+uv run wtfs-tui scan.bin --root /path/that/was/scanned
+```
 
 The interactive mode makes it easy to explore large directory structures and quickly find what's taking up space!
 

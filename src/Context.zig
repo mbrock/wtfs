@@ -29,8 +29,9 @@ pub const invalid_fd: std.posix.fd_t = -1;
 const Context = @This();
 
 allocator: std.mem.Allocator,
+io: std.Io,
 
-directories_mutex: std.Thread.Mutex = .{},
+directories_mutex: std.Io.Mutex = .init,
 directories: *DirectoryTable,
 
 large_files: *std.MultiArrayList(LargeFile),
@@ -40,8 +41,7 @@ outstanding: AtomicUsize = AtomicUsize.init(0),
 
 names_buffer: *SegmentedStringBuffer,
 
-pool: *std.Thread.Pool,
-wait_group: *std.Thread.WaitGroup,
+worker_group: *std.Io.Group,
 
 progress_node: std.Progress.Node,
 errprogress: std.Progress.Node,
@@ -67,36 +67,36 @@ pub fn directoryCString(self: *const Context, index: usize) [:0]const u8 {
 }
 
 pub fn setTotals(self: *Context, index: usize, size: u64, files: usize) void {
-    self.directories_mutex.lock();
-    defer self.directories_mutex.unlock();
+    self.directories_mutex.lockUncancelable(self.io);
+    defer self.directories_mutex.unlock(self.io);
     self.directories.ptr(.total_size, index).* = size;
     self.directories.ptr(.total_files, index).* = files;
     self.directories.ptr(.total_dirs, index).* = 1;
 }
 
 pub fn markInaccessible(self: *Context, index: usize) void {
-    self.directories_mutex.lock();
-    defer self.directories_mutex.unlock();
+    self.directories_mutex.lockUncancelable(self.io);
+    defer self.directories_mutex.unlock(self.io);
     const fd_ptr = self.directories.ptr(.fd, index);
     const current_fd = fd_ptr.*;
     if (current_fd != invalid_fd) {
-        std.posix.close(current_fd);
+        (std.Io.Dir{ .handle = current_fd }).close(self.io);
         fd_ptr.* = invalid_fd;
     }
     self.directories.ptr(.fdrefcount, index).store(0, .release);
     self.directories.ptr(.inaccessible, index).* = true;
 }
 
-pub fn addRoot(self: *Context, path: []const u8, dir: std.fs.Dir) !usize {
+pub fn addRoot(self: *Context, path: []const u8, dir: std.Io.Dir) !usize {
     const name_slice = try self.storeName(path);
 
-    self.directories_mutex.lock();
-    defer self.directories_mutex.unlock();
+    self.directories_mutex.lockUncancelable(self.io);
+    defer self.directories_mutex.unlock(self.io);
 
     const index = try self.directories.addOne(self.allocator);
     self.directories.ptr(.parent, index).* = 0;
     self.directories.ptr(.name_slice, index).* = name_slice;
-    self.directories.ptr(.fd, index).* = dir.fd;
+    self.directories.ptr(.fd, index).* = dir.handle;
     self.directories.ptr(.total_size, index).* = 0;
     self.directories.ptr(.total_files, index).* = 0;
     self.directories.ptr(.total_dirs, index).* = 1;
@@ -121,8 +121,8 @@ pub fn setDirectoryFd(self: *Context, index: usize, fd: std.posix.fd_t) void {
 /// Increment reference count to keep a parent directory fd open (thread-safe)
 /// Call when scheduling a child directory that will need openat() from this parent
 pub fn retainParentFd(self: *Context, parent_index: usize) void {
-    self.directories_mutex.lock();
-    defer self.directories_mutex.unlock();
+    self.directories_mutex.lockUncancelable(self.io);
+    defer self.directories_mutex.unlock(self.io);
     self.retainParentFdLocked(parent_index);
 }
 
@@ -151,8 +151,8 @@ pub fn recordLargeFile(
     name: []const u8,
     size: u64,
 ) !void {
-    self.directories_mutex.lock();
-    defer self.directories_mutex.unlock();
+    self.directories_mutex.lockUncancelable(self.io);
+    defer self.directories_mutex.unlock(self.io);
 
     try self.recordLargeFileLocked(directory_index, name, size);
 }
@@ -164,17 +164,17 @@ pub fn shouldExcludeDir(
     child_name: []const u8,
 ) bool {
     if (self.exclude_root_dirs.len == 0) return false;
-    
+
     // Only check exclusions for direct children of root (parent_index == 0)
     if (parent_index != 0) return false;
-    
+
     // Check if child_name matches any excluded directory
     for (self.exclude_root_dirs) |excluded| {
         if (std.mem.eql(u8, child_name, excluded)) {
             return true;
         }
     }
-    
+
     return false;
 }
 
@@ -188,9 +188,9 @@ pub fn releaseParentFd(self: *Context, parent_index: usize) void {
         const fd_ptr = self.directories.ptr(.fd, parent_index);
         const fd = fd_ptr.*;
         if (fd != invalid_fd) {
-            self.directories_mutex.lock();
-            defer self.directories_mutex.unlock();
-            std.posix.close(fd);
+            self.directories_mutex.lockUncancelable(self.io);
+            defer self.directories_mutex.unlock(self.io);
+            (std.Io.Dir{ .handle = fd }).close(self.io);
             fd_ptr.* = invalid_fd;
         }
     }
@@ -206,9 +206,9 @@ pub fn releaseParentFdAfterOpen(self: *Context, parent_index: usize) void {
         const fd_ptr = self.directories.ptr(.fd, parent_index);
         const fd = fd_ptr.*;
         if (fd != invalid_fd) {
-            self.directories_mutex.lock();
-            defer self.directories_mutex.unlock();
-            std.posix.close(fd);
+            self.directories_mutex.lockUncancelable(self.io);
+            defer self.directories_mutex.unlock(self.io);
+            (std.Io.Dir{ .handle = fd }).close(self.io);
             fd_ptr.* = invalid_fd;
         }
     }

@@ -8,7 +8,7 @@ const SummaryEntry = DiskScan.SummaryEntry;
 const FileSummaryEntry = DiskScan.FileSummaryEntry;
 const DirectoryTotals = DiskScan.DirectoryTotals;
 const ScanResults = DiskScan.ScanResults;
-const Writer = std.io.Writer;
+const Writer = std.Io.Writer;
 const Allocator = std.mem.Allocator;
 
 const TabWriter = Tabular.TabWriter;
@@ -67,7 +67,7 @@ pub fn buildTopLevelSummary(
     entries: []const SummaryEntry,
     limit: usize,
 ) !TopLevelSummary {
-    var summary = TopLevelSummary{ .rows = std.ArrayList(TopLevelRow){} };
+    var summary = TopLevelSummary{ .rows = .empty };
     errdefer summary.rows.deinit(allocator);
 
     if (entries.len == 0) return summary;
@@ -163,7 +163,7 @@ pub fn buildHeaviestSummary(
     data: ReportData,
     entries: []const SummaryEntry,
 ) !HeaviestSummary {
-    var summary = HeaviestSummary{ .rows = std.ArrayList(HeaviestRow){} };
+    var summary = HeaviestSummary{ .rows = .empty };
     errdefer summary.rows.deinit(allocator);
 
     if (entries.len == 0) return summary;
@@ -192,7 +192,7 @@ pub fn buildHeaviestSummary(
 
             const gop = try child_map.getOrPut(parent_index);
             if (!gop.found_existing) {
-                gop.value_ptr.* = std.ArrayList(usize){};
+                gop.value_ptr.* = .empty;
             }
             const children_ptr = gop.value_ptr;
             if (std.mem.indexOfScalar(usize, children_ptr.items, current) == null) {

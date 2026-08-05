@@ -20,24 +20,26 @@ const TabWriter = Tabular.TabWriter;
 const Column = Tabular.Column;
 
 var stderr_buffer: [4096]u8 = undefined;
-var stderr_writer = std.fs.File.stderr().writer(&stderr_buffer);
+var stderr_writer: std.Io.File.Writer = undefined;
 const stderr = &stderr_writer.interface;
-pub fn main() !void {
-    const gpa = std.heap.c_allocator;
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    var thread_safe_arena = std.heap.ThreadSafeAllocator{
-        .child_allocator = arena.allocator(),
-    };
-    const allocator = thread_safe_arena.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    // The arena is threadsafe, and lives for the whole process.
+    const allocator = init.arena.allocator();
 
-    const exe_name = if (args.len > 0)
-        std.mem.sliceTo(args[0], 0)
-    else
-        "wtfs";
+    stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+
+    var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
+    defer args_it.deinit();
+
+    var args_list: std.ArrayList([]const u8) = .empty;
+    while (args_it.next()) |arg| {
+        try args_list.append(allocator, try allocator.dupe(u8, arg));
+    }
+    const args = args_list.items;
+
+    const exe_name = if (args.len > 0) args[0] else "wtfs";
 
     var skip_hidden = false;
     var root_arg: ?[]const u8 = null;
@@ -55,7 +57,7 @@ pub fn main() !void {
 
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
-        const arg = std.mem.sliceTo(args[arg_index], 0);
+        const arg = args[arg_index];
         if (std.mem.eql(u8, arg, "--skip-hidden")) {
             skip_hidden = true;
             continue;
@@ -66,7 +68,7 @@ pub fn main() !void {
                 try printUsage(exe_name);
                 return;
             }
-            binary_output = std.mem.sliceTo(args[arg_index], 0);
+            binary_output = args[arg_index];
             continue;
         }
         if (std.mem.eql(u8, arg, "--binary-input")) {
@@ -75,7 +77,7 @@ pub fn main() !void {
                 try printUsage(exe_name);
                 return;
             }
-            binary_input = std.mem.sliceTo(args[arg_index], 0);
+            binary_input = args[arg_index];
             continue;
         }
         if (std.mem.eql(u8, arg, "--large-file-threshold")) {
@@ -84,7 +86,7 @@ pub fn main() !void {
                 try printUsage(exe_name);
                 return;
             }
-            const value_arg = std.mem.sliceTo(args[arg_index], 0);
+            const value_arg = args[arg_index];
             large_file_threshold = parseSize(value_arg) catch {
                 try stderr.print("invalid size for --large-file-threshold: {s}\n", .{value_arg});
                 try printUsage(exe_name);
@@ -129,7 +131,7 @@ pub fn main() !void {
     }
 
     if (dump_structs) {
-        try dumpStructLayouts();
+        try dumpStructLayouts(io);
         return;
     }
 
@@ -159,6 +161,7 @@ pub fn main() !void {
 
     var diskScan = DiskScan{
         .allocator = allocator,
+        .io = io,
         .skip_hidden = skip_hidden,
         .root = root,
         .large_file_threshold = large_file_threshold,
@@ -172,11 +175,11 @@ pub fn main() !void {
 
     if (binary_input) |path| {
         // Load from binary dump
-        var binary_file = try std.fs.cwd().openFile(path, .{});
-        defer binary_file.close();
+        var binary_file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer binary_file.close(io);
 
         var binary_buffer: [16 * 1024]u8 = undefined;
-        var file_reader = binary_file.reader(binary_buffer[0..]);
+        var file_reader = binary_file.reader(io, binary_buffer[0..]);
 
         const results = try diskScan.readBinaryResults(&file_reader.interface);
 
@@ -189,11 +192,11 @@ pub fn main() !void {
 
         try diskScan.reportResults(results, summary);
     } else if (binary_output) |path| {
-        var binary_file = try std.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
-        defer binary_file.close();
+        var binary_file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .read = false });
+        defer binary_file.close(io);
 
         var binary_buffer: [16 * 1024]u8 = undefined;
-        var file_writer = binary_file.writer(binary_buffer[0..]);
+        var file_writer = binary_file.writer(io, binary_buffer[0..]);
 
         try diskScan.runWithBinaryOutput(&file_writer.interface, true);
         try file_writer.end();
@@ -257,9 +260,9 @@ fn printUsage(exe_name: []const u8) !void {
     try stderr.print("       --force: bypass safety checks (e.g., scanning / on macOS)\n", .{});
 }
 
-fn dumpStructLayouts() !void {
+fn dumpStructLayouts(io: std.Io) !void {
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
     defer stdout.flush() catch {};
 
@@ -267,7 +270,7 @@ fn dumpStructLayouts() !void {
     try dumpStruct(stdout, "Worker", WorkerMod.Worker);
     try dumpStruct(stdout, "Worker.Scanner", WorkerMod.Scanner);
     try dumpStruct(stdout, "SysDispatcher.Config", SysDispatcher.Config);
-    try dumpStruct(stdout, "fs.Dir.Iterator", std.fs.Dir.Iterator);
+    try dumpStruct(stdout, "Io.Dir.Iterator", std.Io.Dir.Iterator);
 }
 
 fn dumpStruct(writer: *Writer, comptime name: []const u8, comptime T: type) !void {
@@ -281,23 +284,23 @@ fn dumpStruct(writer: *Writer, comptime name: []const u8, comptime T: type) !voi
                 @as(usize, @alignOf(T)),
             });
 
-            if (struct_info.fields.len > 0) {
+            if (struct_info.field_names.len > 0) {
                 const Row = struct {
                     field: []const u8,
                     type_name: []const u8,
                     size: usize,
                 };
 
-                const capacity = struct_info.fields.len * 2 + 1;
+                const capacity = struct_info.field_names.len * 2 + 1;
                 var rows: [capacity]Row = undefined;
                 var row_count: usize = 0;
 
                 var expected_offset: usize = 0;
 
-                inline for (struct_info.fields) |field| {
-                    const field_offset = @offsetOf(T, field.name);
-                    const field_size = @sizeOf(field.type);
-                    const field_align = @alignOf(field.type);
+                inline for (struct_info.field_names, struct_info.field_types) |field_name, field_type| {
+                    const field_offset = @offsetOf(T, field_name);
+                    const field_size = @sizeOf(field_type);
+                    const field_align = @alignOf(field_type);
 
                     const aligned_offset = std.mem.alignForward(usize, expected_offset, field_align);
                     const padding = aligned_offset - expected_offset;
@@ -311,7 +314,7 @@ fn dumpStruct(writer: *Writer, comptime name: []const u8, comptime T: type) !voi
                         row_count += 1;
                     }
 
-                    const type_name = @typeName(field.type);
+                    const type_name = @typeName(field_type);
                     const max_type_len = 32;
                     const display_type = if (type_name.len > max_type_len)
                         type_name[0 .. max_type_len - 2] ++ ".."
@@ -319,7 +322,7 @@ fn dumpStruct(writer: *Writer, comptime name: []const u8, comptime T: type) !voi
                         type_name;
 
                     rows[row_count] = .{
-                        .field = "." ++ field.name,
+                        .field = "." ++ field_name,
                         .type_name = display_type,
                         .size = field_size,
                     };
