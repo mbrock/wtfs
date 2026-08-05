@@ -315,10 +315,10 @@ test "SegmentedStringBuffer spans multiple shelves" {
     const allocator = std.testing.allocator;
     defer buffer.deinit(allocator);
 
-    const first_data = "a" ** (SegmentedStringBuffer.first_shelf_bytes - 1); // Leave room for null
-    const first = try buffer.append(allocator, first_data);
+    const first_data: [SegmentedStringBuffer.first_shelf_bytes - 1]u8 = @splat('a'); // Leave room for null
+    const first = try buffer.append(allocator, &first_data);
     try std.testing.expectEqual(@as(usize, 1), buffer.shelfCount());
-    try std.testing.expectEqualStrings(first_data, buffer.get(first));
+    try std.testing.expectEqualStrings(&first_data, buffer.get(first));
 
     const second_len = SegmentedStringBuffer.first_shelf_bytes + 128;
     const payload = try allocator.alloc(u8, second_len);
@@ -349,9 +349,8 @@ test "SegmentedStringBuffer append keeps entries within shelf" {
 }
 
 test "SegmentedStringBuffer concurrent append" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
-    defer std.debug.assert(gpa.deinit() == .ok);
-    const allocator = gpa.allocator();
+    // `std.testing.allocator` is a thread-safe `SafeAllocator`.
+    const allocator = std.testing.allocator;
 
     var buffer = SegmentedStringBuffer.empty;
     defer buffer.deinit(allocator);

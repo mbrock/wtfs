@@ -26,6 +26,8 @@ def main():
     parser.add_argument('path', nargs='?', default='.', help='Directory to scan (default: current)')
     parser.add_argument('--save', metavar='FILE', help='Save binary dump to file')
     parser.add_argument('--load', metavar='FILE', help='Load and display existing dump')
+    parser.add_argument('--root', metavar='PATH',
+                       help='Scanned root for a loaded dump (enables TUI deletion)')
     parser.add_argument('--interactive', '-i', action='store_true',
                        help='Launch interactive TUI browser')
     parser.add_argument('--webui', '-w', action='store_true',
@@ -52,7 +54,7 @@ def main():
 
             if args.interactive:
                 from .tui import run_interactive
-                run_interactive(args.load)
+                run_interactive(args.load, root_path=args.root)
             elif args.webui:
                 launch_web_ui(console, data, ".", args.host, args.port)
             else:
@@ -151,4 +153,3 @@ def parse_size(size_str: str) -> int:
 
 if __name__ == '__main__':
     main()
-

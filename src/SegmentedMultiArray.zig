@@ -24,12 +24,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         const Elem = switch (@typeInfo(T)) {
             .@"struct" => T,
             .@"union" => |u| struct {
-                pub const Bare = @Type(.{ .@"union" = .{
-                    .layout = u.layout,
-                    .tag_type = null,
-                    .fields = u.fields,
-                    .decls = &.{},
-                } });
+                pub const Bare = meta.BareUnion(T);
                 pub const Tag = u.tag_type orelse
                     @compileError("no untagged unions");
                 tags: Tag,
@@ -55,13 +50,14 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         };
 
         pub const Field = meta.FieldEnum(Elem);
-        const fields = meta.fields(Elem);
+        const field_names = @typeInfo(Elem).@"struct".field_names;
+        const field_types = @typeInfo(Elem).@"struct".field_types;
 
         fn FieldType(comptime f: Field) type {
             return @FieldType(Elem, @tagName(f));
         }
         fn FieldTypeI(comptime i: usize) type {
-            return @FieldType(Elem, fields[i].name);
+            return @FieldType(Elem, field_names[i]);
         }
 
         // ----- Storage: per-field shelves (each shelf is a contiguous []FieldType) -----
@@ -69,7 +65,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
             addr: usize,
         };
 
-        shelves: [fields.len][MAX_SHELVES]ShelfEntry = undefined,
+        shelves: [field_names.len][MAX_SHELVES]ShelfEntry = undefined,
         latch: CapacityLatch = .{},
         shelf_count: std.atomic.Value(usize) = .init(0),
 
@@ -79,8 +75,8 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         /// Existing field pointers become invalid once this returns.
         pub fn deinit(self: *Self, alloc: Allocator) void {
             const shelf_count = self.shelf_count.load(.acquire);
-            inline for (fields, 0..) |f, fi| {
-                if (@sizeOf(f.type) == 0) continue;
+            inline for (field_names, field_types, 0..) |_, f_type, fi| {
+                if (@sizeOf(f_type) == 0) continue;
                 for (0..shelf_count) |s| {
                     const addr = self.shelves[fi][s].addr;
                     if (addr == 0) continue;
@@ -221,11 +217,11 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
             cap: usize,
             shelf_count: usize,
             shelves: [MAX_SHELVES]DebugShelf,
-            field_bytes: [fields.len]usize,
+            field_bytes: [field_names.len]usize,
             total_bytes: usize,
 
             pub fn bytesForField(self: @This(), comptime field: Field) usize {
-                return self.field_bytes[@intFromEnum(field)];
+                return self.field_bytes[@backingInt(field)];
             }
         };
 
@@ -239,7 +235,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
                 .total_bytes = 0,
             };
 
-            inline for (fields, 0..) |_, fi| {
+            inline for (0..field_names.len) |fi| {
                 stats.field_bytes[fi] = 0;
             }
             var s: usize = 0;
@@ -254,9 +250,9 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
                 const take = @min(rows, remaining);
                 stats.shelves[shelf_index] = .{ .capacity = rows, .used = take };
 
-                inline for (fields, 0..) |f, fi| {
-                    if (@sizeOf(f.type) == 0) continue;
-                    const bytes = take * @sizeOf(f.type);
+                inline for (field_names, field_types, 0..) |_, f_type, fi| {
+                    if (@sizeOf(f_type) == 0) continue;
+                    const bytes = take * @sizeOf(f_type);
                     stats.field_bytes[fi] += bytes;
                     stats.total_bytes += bytes;
                 }
@@ -285,9 +281,9 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
             if (s >= MAX_SHELVES) return error.OutOfMemory;
 
             const rows = shelfSizeByIndex(@intCast(s));
-            inline for (fields, 0..) |f, fi| {
-                if (@sizeOf(f.type) == 0) continue;
-                const buf = try alloc.alloc(f.type, rows);
+            inline for (field_names, field_types, 0..) |_, f_type, fi| {
+                if (@sizeOf(f_type) == 0) continue;
+                const buf = try alloc.alloc(f_type, rows);
                 self.shelves[fi][s].addr = @intFromPtr(buf.ptr);
             }
 
@@ -339,7 +335,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         /// Pointers remain valid across future growth because shelves are never relocated.
         pub fn ptr(self: *Self, comptime field: Field, idx: usize) *FieldType(field) {
             std.debug.assert(idx < self.len());
-            const fi = @intFromEnum(field);
+            const fi = @backingInt(field);
             const sb = shelfIndex(idx);
             const bi = boxIndex(idx, sb);
 
@@ -360,15 +356,15 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         pub fn get(self: *Self, idx: usize) T {
             std.debug.assert(idx < self.len());
             var e: Elem = undefined;
-            inline for (fields, 0..) |f, fi| {
-                if (@sizeOf(f.type) != 0) {
+            inline for (field_names, field_types, 0..) |f_name, f_type, fi| {
+                if (@sizeOf(f_type) != 0) {
                     const sb = shelfIndex(idx);
                     const bi = boxIndex(idx, sb);
                     const shelf_pos: usize = @intCast(sb);
                     const entry = self.shelves[fi][shelf_pos];
                     std.debug.assert(entry.addr != 0);
                     const base: [*]FieldTypeI(fi) = @as([*]FieldTypeI(fi), @ptrFromInt(entry.addr));
-                    @field(e, f.name) = base[bi];
+                    @field(e, f_name) = base[bi];
                 } else {
                     // ZST: leave default
                 }
@@ -392,13 +388,13 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
             };
             const sb = shelfIndex(idx);
             const bi = boxIndex(idx, sb);
-            inline for (fields, 0..) |f, fi| {
-                if (@sizeOf(f.type) == 0) continue;
+            inline for (field_names, field_types, 0..) |f_name, f_type, fi| {
+                if (@sizeOf(f_type) == 0) continue;
                 const shelf_pos: usize = @intCast(sb);
                 const entry = self.shelves[fi][shelf_pos];
                 std.debug.assert(entry.addr != 0);
                 const base: [*]FieldTypeI(fi) = @as([*]FieldTypeI(fi), @ptrFromInt(entry.addr));
-                base[bi] = @field(e, f.name);
+                base[bi] = @field(e, f_name);
             }
         }
 
@@ -422,10 +418,10 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
             try mal.ensureTotalCapacity(alloc, len_snapshot);
             mal.len = len_snapshot;
             var out = mal.slice();
-            inline for (fields, 0..) |f, fi| {
-                if (@sizeOf(f.type) == 0) continue;
-                const dst = out.items(@enumFromInt(fi));
-                const elem_sz = @sizeOf(f.type);
+            inline for (field_names, field_types, 0..) |_, f_type, fi| {
+                if (@sizeOf(f_type) == 0) continue;
+                const dst = out.items(@fromBackingInt(@intCast(fi)));
+                const elem_sz = @sizeOf(f_type);
                 const dst_bytes = mem.sliceAsBytes(dst);
                 var off: usize = 0;
                 const shelf_count = self.shelf_count.load(.acquire);
@@ -473,8 +469,8 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
 
                 var shelfslices: [MAX_SHELVES][]FT = undefined;
                 for (0..Self.shelfIndex(self.len - 1)) |i| {
-                    var entries: [fields.len]ShelfEntry = undefined;
-                    inline for (0..fields.len) |fi| {
+                    var entries: [field_names.len]ShelfEntry = undefined;
+                    inline for (0..field_names.len) |fi| {
                         entries[fi] = self.parent.shelves[fi][i];
                     }
                     if (entries[0].addr == 0) {
@@ -497,7 +493,7 @@ pub fn SegmentedMultiArray(comptime T: type, comptime PREALLOC: usize) type {
         /// Typed segmented field view used by `itemsSeg`.
         pub fn SegView(comptime field: Field) type {
             const ViewedFieldType = FieldType(field);
-            const field_index = @intFromEnum(field);
+            const field_index = @backingInt(field);
             return struct {
                 parent: *Self,
 
@@ -816,10 +812,7 @@ test "SegmentedMultiArray concurrent reserveBlock" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
     const Row = struct { writer: usize, value: usize };
-    var thread_safe_allocator = std.heap.ThreadSafeAllocator{
-        .child_allocator = testing.allocator,
-    };
-    const alloc = thread_safe_allocator.allocator();
+    const alloc = testing.allocator;
 
     var sma = SegmentedMultiArray(Row, 0){};
     defer sma.deinit(alloc);
@@ -858,7 +851,7 @@ test "SegmentedMultiArray concurrent reserveBlock" {
     defer testing.allocator.free(seen);
     @memset(seen, false);
 
-    var per_writer = [_]usize{0} ** thread_count;
+    var per_writer: [thread_count]usize = @splat(0);
 
     for (0..total) |i| {
         const row = sma.get(i);
@@ -880,10 +873,7 @@ test "SegmentedMultiArray concurrent addOne" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
     const Row = struct { writer: usize, value: usize };
-    var thread_safe_allocator = std.heap.ThreadSafeAllocator{
-        .child_allocator = testing.allocator,
-    };
-    const alloc = thread_safe_allocator.allocator();
+    const alloc = testing.allocator;
 
     var sma = SegmentedMultiArray(Row, 16){};
     defer sma.deinit(alloc);
@@ -925,7 +915,7 @@ test "SegmentedMultiArray concurrent addOne" {
     defer testing.allocator.free(seen);
     @memset(seen, false);
 
-    var per_writer = [_]usize{0} ** thread_count;
+    var per_writer: [thread_count]usize = @splat(0);
 
     for (0..total) |i| {
         const row = sma.get(i);

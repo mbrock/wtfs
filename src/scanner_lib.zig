@@ -8,6 +8,13 @@ const DiskScan = @import("DiskScan.zig");
 /// Opaque handle to a scanner instance (hides Zig implementation details)
 pub const ScannerHandle = opaque {};
 
+/// A scanner plus the I/O implementation it owns. Unlike the CLI, a shared
+/// library has no `main` to hand us an `Io`, so each handle brings its own.
+const Scanner = struct {
+    threaded: std.Io.Threaded,
+    scan: DiskScan,
+};
+
 /// C-compatible scan options
 pub const CScanOptions = extern struct {
     skip_hidden: bool,
@@ -28,12 +35,14 @@ pub const CScanResults = extern struct {
 export fn wtfs_scanner_create() ?*ScannerHandle {
     const allocator = std.heap.c_allocator;
 
-    const scan = allocator.create(DiskScan) catch return null;
-    scan.* = DiskScan{
+    const scanner = allocator.create(Scanner) catch return null;
+    scanner.threaded = .init(allocator, .{ .stack_size = 32 * 1024 * 1024 });
+    scanner.scan = DiskScan{
         .allocator = allocator,
+        .io = scanner.threaded.io(),
     };
 
-    return @ptrCast(scan);
+    return @ptrCast(scanner);
 }
 
 /// Run a scan on the specified directory
@@ -51,7 +60,8 @@ export fn wtfs_scanner_scan(
     options: *const CScanOptions,
     results: *CScanResults,
 ) bool {
-    const scan: *DiskScan = @ptrCast(@alignCast(handle));
+    const scanner: *Scanner = @ptrCast(@alignCast(handle));
+    const scan = &scanner.scan;
 
     // Configure scan
     scan.skip_hidden = options.skip_hidden;
@@ -59,7 +69,7 @@ export fn wtfs_scanner_scan(
     scan.root = std.mem.span(path);
 
     // Initialize minimal progress tracking (required by gatherPhase)
-    var progress = std.Progress.start(.{
+    var progress = std.Progress.start(scan.io, .{
         .root_name = "wtfs",
         .disable_printing = true,
     });
@@ -93,19 +103,20 @@ export fn wtfs_scanner_write_dump(
     handle: *ScannerHandle,
     path: [*:0]const u8,
 ) bool {
-    const scan: *DiskScan = @ptrCast(@alignCast(handle));
+    const scanner: *Scanner = @ptrCast(@alignCast(handle));
+    const scan = &scanner.scan;
     const file_path = std.mem.span(path);
 
     // Open file for writing
-    var file = std.fs.cwd().createFile(file_path, .{
+    var file = std.Io.Dir.cwd().createFile(scan.io, file_path, .{
         .truncate = true,
         .read = false,
     }) catch return false;
-    defer file.close();
+    defer file.close(scan.io);
 
     // Create buffered writer
     var buffer: [16 * 1024]u8 = undefined;
-    var file_writer = file.writer(&buffer);
+    var file_writer = file.writer(scan.io, &buffer);
 
     // Build results from current scan data
     const results = DiskScan.ScanResults{
@@ -137,7 +148,8 @@ export fn wtfs_scanner_write_dump(
 ///
 /// Returns: Number of large files, or 0 if handle is invalid
 export fn wtfs_scanner_large_file_count(handle: *ScannerHandle) u64 {
-    const scan: *DiskScan = @ptrCast(@alignCast(handle));
+    const scanner: *Scanner = @ptrCast(@alignCast(handle));
+    const scan = &scanner.scan;
     return scan.large_files.len;
 }
 
@@ -158,7 +170,8 @@ export fn wtfs_scanner_get_large_file(
     path_buffer_size: u64,
     size: *u64,
 ) bool {
-    const scan: *DiskScan = @ptrCast(@alignCast(handle));
+    const scanner: *Scanner = @ptrCast(@alignCast(handle));
+    const scan = &scanner.scan;
 
     if (index >= scan.large_files.len) return false;
 
@@ -199,14 +212,16 @@ export fn wtfs_scanner_get_large_file(
 /// Args:
 ///   handle: Scanner instance to destroy
 export fn wtfs_scanner_destroy(handle: *ScannerHandle) void {
-    const scan: *DiskScan = @ptrCast(@alignCast(handle));
+    const scanner: *Scanner = @ptrCast(@alignCast(handle));
+    const scan = &scanner.scan;
     const allocator = scan.allocator;
 
     // Cleanup scan resources
     scan.freeNameBuffers();
     scan.directories.deinit(allocator);
     scan.large_files.deinit(allocator);
+    scanner.threaded.deinit();
 
     // Free the scanner itself
-    allocator.destroy(scan);
+    allocator.destroy(scanner);
 }

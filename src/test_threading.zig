@@ -3,29 +3,37 @@ const builtin = @import("builtin");
 
 const StartBarrier = struct {
     remaining: std.atomic.Value(usize),
-    event: std.Thread.ResetEvent = .{},
+    event: std.Io.Event = .unset,
 
     fn init(count: usize) StartBarrier {
         return .{ .remaining = std.atomic.Value(usize).init(count) };
     }
 
-    fn wait(self: *StartBarrier) void {
+    fn wait(self: *StartBarrier, io: std.Io) void {
         if (self.remaining.fetchSub(1, .acq_rel) == 1) {
-            self.event.set();
+            self.event.set(io);
         }
-        self.event.wait();
+        self.event.waitUncancelable(io);
     }
 };
 
 pub const ThreadTestGroup = struct {
     start_barrier: StartBarrier,
-    wg: std.Thread.WaitGroup = .{},
+    threaded: std.Io.Threaded,
+    group: std.Io.Group = .init,
 
     pub fn init(thread_count: usize) !ThreadTestGroup {
         if (builtin.single_threaded) {
             return error.ZigSkipTest;
         }
-        return .{ .start_barrier = StartBarrier.init(thread_count) };
+        return .{
+            .start_barrier = StartBarrier.init(thread_count),
+            // Every worker blocks on the start barrier, so they all need to be
+            // running at once: `concurrent`, with room for all of them.
+            .threaded = .init(std.testing.allocator, .{
+                .concurrent_limit = .limited(thread_count),
+            }),
+        };
     }
 
     pub fn spawn(
@@ -41,23 +49,18 @@ pub const ThreadTestGroup = struct {
         };
         const ArgsType = @TypeOf(args);
 
-        self.wg.start();
-
         const Worker = struct {
             const Fn = func;
             const Ret = ReturnType;
             const Args = ArgsType;
 
-            return_value: ?Ret = null,
-
             fn run(
                 mytid: usize,
+                io: std.Io,
                 barrier: *StartBarrier,
-                wg_ptr: *std.Thread.WaitGroup,
                 args_inner: Args,
             ) void {
-                defer wg_ptr.finish();
-                barrier.wait();
+                barrier.wait(io);
                 const tidargs = .{mytid} ++ args_inner;
                 if (@typeInfo(Ret) == .error_union) {
                     (@call(.auto, Fn, tidargs) catch |err| {
@@ -72,17 +75,13 @@ pub const ThreadTestGroup = struct {
             }
         };
 
-        const thread = try std.Thread.spawn(
-            .{},
-            Worker.run,
-            .{
-                tid,
-                &self.start_barrier,
-                &self.wg,
-                args,
-            },
-        );
-        thread.detach();
+        const io = self.threaded.io();
+        try self.group.concurrent(io, Worker.run, .{
+            tid,
+            io,
+            &self.start_barrier,
+            args,
+        });
     }
 
     pub fn spawnMany(
@@ -100,6 +99,7 @@ pub const ThreadTestGroup = struct {
         if (builtin.single_threaded) {
             return;
         }
-        self.wg.wait();
+        self.group.await(self.threaded.io()) catch {};
+        self.threaded.deinit();
     }
 };

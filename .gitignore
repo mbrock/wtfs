@@ -1,6 +1,7 @@
 .zig-cache
 zig-out
 *.log
+.DS_Store
 
 # Nix outputs
 result
@@ -19,3 +20,4 @@ wtfs/_bin/
 *.bin
 *.wtfs
 test_*.py
+!tests/test_*.py

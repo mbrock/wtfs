@@ -17,6 +17,9 @@ const Self = @This();
 /// Memory allocator for all dynamic allocations during the scan
 allocator: std.mem.Allocator,
 
+/// I/O implementation used for filesystem access, progress, and worker threads
+io: std.Io,
+
 /// Whether to skip hidden files and directories (starting with '.')
 skip_hidden: bool = false,
 
@@ -80,7 +83,7 @@ const Summary = struct {
 };
 
 const RootOpenResult = struct {
-    dir: ?std.fs.Dir,
+    dir: ?std.Io.Dir,
     inaccessible: bool,
 };
 
@@ -94,10 +97,6 @@ pub const ScanResults = struct {
     elapsed_ns: u64,
     totals: DirectoryTotals,
 };
-
-var stdout_buffer: [4096]u8 = undefined;
-var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-const stdout = &stdout_writer.interface;
 
 pub const RunOptions = struct {
     /// When true, generate the human readable summary and print it to stdout.
@@ -126,18 +125,18 @@ const PlatformConfig = struct {
 
 fn createScanContext(
     self: *Self,
-    pool: *std.Thread.Pool,
-    wait_group: *std.Thread.WaitGroup,
+    io: std.Io,
+    worker_group: *std.Io.Group,
     queue_progress: *std.Progress.Node,
     task_queue: *TaskQueue,
 ) Context {
     return Context{
         .allocator = self.allocator,
-        .pool = pool,
+        .io = io,
         .task_queue = task_queue,
         .directories = &self.directories,
         .names_buffer = &self.names,
-        .wait_group = wait_group,
+        .worker_group = worker_group,
         .progress_node = queue_progress.*,
         .errprogress = self.progress_root.start("errors", 0),
         .skip_hidden = self.skip_hidden,
@@ -150,8 +149,8 @@ fn createScanContext(
 fn initializeRootDirectory(self: *Self, ctx: *Context) !void {
     self.progress_root.setEstimatedTotalItems(1);
 
-    var rootdir = try std.fs.cwd().openDir(self.root, .{ .iterate = true });
-    errdefer rootdir.close();
+    var rootdir = try std.Io.Dir.cwd().openDir(self.io, self.root, .{ .iterate = true });
+    errdefer rootdir.close(self.io);
 
     const rootidx = try ctx.addRoot(".", rootdir);
 
@@ -167,22 +166,25 @@ fn gatherPhase(self: *Self) !void {
     var queue_progress = self.progress_root.start("Work queue", 0);
     errdefer queue_progress.end();
 
-    var wait_group = std.Thread.WaitGroup{};
+    // Workers are long-running loops that block on the task queue, so they must
+    // each get their own thread: `Group.concurrent`, never `Group.async` (which
+    // may run the task inline when the pool is saturated).
+    const n_workers = if (builtin.single_threaded)
+        1
+    else
+        std.Thread.getCpuCount() catch 1;
 
-    var worker_pool: std.Thread.Pool = undefined;
-    try worker_pool.init(.{
-        .allocator = self.allocator,
-        .stack_size = 32 * 1024 * 1024,
-    });
-    defer worker_pool.deinit();
+    const io = self.io;
+    var worker_group: std.Io.Group = .init;
 
     var task_queue = TaskQueue{
+        .io = io,
         .progress = &queue_progress,
     };
 
     var ctx = self.createScanContext(
-        &worker_pool,
-        &wait_group,
+        io,
+        &worker_group,
         &queue_progress,
         &task_queue,
     );
@@ -190,13 +192,11 @@ fn gatherPhase(self: *Self) !void {
 
     try self.initializeRootDirectory(&ctx);
 
-    const n_workers = if (builtin.single_threaded) 1 else worker_pool.threads.len;
-
     for (0..n_workers) |_| {
-        worker_pool.spawnWg(&wait_group, Worker.directoryWorker, .{&ctx});
+        try worker_group.concurrent(io, Worker.directoryWorker, .{&ctx});
     }
 
-    defer wait_group.wait();
+    defer worker_group.await(io) catch {};
 }
 
 fn writeFullPath(
@@ -248,7 +248,7 @@ pub fn freeNameBuffers(self: *Self) void {
 test "path helpers use shared directory data" {
     const allocator = std.testing.allocator;
 
-    var disk_scan = Self{ .allocator = allocator };
+    var disk_scan = Self{ .allocator = allocator, .io = std.testing.io };
     defer {
         disk_scan.freeNameBuffers();
         disk_scan.directories.deinit(allocator);
@@ -305,12 +305,12 @@ test "threaded disk scan can repeatedly scan populated directory trees" {
     for (0..top_dir_count) |top_index| {
         var dir_buf: [32]u8 = undefined;
         const dir_name = try std.fmt.bufPrint(&dir_buf, "dir{d}", .{top_index});
-        try tmp.dir.makePath(dir_name);
+        try tmp.dir.createDirPath(std.testing.io, dir_name);
 
         for (0..sub_dir_count) |sub_index| {
             var sub_buf: [64]u8 = undefined;
             const sub_name = try std.fmt.bufPrint(&sub_buf, "{s}/sub{d}", .{ dir_name, sub_index });
-            try tmp.dir.makePath(sub_name);
+            try tmp.dir.createDirPath(std.testing.io, sub_name);
 
             for (0..files_per_subdir) |file_index| {
                 var file_buf: [96]u8 = undefined;
@@ -319,19 +319,19 @@ test "threaded disk scan can repeatedly scan populated directory trees" {
                 var contents_buf: [32]u8 = undefined;
                 const contents = try std.fmt.bufPrint(&contents_buf, "data-{d}-{d}-{d}", .{ top_index, sub_index, file_index });
 
-                try tmp.dir.writeFile(.{ .sub_path = file_path, .data = contents });
+                try tmp.dir.writeFile(std.testing.io, .{ .sub_path = file_path, .data = contents });
             }
         }
     }
 
-    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const root_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(root_path);
 
     const expected_files = top_dir_count * sub_dir_count * files_per_subdir;
     const expected_directories = 1 + top_dir_count + (top_dir_count * sub_dir_count);
 
     for (0..20) |_| {
-        var disk_scan = Self{ .allocator = allocator, .root = root_path };
+        var disk_scan = Self{ .allocator = allocator, .io = std.testing.io, .root = root_path };
         defer {
             disk_scan.freeNameBuffers();
             disk_scan.directories.deinit(allocator);
@@ -380,7 +380,7 @@ const StatsAggregator = struct {
 
 const SummaryBuilder = struct {
     fn buildTopLevelEntries(self: *Self) !std.ArrayList(SummaryEntry) {
-        var entries = std.ArrayList(SummaryEntry){};
+        var entries: std.ArrayList(SummaryEntry) = .empty;
         errdefer Summary.freeEntryList(self.allocator, &entries);
         self.progress_root.setName("Building paths");
         const len_snapshot = self.directories.len();
@@ -409,9 +409,9 @@ const SummaryBuilder = struct {
     }
 
     fn buildHeaviestEntries(self: *Self, max_entries: usize) !std.ArrayList(SummaryEntry) {
-        if (max_entries == 0) return std.ArrayList(SummaryEntry){};
+        if (max_entries == 0) return .empty;
 
-        var top_indexes = std.ArrayList(usize){};
+        var top_indexes: std.ArrayList(usize) = .empty;
         defer top_indexes.deinit(self.allocator);
 
         const len_snapshot = self.directories.len();
@@ -423,7 +423,7 @@ const SummaryBuilder = struct {
             try SummaryBuilder.insertTopIndex(self, &top_indexes, idx, max_entries, size);
         }
 
-        var entries = std.ArrayList(SummaryEntry){};
+        var entries: std.ArrayList(SummaryEntry) = .empty;
         errdefer Summary.freeEntryList(self.allocator, &entries);
         try entries.ensureTotalCapacityPrecise(self.allocator, top_indexes.items.len);
 
@@ -440,9 +440,9 @@ const SummaryBuilder = struct {
     }
 
     fn buildLargeFileEntries(self: *Self, max_entries: usize) !std.ArrayList(FileSummaryEntry) {
-        if (max_entries == 0) return std.ArrayList(FileSummaryEntry){};
+        if (max_entries == 0) return .empty;
 
-        var top_indexes = std.ArrayList(usize){};
+        var top_indexes: std.ArrayList(usize) = .empty;
         defer top_indexes.deinit(self.allocator);
 
         const slices = self.large_files.slice();
@@ -455,7 +455,7 @@ const SummaryBuilder = struct {
             try SummaryBuilder.insertFileIndex(self, &top_indexes, idx, max_entries, sizes);
         }
 
-        var entries = std.ArrayList(FileSummaryEntry){};
+        var entries: std.ArrayList(FileSummaryEntry) = .empty;
         errdefer Summary.freeFileEntryList(self.allocator, &entries);
         try entries.ensureTotalCapacityPrecise(self.allocator, top_indexes.items.len);
 
@@ -567,9 +567,9 @@ const SummaryBuilder = struct {
 pub fn performScan(self: *Self) !ScanResults {
     self.large_files.clearRetainingCapacity();
 
-    var timer = try std.time.Timer.start();
+    const started = std.Io.Clock.awake.now(self.io);
     try self.gatherPhase();
-    const elapsed_ns = timer.read();
+    const elapsed_ns: u64 = @intCast(started.untilNow(self.io, .awake).toNanoseconds());
 
     StatsAggregator.aggregateUp(self);
     const totals = StatsAggregator.extractTotals(self);
@@ -582,9 +582,9 @@ pub fn performScan(self: *Self) !ScanResults {
 
 pub fn generateSummary(self: *Self) !Summary {
     var summary = Summary{
-        .top_level = std.ArrayList(SummaryEntry){},
-        .heaviest = std.ArrayList(SummaryEntry){},
-        .large_files = std.ArrayList(FileSummaryEntry){},
+        .top_level = .empty,
+        .heaviest = .empty,
+        .large_files = .empty,
     };
     errdefer summary.deinit(self.allocator);
 
@@ -620,6 +620,10 @@ pub fn reportResults(self: *Self, results: ScanResults, summary: Summary) !void 
     );
     defer heaviest.deinit(self.allocator);
 
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(self.io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+
     try Reporter.printHeader(stdout, self.root, results);
     try Reporter.printTopLevelDirectories(stdout, report_data, top_level);
     try Reporter.printHeaviestDirectories(stdout, report_data, heaviest);
@@ -629,9 +633,9 @@ pub fn reportResults(self: *Self, results: ScanResults, summary: Summary) !void 
 
 fn runWithOptions(self: *Self, options: RunOptions) !void {
     // Initialize progress tracking
-    var progress = std.Progress.start(.{
+    var progress = std.Progress.start(self.io, .{
         .root_name = "wtfs",
-        .refresh_rate_ns = 80 * std.time.ns_per_ms,
+        .refresh_rate_ns = .fromMilliseconds(80),
     });
     errdefer progress.end();
     self.progress_root = progress;
@@ -679,7 +683,7 @@ pub fn writeBinaryResults(
     try writer.writeStruct(results.totals, .little);
 
     // Build name buffer from segmented storage
-    var name_buffer = std.ArrayListUnmanaged(u8){};
+    var name_buffer: std.ArrayList(u8) = .empty;
     defer name_buffer.deinit(self.allocator);
 
     const dir_len = self.directories.len();
@@ -793,7 +797,7 @@ pub fn readBinaryResults(
     try reader.readSliceAll(name_buffer);
 
     // Store names in segmented buffer and collect slice indices
-    var name_slices = std.ArrayList(u32){};
+    var name_slices: std.ArrayList(u32) = .empty;
     defer name_slices.deinit(self.allocator);
 
     var name_offset: usize = 0;
