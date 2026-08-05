@@ -174,8 +174,22 @@ uv run wtfs-tui scan.bin
 - `Tab` - Switch between Directories and Large Files tabs
 - `q` - Quit
 - `Ctrl+P` - Command palette
-- `m` - Mark or unmark the selected directory for deletion
+- `m` - Mark or unmark the selected directory
+- `a` - Archive marked directories to a mounted volume or chosen folder
 - `d` - Review and permanently delete marked directories
+
+Deletion runs in the background with live entry and target progress. Independent
+marked directories are removed concurrently. wtfs repairs owner access bits on
+read-only contents when possible; targets that still fail remain marked and get
+a detailed report with the failing path and permission troubleshooting steps.
+
+Archiving creates a timestamped `wtfs-archive-*` directory at the chosen
+destination and mirrors each marked directory's path beneath it. Moves on one
+filesystem use an atomic rename; moves to an external volume stream the copy in
+the background with byte progress, preserve metadata and symbolic links, and
+remove the source only after the copy completes. Each archive includes a
+`manifest.json` recording original paths and outcomes. Mounted volumes such as
+`/Volumes/Lootbox` appear in the destination prompt automatically.
 
 Deletion is enabled automatically after a fresh scan. When opening a saved
 dump directly, provide its original scan root:
