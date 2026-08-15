@@ -34,7 +34,7 @@ from .archive import (
     write_manifest,
 )
 from .deletion import DeletionFailure, DeletionResult, delete_tree
-from .dump import WtfsDump, Directory, format_size
+from .dump import Directory, LargeFile, WtfsDump, format_size
 
 
 def deletion_path(root_path: Path, directory: Directory) -> Path:
@@ -599,7 +599,7 @@ class ArchiveReport(ModalScreen[None]):
 
 
 class DirectoryTreeView(Tree):
-    """Hierarchical tree view of directories."""
+    """Hierarchical tree view of directories and their recorded large files."""
 
     MIN_SIZE_THRESHOLD = 10 * 1024 * 1024  # 10 MiB
 
@@ -624,6 +624,19 @@ class DirectoryTreeView(Tree):
                 reverse=True,
             )
 
+        self.large_files_by_directory = {}
+        for large_file in self.data.large_files:
+            self.large_files_by_directory.setdefault(
+                large_file.directory_index,
+                [],
+            ).append(large_file)
+
+        for directory_idx in self.large_files_by_directory:
+            self.large_files_by_directory[directory_idx].sort(
+                key=lambda large_file: large_file.size,
+                reverse=True,
+            )
+
     def on_mount(self) -> None:
         """Build the root node when mounted."""
         # Only create the root node initially
@@ -638,24 +651,41 @@ class DirectoryTreeView(Tree):
         root_node.expand()
 
     def _add_children(self, parent_node: TreeNode, parent_idx: int):
-        """Lazily add children to a node, filtering out small directories."""
-        if parent_idx in self.children_by_parent:
-            for child_dir in self.children_by_parent[parent_idx]:
-                # Skip directories smaller than threshold
-                if child_dir.total_size < self.MIN_SIZE_THRESHOLD:
-                    continue
+        """Lazily add large files and non-trivial child directories."""
+        entries = [
+            (child_dir.total_size, child_dir)
+            for child_dir in self.children_by_parent.get(parent_idx, [])
+            if child_dir.total_size >= self.MIN_SIZE_THRESHOLD
+        ]
+        entries.extend(
+            (large_file.size, large_file)
+            for large_file in self.large_files_by_directory.get(parent_idx, [])
+        )
+        entries.sort(key=lambda entry: entry[0], reverse=True)
 
+        for _, entry in entries:
+            if isinstance(entry, Directory):
+                child_dir = entry
                 label = self._format_label(child_dir)
                 # Only create the node, don't add its children yet
-                has_children = child_dir.index in self.children_by_parent
+                has_children = (
+                    child_dir.index in self.children_by_parent
+                    or child_dir.index in self.large_files_by_directory
+                )
                 parent_node.add(label, data=child_dir, allow_expand=has_children)
+            else:
+                parent_node.add(
+                    self._format_large_file_label(entry),
+                    data=entry,
+                    allow_expand=False,
+                )
 
     def on_tree_node_expanded(self, event: Tree.NodeExpanded) -> None:
         """Load children when a node is expanded."""
         node = event.node
 
         # Only load children if not already loaded
-        if not node.children and node.data:
+        if not node.children and isinstance(node.data, Directory):
             dir_idx = node.data.index
             self._add_children(node, dir_idx)
 
@@ -679,6 +709,14 @@ class DirectoryTreeView(Tree):
         return (
             f"{marker}[cyan]{escape(name):<40}[/] "
             f"[yellow]{size_str:>10}[/] [dim]{files:>8,} files[/]"
+        )
+
+    def _format_large_file_label(self, large_file: LargeFile) -> str:
+        """Format a recorded large file as a leaf in its owning directory."""
+        size_str = format_size(large_file.size)
+        return (
+            f"         [bright_magenta]{escape(large_file.name):<40}[/] "
+            f"[yellow]{size_str:>10}[/] [dim]large file[/]"
         )
 
 

@@ -7,7 +7,7 @@ from unittest.mock import patch
 from textual.widgets import Input
 
 from wtfs.deletion import DeletionFailure, DeletionResult, delete_tree
-from wtfs.dump import Directory, DirectoryTotals, WtfsDump
+from wtfs.dump import Directory, DirectoryTotals, LargeFile, WtfsDump
 from wtfs.tui import (
     ArchiveDestination,
     ArchiveReport,
@@ -81,6 +81,45 @@ class OutermostDirectoriesTests(unittest.TestCase):
             ),
             [directories[1], directories[3]],
         )
+
+
+class DirectoryTreeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shows_large_files_beneath_their_owning_directory(self):
+        data = WtfsDump()
+        data.totals = DirectoryTotals(3, 2, 3 * 1024**3)
+        data.directories = [
+            directory(0, 0, "."),
+            directory(1, 0, "./globalStorage"),
+            directory(2, 1, "./globalStorage/extension-data"),
+        ]
+        data.directories[0].total_size = 3 * 1024**3
+        data.directories[1].total_size = 3 * 1024**3
+        data.directories[2].total_size = 400 * 1024**2
+        database = LargeFile(1, "state.vscdb", 1200 * 1024**2)
+        backup = LargeFile(1, "state.vscdb.backup", 1100 * 1024**2)
+        data.large_files = [database, backup]
+
+        app = WtfsApp(data)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            tree = app.query_one(DirectoryTreeView)
+            global_storage = tree.root.children[0].children[0]
+
+            self.assertTrue(global_storage.allow_expand)
+            global_storage.expand()
+            await pilot.pause()
+
+            self.assertEqual(
+                [node.data for node in global_storage.children],
+                [database, backup, data.directories[2]],
+            )
+            self.assertTrue(
+                all(not node.allow_expand for node in global_storage.children[:2])
+            )
+
+            tree.move_cursor(global_storage.children[0])
+            app.action_mark()
+            self.assertEqual(app.marked, set())
 
 
 class DeletionFlowTests(unittest.IsolatedAsyncioTestCase):

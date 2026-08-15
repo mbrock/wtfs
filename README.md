@@ -163,7 +163,7 @@ uv run wtfs-tui scan.bin
 **Features:**
 - 📊 **Real-time filtering** - Type to filter directories as you browse
 - 🔄 **Multiple sort modes** - Sort by size (`s`), name (`n`), or file count (`f`)
-- 📑 **Tabbed interface** - Switch between directories and large files views
+- 📄 **Large files in context** - Recorded large files appear beneath their owning directory
 - ⌨️ **Keyboard shortcuts** - Full keyboard navigation (arrow keys, Tab, etc.)
 - 🎨 **Beautiful UI** - Clean, modern interface with colors and formatting
 
@@ -171,7 +171,6 @@ uv run wtfs-tui scan.bin
 - `s` - Sort by size
 - `n` - Sort by name
 - `f` - Sort by file count
-- `Tab` - Switch between Directories and Large Files tabs
 - `q` - Quit
 - `Ctrl+P` - Command palette
 - `m` - Mark or unmark the selected directory
