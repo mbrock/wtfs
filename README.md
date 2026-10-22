@@ -56,7 +56,7 @@ as `\\`) so that one entry is always one line.
 $ sudo wtfs -x --deleted -n 5 /
 # wtfs /
 # du 13606984192 bytes (12.7GiB); apparent size 11192082480 bytes (10.4GiB); hardlinked copies not counted 4955936768 bytes (4.6GiB)
-# 1295739 entries: 1214396 files, 72271 dirs, 9071 symlinks, 1 other; 0 errors; 0.33s
+# 1295739 entries: 1214396 files, 72271 dirs, 9071 symlinks, 1 other; 0 errors; 5 mount points not scanned; 0.33s
 
 ## children of / by du (top 5 of 25)
 #          du_bytes   du_human     entries  path

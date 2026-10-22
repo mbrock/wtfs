@@ -73,6 +73,7 @@ pub fn print(a: Allocator, w: *Writer, scan: *const Scan, deleted: []const table
     var apparent: u64 = 0;
     var alloc_all: u64 = 0;
     var errors: u64 = 0;
+    var skipped: u64 = 0;
     var root_children: u64 = 0;
 
     var children: TopN(u32) = .{ .n = opts.top };
@@ -85,6 +86,7 @@ pub fn print(a: Allocator, w: *Writer, scan: *const Scan, deleted: []const table
         counts[@backingInt(r.kind)] += 1;
         if (!r.dup) apparent += r.size;
         alloc_all += r.alloc;
+        if (r.err == .other_fs or r.err == .pseudo_fs) skipped += 1;
         if (r.err != .none and r.err != .other_fs and r.err != .pseudo_fs) {
             errors += 1;
             if (errs.items.len < opts.top) try errs.append(a, @intCast(i));
@@ -108,13 +110,14 @@ pub fn print(a: Allocator, w: *Writer, scan: *const Scan, deleted: []const table
     try w.print("# du {d} bytes ({s})", .{ root.tree_du, formatBytes(&hb, root.tree_du) });
     try w.print("; apparent size {d} bytes ({s})", .{ apparent, formatBytes(&hb, apparent) });
     try w.print("; hardlinked copies not counted {d} bytes ({s})\n", .{ alloc_all - root.tree_du, formatBytes(&hb, alloc_all - root.tree_du) });
-    try w.print("# {d} entries: {d} files, {d} dirs, {d} symlinks, {d} other; {d} errors; {d:.2}s\n", .{
+    try w.print("# {d} entries: {d} files, {d} dirs, {d} symlinks, {d} other; {d} errors; {d} mount points not scanned; {d:.2}s\n", .{
         n,
         counts[@backingInt(Scan.Kind.file)],
         counts[@backingInt(Scan.Kind.dir)],
         counts[@backingInt(Scan.Kind.symlink)],
         n - counts[@backingInt(Scan.Kind.file)] - counts[@backingInt(Scan.Kind.dir)] - counts[@backingInt(Scan.Kind.symlink)],
         errors,
+        skipped,
         @as(f64, @floatFromInt(scan.elapsed_ns)) / std.time.ns_per_s,
     });
     if (opts.top == 0) return;
