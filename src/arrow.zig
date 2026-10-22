@@ -166,7 +166,7 @@ fn schemaNode(a: Allocator) !*const Node {
     for (table.columns, fields) |col, *out| {
         const type_id: u8, const type_node: Node = switch (col.type) {
             .utf8 => .{ type_utf8, .{ .table = &.{} } },
-            .u64 => .{ type_int, .{ .table = try a.dupe(Field, &.{ .{ .scalar = .{ .i32 = 64 } }, .{ .scalar = .{ .bool = false } } }) } },
+            .i64 => .{ type_int, .{ .table = try a.dupe(Field, &.{ .{ .scalar = .{ .i32 = 64 } }, .{ .scalar = .{ .bool = true } } }) } },
             .u32 => .{ type_int, .{ .table = try a.dupe(Field, &.{ .{ .scalar = .{ .i32 = 32 } }, .{ .scalar = .{ .bool = false } } }) } },
             .timestamp_us => .{ type_timestamp, .{ .table = try a.dupe(Field, &.{
                 .{ .scalar = .{ .i16 = unit_microsecond } },

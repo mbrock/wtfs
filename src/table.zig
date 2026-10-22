@@ -5,7 +5,9 @@ const std = @import("std");
 const Scan = @import("Scan.zig");
 const Row = Scan.Row;
 
-pub const Type = enum { utf8, u64, u32, timestamp_us };
+/// Byte counts, ids and inodes are signed 64-bit so SQL arithmetic and
+/// functions like DuckDB's format_bytes() need no casts.
+pub const Type = enum { utf8, i64, u32, timestamp_us };
 
 pub const Column = struct {
     name: []const u8,
@@ -17,16 +19,16 @@ pub const Column = struct {
 pub const columns = [_]Column{
     .{ .name = "path", .type = .utf8, .doc = "full path, starting with the scanned root as given" },
     .{ .name = "kind", .type = .utf8, .doc = "file, dir, symlink, fifo, socket, block, char, unknown, or deleted" },
-    .{ .name = "size", .type = .u64, .doc = "apparent size in bytes (st_size)" },
-    .{ .name = "alloc", .type = .u64, .doc = "bytes allocated on disk (st_blocks*512)" },
-    .{ .name = "du", .type = .u64, .doc = "bytes du charges to this path: alloc, or 0 if another hardlink to the inode was counted" },
-    .{ .name = "tree_du", .type = .u64, .doc = "sum of du over this entry and everything under it" },
-    .{ .name = "tree_count", .type = .u64, .doc = "number of entries in this subtree, including itself" },
-    .{ .name = "id", .type = .u64, .doc = "row number; the root is 0 and parents come before children" },
-    .{ .name = "parent", .type = .u64, .nullable = true, .doc = "id of the containing directory (NULL for the root)" },
+    .{ .name = "size", .type = .i64, .doc = "apparent size in bytes (st_size)" },
+    .{ .name = "alloc", .type = .i64, .doc = "bytes allocated on disk (st_blocks*512)" },
+    .{ .name = "du", .type = .i64, .doc = "bytes du charges to this path: alloc, or 0 if another hardlink to the inode was counted" },
+    .{ .name = "tree_du", .type = .i64, .doc = "sum of du over this entry and everything under it" },
+    .{ .name = "tree_count", .type = .i64, .doc = "number of entries in this subtree, including itself" },
+    .{ .name = "id", .type = .i64, .doc = "row number; the root is 0 and parents come before children" },
+    .{ .name = "parent", .type = .i64, .nullable = true, .doc = "id of the containing directory (NULL for the root)" },
     .{ .name = "depth", .type = .u32, .doc = "0 for the root, 1 for its children, ..." },
-    .{ .name = "dev", .type = .u64, .doc = "device id (Linux: major<<32 | minor)" },
-    .{ .name = "ino", .type = .u64, .doc = "inode number" },
+    .{ .name = "dev", .type = .i64, .doc = "device id (Linux: major<<32 | minor)" },
+    .{ .name = "ino", .type = .i64, .doc = "inode number" },
     .{ .name = "nlink", .type = .u32, .doc = "hard link count" },
     .{ .name = "uid", .type = .u32, .doc = "owner user id" },
     .{ .name = "gid", .type = .u32, .doc = "owner group id" },
@@ -115,16 +117,16 @@ pub const Batch = struct {
             const k = i - start;
             try putPath(a, &b.cols[0], b.path_buf.items);
             try putStr(a, &b.cols[1], kind);
-            try putInt(a, &b.cols[2], u64, row.size);
-            try putInt(a, &b.cols[3], u64, row.alloc);
-            try putInt(a, &b.cols[4], u64, row.du());
-            try putInt(a, &b.cols[5], u64, row.tree_du);
-            try putInt(a, &b.cols[6], u64, row.tree_count);
-            try putInt(a, &b.cols[7], u64, i);
+            try putInt(a, &b.cols[2], i64, row.size);
+            try putInt(a, &b.cols[3], i64, row.alloc);
+            try putInt(a, &b.cols[4], i64, row.du());
+            try putInt(a, &b.cols[5], i64, row.tree_du);
+            try putInt(a, &b.cols[6], i64, row.tree_count);
+            try putInt(a, &b.cols[7], i64, i);
             try putOptInt(a, &b.cols[8], k, b.len, parent);
             try putInt(a, &b.cols[9], u32, row.depth);
-            try putInt(a, &b.cols[10], u64, row.dev);
-            try putInt(a, &b.cols[11], u64, row.ino);
+            try putInt(a, &b.cols[10], i64, @as(i64, @bitCast(row.dev)));
+            try putInt(a, &b.cols[11], i64, @as(i64, @bitCast(row.ino)));
             try putInt(a, &b.cols[12], u32, row.nlink);
             try putInt(a, &b.cols[13], u32, row.uid);
             try putInt(a, &b.cols[14], u32, row.gid);
@@ -205,7 +207,7 @@ fn setValid(a: std.mem.Allocator, c: *ColumnData, k: usize, n: usize, valid: boo
 
 fn putOptInt(a: std.mem.Allocator, c: *ColumnData, k: usize, n: usize, v: ?u64) !void {
     try setValid(a, c, k, n, v != null);
-    try putInt(a, c, u64, v orelse 0);
+    try putInt(a, c, i64, v orelse 0);
 }
 
 fn putOptStr(a: std.mem.Allocator, c: *ColumnData, k: usize, n: usize, v: ?[]const u8) !void {

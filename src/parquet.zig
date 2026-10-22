@@ -116,7 +116,7 @@ const rep_optional = 1;
 const conv_utf8 = 0;
 const conv_timestamp_micros = 10;
 const conv_uint_32 = 13;
-const conv_uint_64 = 14;
+const conv_int_64 = 18;
 const enc_plain = 0;
 const enc_rle = 3;
 const codec_gzip = 2;
@@ -125,7 +125,7 @@ fn physicalType(ty: table.Type) i32 {
     return switch (ty) {
         .utf8 => ptype_byte_array,
         .u32 => ptype_int32,
-        .u64, .timestamp_us => ptype_int64,
+        .i64, .timestamp_us => ptype_int64,
     };
 }
 
@@ -328,7 +328,7 @@ const Writer = struct {
             try t.i32f(6, switch (col.type) {
                 .utf8 => conv_utf8,
                 .u32 => conv_uint_32,
-                .u64 => conv_uint_64,
+                .i64 => conv_int_64,
                 .timestamp_us => conv_timestamp_micros,
             });
             try t.begin(10); // LogicalType union
@@ -337,10 +337,10 @@ const Writer = struct {
                     try t.begin(1); // STRING
                     try t.end();
                 },
-                .u32, .u64 => {
+                .u32, .i64 => {
                     try t.begin(10); // INTEGER
                     try t.bytef(1, if (col.type == .u32) 32 else 64);
-                    try t.boolf(2, false);
+                    try t.boolf(2, col.type == .i64);
                     try t.end();
                 },
                 .timestamp_us => {
