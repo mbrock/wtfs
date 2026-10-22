@@ -1,0 +1,82 @@
+# Builds and tests on every push and pull request. Pushing a tag vX.Y.Z also
+# publishes a GitHub release with the static Linux and the macOS binaries.
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Check the tag matches build.zig.zon
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(sed -n 's/.*\.version = "\(.*\)".*/\1/p' build.zig.zon)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match build.zig.zon version $version" >&2
+            exit 1
+          fi
+      - run: zig fmt --check src build.zig
+      - run: zig build test
+      - run: zig build release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: zig-out/bin/wtfs-*
+          if-no-files-found: error
+
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, bin: wtfs-linux-x86_64 }
+          - { os: ubuntu-24.04-arm, bin: wtfs-linux-aarch64 }
+          - { os: macos-latest, bin: wtfs-macos-aarch64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: bin
+      - run: chmod +x bin/*
+      - run: python3 -m pip install --quiet duckdb || pip3 install --quiet --break-system-packages duckdb
+      - run: tools/smoke-test.sh bin/${{ matrix.bin }}
+      - name: Linux binaries are static
+        if: runner.os == 'Linux'
+        run: file bin/${{ matrix.bin }} | tee /dev/stderr | grep -q 'statically linked'
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: bin
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd bin
+          chmod +x wtfs-*
+          sha256sum wtfs-* > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" wtfs-* SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --title "wtfs $GITHUB_REF_NAME" --generate-notes
