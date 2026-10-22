@@ -1,399 +1,257 @@
-comptime {
-    _ = @import("TabWriter.zig");
-    _ = @import("DiskScan.zig");
-    _ = @import("DirScanner.zig");
-    _ = @import("SysDispatcher.zig");
-    _ = @import("SegmentedMultiArray.zig");
-}
-
 const std = @import("std");
-const DiskScan = @import("DiskScan.zig");
-const SysDispatcher = @import("SysDispatcher.zig");
-const WorkerMod = @import("Worker.zig");
-const Tabular = @import("TabWriter.zig");
-const Writer = std.Io.Writer;
 const builtin = @import("builtin");
-const ascii = std.ascii;
-const Report = @import("Report.zig");
+const build_options = @import("build_options");
+const Scan = @import("Scan.zig");
+const table = @import("table.zig");
+const arrow = @import("arrow.zig");
+const parquet = @import("parquet.zig");
+const report = @import("report.zig");
+const dump = @import("dump.zig");
+const deleted_files = @import("deleted.zig");
 
-const TabWriter = Tabular.TabWriter;
-const Column = Tabular.Column;
+const usage =
+    \\wtfs - find out where disk space went
+    \\
+    \\usage: wtfs [options] [PATH]
+    \\
+    \\Scans PATH (default .) in parallel and prints a plain-text summary: the
+    \\total, PATH's children, the largest directories and the largest files.
+    \\Data lines are "DU_BYTES  HUMAN  [ENTRIES]  PATH" with full paths; header
+    \\lines start with '#'. Sizes are bytes allocated on disk, like du: hard-
+    \\linked files are counted once.
+    \\
+    \\options:
+    \\  -o, --output FILE     also write every entry as one table row to FILE:
+    \\                          *.parquet   Parquet (recommended); DuckDB reads it natively
+    \\                          *.arrow     Arrow IPC (Feather v2); DuckDB needs
+    \\                                      INSTALL arrow FROM community; LOAD arrow;
+    \\  -n, --top N           lines per summary section (default 20; 0 = totals only)
+    \\  -x, --one-file-system do not descend into other filesystems
+    \\      --deleted         also list deleted files still held open on the scanned
+    \\                        filesystems (Linux, /proc); table rows kind='deleted'
+    \\  -j, --threads N       worker threads (default: number of CPUs)
+    \\  -q, --quiet           no progress display on stderr
+    \\  -h, --help            show this help
+    \\      --version         print the version
+    \\
+    \\table columns (one row per file, directory, symlink, ...):
+    \\  path kind size alloc du tree_du tree_count id parent depth
+    \\  dev ino nlink uid gid mode mtime error open_by
+    \\  du = alloc, or 0 for a hardlink whose inode was counted at another path;
+    \\  sum(du) WHERE kind <> 'deleted' equals `du -sB1 PATH`.
+    \\  tree_du = du of the whole subtree.
+    \\
+    \\examples:
+    \\  wtfs -x /home
+    \\  wtfs -o /tmp/nix.parquet /nix/store
+    \\  duckdb -c "SELECT tree_du, path FROM '/tmp/nix.parquet'
+    \\             WHERE kind = 'dir' ORDER BY tree_du DESC LIMIT 20"
+    \\
+    \\Pseudo filesystems (proc, sysfs, cgroup, ...) are never descended into.
+    \\
+    \\Python TUI compatibility: --binary-output FILE writes the legacy wtfsdumpv1
+    \\snapshot, with --large-file-threshold SIZE and --skip-hidden.
+    \\
+;
 
-var stderr_buffer: [4096]u8 = undefined;
-var stderr_writer: std.Io.File.Writer = undefined;
-const stderr = &stderr_writer.interface;
+fn fail(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print("wtfs: " ++ fmt ++ "\n", args);
+    std.process.exit(2);
+}
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    // The arena is threadsafe, and lives for the whole process.
-    const allocator = init.arena.allocator();
+    const arena = init.arena.allocator();
+    const gpa = std.heap.smp_allocator;
 
-    stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, arena);
+    _ = args_it.next();
+    var args: std.ArrayList([]const u8) = .empty;
+    while (args_it.next()) |arg| try args.append(arena, try arena.dupe(u8, arg));
 
-    var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
-    defer args_it.deinit();
-
-    var args_list: std.ArrayList([]const u8) = .empty;
-    while (args_it.next()) |arg| {
-        try args_list.append(allocator, try allocator.dupe(u8, arg));
-    }
-    const args = args_list.items;
-
-    const exe_name = if (args.len > 0) args[0] else "wtfs";
-
-    var skip_hidden = false;
-    var root_arg: ?[]const u8 = null;
-    var large_file_threshold = DiskScan.default_large_file_threshold;
+    var root: ?[]const u8 = null;
+    var output: ?[]const u8 = null;
     var binary_output: ?[]const u8 = null;
-    var binary_input: ?[]const u8 = null;
-    var dump_structs = false;
+    var large_file_threshold: u64 = 100 * 1024 * 1024;
+    var top: usize = 20;
+    var opts: Scan.Options = .{};
+    var quiet = false;
     var force = false;
+    var want_deleted = false;
 
-    const threshold_prefix = "--large-file-threshold=";
-    const binary_output_prefix = "--binary-output=";
-    const binary_input_prefix = "--binary-input=";
-
-    defer stderr.flush() catch {};
-
-    var arg_index: usize = 1;
-    while (arg_index < args.len) : (arg_index += 1) {
-        const arg = args[arg_index];
-        if (std.mem.eql(u8, arg, "--skip-hidden")) {
-            skip_hidden = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--binary-output")) {
-            arg_index += 1;
-            if (arg_index >= args.len) {
-                try printUsage(exe_name);
-                return;
+    var i: usize = 0;
+    while (i < args.items.len) : (i += 1) {
+        const arg = args.items[i];
+        var value: ?[]const u8 = null;
+        var flag = arg;
+        if (std.mem.startsWith(u8, arg, "--")) {
+            if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
+                flag = arg[0..eq];
+                value = arg[eq + 1 ..];
             }
-            binary_output = args[arg_index];
-            continue;
+        } else if (arg.len > 2 and arg[0] == '-' and std.mem.indexOfScalar(u8, "onj", arg[1]) != null) {
+            // -n5, -j8, -oscan.parquet
+            flag = arg[0..2];
+            value = arg[2..];
         }
-        if (std.mem.eql(u8, arg, "--binary-input")) {
-            arg_index += 1;
-            if (arg_index >= args.len) {
-                try printUsage(exe_name);
-                return;
+        const Next = struct {
+            fn get(items: []const []const u8, idx: *usize, f: []const u8, v: ?[]const u8) []const u8 {
+                if (v) |x| return x;
+                idx.* += 1;
+                if (idx.* >= items.len) fail("{s} needs a value", .{f});
+                return items[idx.*];
             }
-            binary_input = args[arg_index];
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--large-file-threshold")) {
-            arg_index += 1;
-            if (arg_index >= args.len) {
-                try printUsage(exe_name);
-                return;
-            }
-            const value_arg = args[arg_index];
-            large_file_threshold = parseSize(value_arg) catch {
-                try stderr.print("invalid size for --large-file-threshold: {s}\n", .{value_arg});
-                try printUsage(exe_name);
-                return;
-            };
-            continue;
-        }
-        if (std.mem.startsWith(u8, arg, binary_output_prefix)) {
-            binary_output = arg[binary_output_prefix.len..];
-            continue;
-        }
-        if (std.mem.startsWith(u8, arg, binary_input_prefix)) {
-            binary_input = arg[binary_input_prefix.len..];
-            continue;
-        }
-        if (std.mem.startsWith(u8, arg, threshold_prefix)) {
-            const value_arg = arg[threshold_prefix.len..];
-            large_file_threshold = parseSize(value_arg) catch {
-                try stderr.print("invalid size for --large-file-threshold: {s}\n", .{value_arg});
-                try printUsage(exe_name);
-                return;
-            };
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--help")) {
-            try printUsage(exe_name);
+        };
+        if (eql(flag, "-h") or eql(flag, "--help")) {
+            try writeStdout(io, usage);
             return;
-        }
-        if (std.mem.eql(u8, arg, "--dump-structs")) {
-            dump_structs = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--force")) {
+        } else if (eql(flag, "--version")) {
+            try writeStdout(io, "wtfs " ++ build_options.version ++ "\n");
+            return;
+        } else if (eql(flag, "-o") or eql(flag, "--output")) {
+            output = Next.get(args.items, &i, flag, value);
+        } else if (eql(flag, "-n") or eql(flag, "--top")) {
+            const v = Next.get(args.items, &i, flag, value);
+            top = std.fmt.parseInt(usize, v, 10) catch fail("invalid number for {s}: {s}", .{ flag, v });
+        } else if (eql(flag, "-j") or eql(flag, "--threads")) {
+            const v = Next.get(args.items, &i, flag, value);
+            opts.threads = std.fmt.parseInt(usize, v, 10) catch fail("invalid number for {s}: {s}", .{ flag, v });
+        } else if (eql(flag, "-x") or eql(flag, "--one-file-system")) {
+            opts.one_file_system = true;
+        } else if (eql(flag, "--deleted")) {
+            want_deleted = true;
+        } else if (eql(flag, "-q") or eql(flag, "--quiet")) {
+            quiet = true;
+        } else if (eql(flag, "--binary-output")) {
+            binary_output = Next.get(args.items, &i, flag, value);
+        } else if (eql(flag, "--large-file-threshold")) {
+            const v = Next.get(args.items, &i, flag, value);
+            large_file_threshold = parseSize(v) catch fail("invalid size for {s}: {s}", .{ flag, v });
+        } else if (eql(flag, "--skip-hidden")) {
+            opts.skip_hidden = true;
+        } else if (eql(flag, "--force")) {
             force = true;
-            continue;
+        } else if (arg.len > 1 and arg[0] == '-') {
+            fail("unknown option {s} (see wtfs --help)", .{arg});
+        } else if (root != null) {
+            fail("only one PATH may be given", .{});
+        } else {
+            root = arg;
         }
-        if (root_arg != null) {
-            try printUsage(exe_name);
-            return;
-        }
-        root_arg = arg;
     }
+    const root_path = root orelse ".";
 
-    if (dump_structs) {
-        try dumpStructLayouts(io);
-        return;
-    }
-
-    const root = root_arg orelse ".";
-
-    // When scanning filesystem root, exclude problematic pseudo-filesystems
-    // On macOS, you probably want /System/Volumes/Data or /Volumes instead of /
-    const root_excludes = [_][]const u8{ "proc", "sys", "dev" };
-    const exclude_dirs = if (std.mem.eql(u8, root, "/"))
-        root_excludes[0..]
+    const Format = enum { arrow, parquet };
+    const format: ?Format = if (output) |o|
+        if (std.mem.endsWith(u8, o, ".parquet"))
+            .parquet
+        else if (std.mem.endsWith(u8, o, ".arrow") or std.mem.endsWith(u8, o, ".feather") or std.mem.endsWith(u8, o, ".ipc"))
+            .arrow
+        else
+            fail("cannot tell the format of {s}: use a .parquet or .arrow extension", .{o})
     else
-        &[_][]const u8{};
+        null;
 
-    // Prevent scanning / on macOS unless --force is used
-    if (builtin.os.tag == .macos and std.mem.eql(u8, root, "/") and !force) {
-        try stderr.print("error: Scanning / on macOS is not recommended.\n", .{});
-        try stderr.print("\n", .{});
-        try stderr.print("On macOS, the root filesystem contains system files and virtual mounts.\n", .{});
-        try stderr.print("Consider scanning one of these instead:\n", .{});
-        try stderr.print("  - /System/Volumes/Data (main filesystem)\n", .{});
-        try stderr.print("  - /Volumes (mounted drives)\n", .{});
-        try stderr.print("  - /Users (user home directories)\n", .{});
-        try stderr.print("\n", .{});
-        try stderr.print("To scan / anyway, use --force\n", .{});
-        return;
+    if (builtin.os.tag.isDarwin() and eql(root_path, "/") and !force) {
+        fail(
+            \\scanning / on macOS also walks firmlinked and system volumes.
+            \\Scan /System/Volumes/Data, /Users or /Volumes/NAME instead, or pass --force.
+        , .{});
     }
 
-    var diskScan = DiskScan{
-        .allocator = allocator,
-        .io = io,
-        .skip_hidden = skip_hidden,
-        .root = root,
-        .large_file_threshold = large_file_threshold,
-        .exclude_root_dirs = exclude_dirs,
+    // Create output files first so a bad path fails before a long scan.
+    var out_file: ?std.Io.File = null;
+    if (output) |o| out_file = std.Io.Dir.cwd().createFile(io, o, .{}) catch |err|
+        fail("cannot create {s}: {t}", .{ o, err });
+    var dump_file: ?std.Io.File = null;
+    if (binary_output) |o| dump_file = std.Io.Dir.cwd().createFile(io, o, .{}) catch |err|
+        fail("cannot create {s}: {t}", .{ o, err });
+
+    var progress: std.Progress.Node = .none;
+    if (!quiet) progress = std.Progress.start(io, .{ .root_name = "wtfs: directories scanned", .refresh_rate_ns = .fromMilliseconds(100) });
+    opts.progress = progress;
+
+    var scan: Scan = .{ .allocator = gpa, .io = io, .root = root_path, .options = opts };
+    scan.run() catch |err| {
+        progress.end();
+        fail("cannot scan {s}: {t}", .{ root_path, err });
     };
-    defer {
-        diskScan.freeNameBuffers();
-        diskScan.directories.deinit(allocator);
-        diskScan.large_files.deinit(allocator);
+
+    const deleted: []const table.Deleted = if (want_deleted) try deleted_files.find(arena, &scan) else &.{};
+
+    if (out_file) |f| {
+        progress.setName("wtfs: writing table");
+        defer f.close(io);
+        var buf: [256 * 1024]u8 = undefined;
+        var fw = f.writer(io, &buf);
+        const src: table.Source = .{ .scan = &scan, .deleted = deleted };
+        switch (format.?) {
+            .parquet => {
+                const threads = if (opts.threads != 0) opts.threads else std.Thread.getCpuCount() catch 4;
+                try parquet.write(gpa, io, &fw.interface, src, threads);
+            },
+            .arrow => {
+                var batch: table.Batch = .{};
+                defer batch.deinit(gpa);
+                var w = try arrow.Writer.init(gpa, &fw.interface);
+                defer w.deinit();
+                var start: usize = 0;
+                while (start < src.len()) {
+                    const end = @min(start + table.batch_rows, src.len());
+                    try batch.fill(gpa, src, start, end);
+                    try w.writeBatch(&batch);
+                    start = end;
+                }
+                try w.finish();
+            },
+        }
     }
 
-    if (binary_input) |path| {
-        // Load from binary dump
-        var binary_file = try std.Io.Dir.cwd().openFile(io, path, .{});
-        defer binary_file.close(io);
-
-        var binary_buffer: [16 * 1024]u8 = undefined;
-        var file_reader = binary_file.reader(io, binary_buffer[0..]);
-
-        const results = try diskScan.readBinaryResults(&file_reader.interface);
-
-        // Show all loaded large files regardless of threshold
-        diskScan.large_file_threshold = 0;
-
-        // Generate and display summary
-        var summary = try diskScan.generateSummary();
-        defer summary.deinit(allocator);
-
-        try diskScan.reportResults(results, summary);
-    } else if (binary_output) |path| {
-        var binary_file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true, .read = false });
-        defer binary_file.close(io);
-
-        var binary_buffer: [16 * 1024]u8 = undefined;
-        var file_writer = binary_file.writer(io, binary_buffer[0..]);
-
-        try diskScan.runWithBinaryOutput(&file_writer.interface, true);
-        try file_writer.end();
-    } else {
-        try diskScan.run();
+    if (dump_file) |f| {
+        defer f.close(io);
+        var buf: [64 * 1024]u8 = undefined;
+        var fw = f.writer(io, &buf);
+        try dump.write(gpa, &fw.interface, &scan, large_file_threshold);
     }
+    progress.end();
+
+    var stdout_buf: [64 * 1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
+    try report.print(arena, &stdout.interface, &scan, deleted, .{ .top = top, .output_path = output });
+    try stdout.interface.flush();
+}
+
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
+fn writeStdout(io: std.Io, s: []const u8) !void {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    try w.interface.writeAll(s);
+    try w.interface.flush();
 }
 
 fn parseSize(value: []const u8) !u64 {
     if (value.len == 0) return error.InvalidSize;
-
-    var slice = value;
-    var multiplier: u64 = 1;
-
-    var suffix = ascii.toUpper(slice[slice.len - 1]);
-    if (suffix == 'B') {
-        if (slice.len == 1) return error.InvalidSize;
-        slice = slice[0 .. slice.len - 1];
-        suffix = ascii.toUpper(slice[slice.len - 1]);
-    }
-
-    switch (suffix) {
-        'K' => {
-            multiplier = 1024;
-            slice = slice[0 .. slice.len - 1];
-        },
-        'M' => {
-            multiplier = 1024 * 1024;
-            slice = slice[0 .. slice.len - 1];
-        },
-        'G' => {
-            multiplier = 1024 * 1024 * 1024;
-            slice = slice[0 .. slice.len - 1];
-        },
-        'T' => {
-            multiplier = 1024 * 1024 * 1024 * 1024;
-            slice = slice[0 .. slice.len - 1];
-        },
-        else => {},
-    }
-
-    if (slice.len == 0) return error.InvalidSize;
-
-    const number = std.fmt.parseInt(u64, slice, 10) catch return error.InvalidSize;
-    if (multiplier == 1) return number;
-
-    if (number > std.math.maxInt(u64) / multiplier) {
-        return error.InvalidSize;
-    }
-
-    return number * multiplier;
+    var s = value;
+    if (s[s.len - 1] == 'B' or s[s.len - 1] == 'b') s = s[0 .. s.len - 1];
+    if (s.len == 0) return error.InvalidSize;
+    const shift: u6 = switch (std.ascii.toUpper(s[s.len - 1])) {
+        'K' => 10,
+        'M' => 20,
+        'G' => 30,
+        'T' => 40,
+        else => 0,
+    };
+    if (shift != 0) s = s[0 .. s.len - 1];
+    const n = std.fmt.parseInt(u64, s, 10) catch return error.InvalidSize;
+    return std.math.shlExact(u64, n, shift) catch error.InvalidSize;
 }
 
-fn printUsage(exe_name: []const u8) !void {
-    try stderr.print(
-        "usage: {s} [--skip-hidden] [--large-file-threshold SIZE] [--binary-output PATH] [--binary-input PATH] [--force] [--dump-structs] [dir]\n",
-        .{exe_name},
-    );
-    try stderr.print("       SIZE accepts optional K/M/G/T suffix (base 1024)\n", .{});
-    try stderr.print("       --binary-input: load scan results from file instead of scanning\n", .{});
-    try stderr.print("       --force: bypass safety checks (e.g., scanning / on macOS)\n", .{});
-}
-
-fn dumpStructLayouts(io: std.Io) !void {
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
-    const stdout = &stdout_writer.interface;
-    defer stdout.flush() catch {};
-
-    try dumpStruct(stdout, "Context", @import("Context.zig"));
-    try dumpStruct(stdout, "Worker", WorkerMod.Worker);
-    try dumpStruct(stdout, "Worker.Scanner", WorkerMod.Scanner);
-    try dumpStruct(stdout, "SysDispatcher.Config", SysDispatcher.Config);
-    try dumpStruct(stdout, "Io.Dir.Iterator", std.Io.Dir.Iterator);
-}
-
-fn dumpStruct(writer: *Writer, comptime name: []const u8, comptime T: type) !void {
-    const info = @typeInfo(T);
-
-    switch (info) {
-        .@"struct" => |struct_info| {
-            try writer.print("{s: <20} ", .{name});
-            try writer.print("{d} bytes, aligned to {d}\n\n", .{
-                @as(usize, @sizeOf(T)),
-                @as(usize, @alignOf(T)),
-            });
-
-            if (struct_info.field_names.len > 0) {
-                const Row = struct {
-                    field: []const u8,
-                    type_name: []const u8,
-                    size: usize,
-                };
-
-                const capacity = struct_info.field_names.len * 2 + 1;
-                var rows: [capacity]Row = undefined;
-                var row_count: usize = 0;
-
-                var expected_offset: usize = 0;
-
-                inline for (struct_info.field_names, struct_info.field_types) |field_name, field_type| {
-                    const field_offset = @offsetOf(T, field_name);
-                    const field_size = @sizeOf(field_type);
-                    const field_align = @alignOf(field_type);
-
-                    const aligned_offset = std.mem.alignForward(usize, expected_offset, field_align);
-                    const padding = aligned_offset - expected_offset;
-
-                    if (padding > 0) {
-                        rows[row_count] = .{
-                            .field = "",
-                            .type_name = "",
-                            .size = padding,
-                        };
-                        row_count += 1;
-                    }
-
-                    const type_name = @typeName(field_type);
-                    const max_type_len = 32;
-                    const display_type = if (type_name.len > max_type_len)
-                        type_name[0 .. max_type_len - 2] ++ ".."
-                    else
-                        type_name;
-
-                    rows[row_count] = .{
-                        .field = "." ++ field_name,
-                        .type_name = display_type,
-                        .size = field_size,
-                    };
-                    row_count += 1;
-
-                    expected_offset = field_offset + field_size;
-                }
-
-                const struct_size = @sizeOf(T);
-                const trailing_padding = struct_size - expected_offset;
-                if (trailing_padding > 0) {
-                    rows[row_count] = .{
-                        .field = "",
-                        .type_name = "",
-                        .size = trailing_padding,
-                    };
-                    row_count += 1;
-                }
-
-                var field_width: usize = "Field".len;
-                var size_width: usize = "Size".len;
-                var type_width: usize = "Type".len;
-
-                var i: usize = 0;
-                while (i < row_count) : (i += 1) {
-                    const row = rows[i];
-
-                    if (row.field.len > field_width) field_width = row.field.len;
-                    if (row.type_name.len > type_width) type_width = row.type_name.len;
-
-                    var size_buf: [32]u8 = undefined;
-                    const size_value: u64 = @intCast(row.size);
-                    const size_str = try Report.formatBytes(size_buf[0..], size_value);
-                    if (size_str.len > size_width) size_width = size_str.len;
-                }
-
-                var columns = [_]Column{
-                    Column{ .width = field_width },
-                    Column{ .width = type_width },
-                    Column{ .width = size_width, .alignment = .right },
-                };
-
-                var table = TabWriter.initWithOptions(writer, columns[0..], .{
-                    .style = .box,
-                });
-                try table.writeHeader(&[_][]const u8{ "Field", "Type", "Size" });
-                try table.writeSeparator("-");
-
-                i = 0;
-                while (i < row_count) : (i += 1) {
-                    const row = rows[i];
-                    var size_buf: [32]u8 = undefined;
-                    const size_value: u64 = @intCast(row.size);
-                    const size_str = try Report.formatBytes(size_buf[0..], size_value);
-
-                    try table.writeRow(&[_][]const u8{
-                        row.field,
-                        row.type_name,
-                        size_str,
-                    });
-                }
-
-                try table.finish();
-
-                try writer.writeByte('\n');
-            } else {
-                try writer.writeByte('\n');
-            }
-        },
-        else => {
-            try writer.print("{s}: not a struct\n\n", .{name});
-        },
-    }
+test {
+    _ = Scan;
+    _ = table;
+    _ = arrow;
+    _ = parquet;
 }

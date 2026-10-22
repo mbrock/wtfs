@@ -100,5 +100,5 @@ uv build
 # etc.
 ```
 
-See `build_binary.py` for the build hook that compiles and bundles the binary.
+See `hatch_build.py` for the build hook that bundles the binaries from `zig build release`.
 
