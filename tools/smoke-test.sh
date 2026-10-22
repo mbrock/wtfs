@@ -39,7 +39,7 @@ query="SELECT sum(du), count(*) FILTER (WHERE kind = 'file') FROM 'scan.parquet'
 if command -v duckdb > /dev/null; then
   result=$(duckdb -csv -noheader -c "$query")
 elif python3 -c 'import duckdb' 2> /dev/null; then
-  result=$(python3 -c "import duckdb,sys; print(','.join(map(str, duckdb.sql(sys.argv[1]).fetchone())))" "$query")
+  result=$(python3 -c "import duckdb,sys; print(','.join(map(str, duckdb.sql(sys.argv[1]).fetchall()[0])))" "$query")
 else
   echo "duckdb not available; skipping table check"
   exit 0
