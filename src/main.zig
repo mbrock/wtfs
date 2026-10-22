@@ -22,7 +22,7 @@ const usage =
     \\
     \\options:
     \\  -o, --output FILE     also write every entry as one table row to FILE:
-    \\                          *.parquet   Parquet; DuckDB reads it natively
+    \\                          *.parquet   Parquet (recommended); DuckDB reads it natively
     \\                          *.arrow     Arrow IPC (Feather v2); DuckDB needs
     \\                                      INSTALL arrow FROM community; LOAD arrow;
     \\  -n, --top N           lines per summary section (default 20; 0 = totals only)
