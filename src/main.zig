@@ -27,7 +27,8 @@ const usage =
     \\                                      INSTALL arrow FROM community; LOAD arrow;
     \\  -n, --top N           lines per summary section (default 20; 0 = totals only)
     \\  -x, --one-file-system do not descend into other filesystems
-    \\      --deleted         also list deleted files still held open (Linux, /proc)
+    \\      --deleted         also list deleted files still held open on the scanned
+    \\                        filesystems (Linux, /proc); table rows kind='deleted'
     \\  -j, --threads N       worker threads (default: number of CPUs)
     \\  -q, --quiet           no progress display on stderr
     \\  -h, --help            show this help
@@ -37,7 +38,8 @@ const usage =
     \\  path kind size alloc du tree_du tree_count id parent depth
     \\  dev ino nlink uid gid mode mtime error open_by
     \\  du = alloc, or 0 for a hardlink whose inode was counted at another path;
-    \\  sum(du) equals `du -sB1 PATH`. tree_du = du of the whole subtree.
+    \\  sum(du) WHERE kind <> 'deleted' equals `du -sB1 PATH`.
+    \\  tree_du = du of the whole subtree.
     \\
     \\examples:
     \\  wtfs -x /home
@@ -175,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
         fail("cannot scan {s}: {t}", .{ root_path, err });
     };
 
-    const deleted: []const table.Deleted = if (want_deleted) try deleted_files.find(arena) else &.{};
+    const deleted: []const table.Deleted = if (want_deleted) try deleted_files.find(arena, &scan) else &.{};
 
     if (out_file) |f| {
         progress.setName("wtfs: writing table");

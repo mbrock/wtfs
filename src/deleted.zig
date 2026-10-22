@@ -1,6 +1,7 @@
 //! Find deleted files that processes still hold open (Linux). Their space is
 //! not freed until the last descriptor closes, and no directory walk can see
 //! them. Reads /proc/PID/fd/*; without root only your own processes show up.
+//! Only files on filesystems the scan visited are reported.
 const std = @import("std");
 const builtin = @import("builtin");
 const sys = @import("sys.zig");
@@ -10,8 +11,14 @@ const table = @import("table.zig");
 const Allocator = std.mem.Allocator;
 const suffix = " (deleted)";
 
-pub fn find(a: Allocator) ![]table.Deleted {
+pub fn find(a: Allocator, scan: *const Scan) ![]table.Deleted {
     if (builtin.os.tag != .linux) return &.{};
+
+    var devs: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    for (0..scan.rows.len()) |i| {
+        const r = scan.rows.at(i);
+        if (r.kind == .dir and r.err == .none) try devs.put(a, r.dev, {});
+    }
 
     const Key = struct { dev: u64, ino: u64 };
     var by_inode: std.AutoArrayHashMapUnmanaged(Key, usize) = .empty;
@@ -40,7 +47,7 @@ pub fn find(a: Allocator) ![]table.Deleted {
             if (!std.mem.endsWith(u8, target, suffix)) continue;
             if (target.len == 0 or target[0] != '/' or std.mem.startsWith(u8, target, "/memfd:")) continue;
             const st = sys.statAt(fd_dir, e.name, true) catch continue;
-            if (st.kind != .file) continue;
+            if (st.kind != .file or !devs.contains(st.dev)) continue;
 
             const gop = try by_inode.getOrPut(a, .{ .dev = st.dev, .ino = st.ino });
             if (!gop.found_existing) {

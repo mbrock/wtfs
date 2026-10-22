@@ -93,7 +93,7 @@ $ sudo wtfs -x --deleted -n 5 /
 -o, --output FILE     also write every entry as a table: *.parquet or *.arrow
 -n, --top N           lines per summary section (default 20; 0 = totals only)
 -x, --one-file-system do not descend into other filesystems
-    --deleted         also list deleted files still held open (Linux, /proc)
+    --deleted         also list deleted files still held open on the scanned filesystems (Linux, /proc)
 -j, --threads N       worker threads (default: number of CPUs)
 -q, --quiet           no progress display on stderr
 ```
@@ -277,7 +277,9 @@ SELECT format_bytes(du) AS du, path, open_by FROM 'root.parquet' WHERE kind = 'd
 └──────────┴────────────────────┴────────────────────────┘
 ```
 
-Without root, `--deleted` only sees your own processes.
+`--deleted` reports files on any filesystem the scan visited, wherever they
+used to live, since they take space from the same `df` total. Without root it
+only sees your own processes.
 
 **More**
 
