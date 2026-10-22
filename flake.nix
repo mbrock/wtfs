@@ -1,201 +1,128 @@
 {
-  description = "Fast directory scanning utility with beautiful Python analysis tools";
+  description = "wtfs: find out where disk space went; scans a tree into a Parquet/Arrow table";
 
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
-  };
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
+    { self, nixpkgs }:
+    let
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      version = builtins.head (
+        builtins.match ''.*[.]version = "([^"]+)".*'' (builtins.readFile ./build.zig.zon)
+      );
+
+      src = nixpkgs.lib.fileset.toSource {
+        root = ./.;
+        fileset = nixpkgs.lib.fileset.unions [
+          ./build.zig
+          ./build.zig.zon
+          ./src
+        ];
+      };
+
+      wtfsFor =
+        pkgs:
+        {
+          static ? false,
+        }:
+        pkgs.stdenv.mkDerivation {
+          pname = if static then "wtfs-static" else "wtfs";
+          inherit version src;
+          nativeBuildInputs = [ pkgs.zig_0_17.hook ];
+          # The zig hook builds with --release=safe -Dcpu=baseline. The Linux
+          # build makes raw syscalls and links no libc, so it is static
+          # either way; `static` asserts that.
+          doCheck = true;
+          postInstall = pkgs.lib.optionalString static ''
+            if ${pkgs.file}/bin/file $out/bin/wtfs | grep -q dynamic; then
+              echo "wtfs is not statically linked" >&2; exit 1
+            fi
+          '';
+          meta = {
+            description = "Find out where disk space went: fast parallel scan to a Parquet/Arrow table";
+            homepage = "https://github.com/mbrock/wtfs";
+            license = pkgs.lib.licenses.mit;
+            platforms = systems;
+            mainProgram = "wtfs";
+          };
+        };
+    in
     {
-      self,
-      nixpkgs,
-      flake-utils,
-    }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
+      packages = forAllSystems (
+        pkgs:
+        let
+          wtfs = wtfsFor pkgs { };
+        in
+        {
+          default = wtfs;
+          inherit wtfs;
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          static = wtfsFor pkgs { static = true; };
+        }
+      );
 
-        # Build the Zig core binary
-        wtfs-core = pkgs.stdenv.mkDerivation {
-          pname = "wtfs-core";
-          version = "0.6.0";
-
-          src = ./.;
-
-          nativeBuildInputs = [ pkgs.zig ];
-
-          buildPhase = ''
-            runHook preBuild
-
-            export HOME=$TMPDIR
-            zig build -Doptimize=ReleaseSafe -Dcpu=baseline --prefix $out
-
-            runHook postBuild
-          '';
-
-          installPhase = ''
-            runHook preInstall
-
-            # The zig build --prefix already installs to $out
-            # but we need to ensure the install phase completes
-
-            runHook postInstall
-          '';
-
-          meta = with pkgs.lib; {
-            description = "Efficient bulk retrieval of file attributes (core Zig binary)";
-            homepage = "https://github.com/mbrock/wtfs";
-            license = licenses.mit;
-            maintainers = [ ];
-            platforms = platforms.unix;
-            mainProgram = "wtfs";
-          };
+      apps = forAllSystems (pkgs: {
+        default = {
+          type = "app";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.default}/bin/wtfs";
+          meta.description = "Scan a directory tree and summarize disk usage";
         };
+      });
 
-        # Build tagflow (not yet in nixpkgs)
-        tagflow = pkgs.python3Packages.buildPythonPackage rec {
-          pname = "tagflow";
-          version = "0.12.0";
-          format = "pyproject";
+      checks = forAllSystems (
+        pkgs:
+        let
+          wtfs = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        in
+        {
+          inherit wtfs;
+          # The total wtfs reports and the table's sum(du) both equal du -sB1,
+          # including for hardlinks, sparse files and symlinks.
+          matches-du =
+            pkgs.runCommand "wtfs-matches-du"
+              {
+                nativeBuildInputs = [
+                  wtfs
+                  pkgs.duckdb
+                  pkgs.coreutils
+                ];
+              }
+              ''
+                mkdir -p t/a/b t/c
+                head -c 100000 /dev/zero > t/a/b/big
+                ln t/a/b/big t/c/big-link
+                truncate -s 1G t/sparse
+                ln -s a t/link
+                for i in $(seq 1 300); do echo $i > t/a/f$i; done
 
-          src = pkgs.fetchPypi {
-            inherit pname version;
-            hash = "sha256-+Ooje+SUwKG55A44AdY5wjQo3ly/mAQxYHiHo065J5A=";
-          };
+                expected=$(du -sB1 t | cut -f1)
+                got=$(wtfs -q -n 0 -o scan.parquet t | sed -n 's/^# du \([0-9]*\) bytes.*/\1/p')
+                summed=$(duckdb -csv -noheader -c "SELECT sum(du) FROM 'scan.parquet'")
+                echo "du=$expected wtfs=$got sum(du)=$summed"
+                [ "$expected" = "$got" ] && [ "$expected" = "$summed" ]
+                touch $out
+              '';
+        }
+      );
 
-          nativeBuildInputs = with pkgs.python3Packages; [
-            hatchling
-          ];
-
-          propagatedBuildInputs = with pkgs.python3Packages; [
-            fastapi
-            pydantic
-            beautifulsoup4
-            anyio
-            hypercorn
-            rich
-            trio
-          ];
-
-          # Disable tests if they require network or special setup
-          doCheck = false;
-
-          meta = with pkgs.lib; {
-            description = "Block-oriented HTML generation for Python";
-            homepage = "https://github.com/lessrest/tagflow";
-            license = licenses.mit;
-          };
-        };
-
-        # Build the Python package with bundled Zig binaries
-        wtfs-python = pkgs.python3Packages.buildPythonApplication {
-          pname = "wtfs";
-          version = "0.1.0";
-
-          src = ./.;
-
-          format = "pyproject";
-
-          nativeBuildInputs = [
-            pkgs.python3Packages.hatchling
-            pkgs.zig
-          ];
-
-          propagatedBuildInputs = with pkgs.python3Packages; [
-            rich
-            textual
-            tagflow
-            fastapi
-            uvicorn
-            pydantic
-            starlette
-          ];
-
-          # Build the Zig binaries before building the Python package
-          preBuild = ''
-            export HOME=$TMPDIR
-            # Build all platform binaries using the python step
-            # This cross-compiles for: linux-{x86_64,aarch64}, macos-{x86_64,aarch64}
-            zig build python -Doptimize=ReleaseFast
-          '';
-
-          meta = with pkgs.lib; {
-            description = "Fast directory scanning utility with beautiful Python analysis tools";
-            homepage = "https://github.com/mbrock/wtfs";
-            license = licenses.mit;
-            maintainers = [ ];
-            platforms = platforms.unix;
-            mainProgram = "wtfs";
-          };
-        };
-      in
-      {
-        packages = {
-          # Python tool as the default (more useful)
-          default = wtfs-python;
-
-          # Also provide the core Zig binary separately
-          wtfs-core = wtfs-core;
-
-          # Aliases for clarity
-          wtfs = wtfs-python;
-          wtfs-python = wtfs-python;
-        };
-
-        devShells.default = pkgs.mkShell {
-          buildInputs = [
-            pkgs.zig
-            pkgs.python3
-            pkgs.python3Packages.rich
-            pkgs.python3Packages.textual
-            pkgs.python3Packages.fastapi
-            pkgs.python3Packages.uvicorn
-            pkgs.python3Packages.hatchling
-            pkgs.python3Packages.pip
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          packages = [
+            pkgs.zig_0_17
+            pkgs.duckdb
             pkgs.uv
+            pkgs.python3
           ];
-
-          shellHook = ''
-            echo "wtfs development environment"
-            echo "Zig version: $(zig version)"
-            echo "Python version: $(python --version)"
-            echo ""
-            echo "Available commands:"
-            echo "  - Build Zig core: zig build"
-            echo "  - Run Python tool: python -m wtfs.cli"
-            echo "  - Run TUI: python -m wtfs.tui"
-            echo "  - Run web UI: python -m wtfs.cli --webui"
-            echo ""
-            echo "Note: Install additional Python deps with: uv sync"
-          '';
         };
+      });
 
-        apps = {
-          # Default app runs the Python tool
-          default = {
-            type = "app";
-            program = "${wtfs-python}/bin/wtfs";
-          };
-
-          # Also provide the core binary as an app
-          wtfs-core = {
-            type = "app";
-            program = "${wtfs-core}/bin/wtfs";
-          };
-
-          # Additional Python tools
-          wtfs-tui = {
-            type = "app";
-            program = "${wtfs-python}/bin/wtfs-tui";
-          };
-
-          wtfsdump = {
-            type = "app";
-            program = "${wtfs-python}/bin/wtfsdump";
-          };
-        };
-      }
-    );
+      formatter = forAllSystems (pkgs: pkgs.nixfmt);
+    };
 }
